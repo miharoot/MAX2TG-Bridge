@@ -2,26 +2,81 @@ from __future__ import annotations
 
 import base64
 import logging
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from yarl import URL
 
 from app.config import Settings
-from app.max_client import (
-    _BROWSER_HEADERS,
-    _HTTP_HEADERS,
-    _USER_AGENT,
-    _is_allowed_download_url,
-    _redact_url,
-    MaxMessage,
-    OpCode,
-)
 from app.pymax_auth import build_pymax_client
 
 log = logging.getLogger(__name__)
+
+_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+_BROWSER_HEADERS = {"User-Agent": _USER_AGENT, "Accept-Encoding": "gzip, deflate"}
+_HTTP_HEADERS = {**_BROWSER_HEADERS, "Origin": "https://web.max.ru", "Referer": "https://web.max.ru/", "Accept": "*/*"}
+_ALLOWED_DOWNLOAD_HOSTS = frozenset({"i.oneme.ru", "oneme.ru", "web.max.ru", "max.ru"})
+_ALLOWED_DOWNLOAD_SUFFIXES = (".oneme.ru", ".max.ru", ".okcdn.ru")
+
+
+def _is_allowed_download_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except (TypeError, ValueError):
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return parsed.scheme == "https" and (
+        host in _ALLOWED_DOWNLOAD_HOSTS
+        or any(host.endswith(suffix) for suffix in _ALLOWED_DOWNLOAD_SUFFIXES)
+    )
+
+
+def _redact_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        query = [(key, "<redacted>") for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), ""))
+    except (TypeError, ValueError):
+        return "<invalid-url>"
+
+
+@dataclass
+class MaxMessage:
+    chat_id: Any = None
+    sender_id: Any = None
+    text: str = ""
+    timestamp: Any = None
+    message_id: str = ""
+    is_self: bool = False
+    cid: Any = None
+    attaches: list = field(default_factory=list)
+    link: dict = field(default_factory=dict)
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class MaxReadEvent:
+    """A chat's read marker moved — either the peer read up to some point,
+    or (set_as_unread=True) explicitly marked it unread again."""
+    chat_id: Any = None
+    user_id: Any = None
+    mark: Any = None
+    set_as_unread: bool = False
+
+
+@dataclass
+class MaxReactionEvent:
+    """A message's reaction counters changed (someone added/removed a
+    reaction emoji, e.g. 👀/👍, on a MAX message)."""
+    chat_id: Any = None
+    message_id: str = ""
+    counters: list = field(default_factory=list)   # [{"reaction": "👍", "count": 2}, ...]
+    total_count: int = 0
 
 
 def _plain(value: Any) -> Any:
@@ -49,7 +104,7 @@ def _model_dict(value: Any) -> dict:
     return _plain(vars(value))
 
 
-def _pymax_attachment_to_legacy(attach: Any) -> dict:
+def _attachment_to_dict(attach: Any) -> dict:
     data = _model_dict(attach)
     atype = data.get("_type") or data.get("type")
     if isinstance(atype, str):
@@ -67,7 +122,7 @@ def _pymax_attachment_to_legacy(attach: Any) -> dict:
     return data
 
 
-def _pymax_message_to_legacy(message: Any, my_id: Any = None) -> MaxMessage | None:
+def _message_from_pymax(message: Any, my_id: Any = None) -> MaxMessage | None:
     chat_id = getattr(message, "chat_id", None)
     if chat_id is None:
         return None
@@ -81,8 +136,9 @@ def _pymax_message_to_legacy(message: Any, my_id: Any = None) -> MaxMessage | No
         timestamp=getattr(message, "time", None),
         message_id=str(getattr(message, "id", "")),
         is_self=bool(my_id is not None and sender_id == my_id),
+        cid=getattr(message, "cid", None),
         attaches=[
-            _pymax_attachment_to_legacy(attach)
+            _attachment_to_dict(attach)
             for attach in (getattr(message, "attaches", None) or [])
         ],
         link=_model_dict(getattr(message, "link", None)),
@@ -90,7 +146,7 @@ def _pymax_message_to_legacy(message: Any, my_id: Any = None) -> MaxMessage | No
     )
 
 
-def _name_to_legacy(name: Any) -> dict:
+def _name_to_dict(name: Any) -> dict:
     data = _model_dict(name)
     if "first_name" in data and "firstName" not in data:
         data["firstName"] = data["first_name"]
@@ -99,11 +155,11 @@ def _name_to_legacy(name: Any) -> dict:
     return data
 
 
-def _user_to_legacy(user: Any) -> dict:
+def _user_to_dict(user: Any) -> dict:
     data = _model_dict(user)
     names = getattr(user, "names", None)
     if names is not None:
-        data["names"] = [_name_to_legacy(name) for name in names]
+        data["names"] = [_name_to_dict(name) for name in names]
     if "base_url" in data and "baseUrl" not in data:
         data["baseUrl"] = data["base_url"]
     if "base_raw_url" in data and "baseRawUrl" not in data:
@@ -111,7 +167,7 @@ def _user_to_legacy(user: Any) -> dict:
     return data
 
 
-def _chat_to_legacy(chat: Any) -> dict:
+def _chat_to_dict(chat: Any) -> dict:
     data = _model_dict(chat)
     if "base_icon_url" in data and "baseIconUrl" not in data:
         data["baseIconUrl"] = data["base_icon_url"]
@@ -120,8 +176,12 @@ def _chat_to_legacy(chat: Any) -> dict:
     return data
 
 
-class PyMaxClientAdapter:
-    """Compatibility layer exposing the legacy MaxClient surface on PyMax."""
+class PyMaxClient:
+    """Bridge client backed exclusively by PyMax."""
+
+    MESSAGE_DEDUPE_MAX = 4096
+    OUTBOUND_ECHO_TTL_SEC = 60 * 60
+    OUTBOUND_ECHO_MAX = 4096
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -129,12 +189,20 @@ class PyMaxClientAdapter:
         self.chat_ids: list[int] = []
         if settings.max_chat_ids:
             self.chat_ids += map(int, map(str.strip, settings.max_chat_ids.split(",")))
+        self.ignore_chat_ids: list[int] = []
+        if settings.max_ignore_chat_ids:
+            self.ignore_chat_ids += map(
+                int, map(str.strip, settings.max_ignore_chat_ids.split(","))
+            )
 
         self._client = build_pymax_client(settings)
         self._my_id: Any = None
         self._on_ready_cb = None
         self._on_message_cb = None
         self._on_disconnect_cb = None
+        self._on_read_cb = None
+        self._on_reaction_cb = None
+        self._outbound_cids: OrderedDict[tuple[Any, str], float] = OrderedDict()
         self.resolver = None
 
         self._wire_events()
@@ -142,6 +210,10 @@ class PyMaxClientAdapter:
     @property
     def raw_client(self):
         return self._client
+
+    @property
+    def my_id(self) -> Any:
+        return self._my_id
 
     def on_ready(self, func):
         self._on_ready_cb = func
@@ -155,23 +227,57 @@ class PyMaxClientAdapter:
         self._on_disconnect_cb = func
         return func
 
+    def on_read(self, func):
+        self._on_read_cb = func
+        return func
+
+    def on_reaction(self, func):
+        self._on_reaction_cb = func
+        return func
+
+    def _mark_outbound_cid(self, chat_id: Any, cid: Any) -> None:
+        if cid is None:
+            return
+        now = time.monotonic()
+        cutoff = now - self.OUTBOUND_ECHO_TTL_SEC
+        while self._outbound_cids:
+            key, ts = next(iter(self._outbound_cids.items()))
+            if ts >= cutoff:
+                break
+            self._outbound_cids.pop(key, None)
+        self._outbound_cids[(chat_id, str(cid))] = now
+        while len(self._outbound_cids) > self.OUTBOUND_ECHO_MAX:
+            self._outbound_cids.popitem(last=False)
+
+    def is_bridge_echo(self, msg: MaxMessage) -> bool:
+        """True if this is an echo of a message the bridge itself just sent
+        (same chat_id + cid we recorded on send), as opposed to a message
+        typed manually on your own phone/other MAX client (also is_self,
+        but not tracked here — so it's forwarded, not dropped)."""
+        if msg.cid is None:
+            return False
+        return (msg.chat_id, str(msg.cid)) in self._outbound_cids
+
     def _wire_events(self) -> None:
         @self._client.on_start()
         async def _handle_start(pymax_client):
             self._my_id = self._extract_my_id(pymax_client)
             snapshot = self._build_snapshot(pymax_client)
+            await self._add_configured_chats(snapshot)
             if self._on_ready_cb:
                 await self._on_ready_cb(snapshot)
 
         @self._client.on_message()
         async def _handle_message(message, pymax_client):
-            legacy = _pymax_message_to_legacy(message, self._my_id)
-            if legacy is None:
+            bridge_message = _message_from_pymax(message, self._my_id)
+            if bridge_message is None:
                 return
-            if self.chat_ids and legacy.chat_id not in self.chat_ids:
+            if self.chat_ids and bridge_message.chat_id not in self.chat_ids:
+                return
+            if self.ignore_chat_ids and bridge_message.chat_id in self.ignore_chat_ids:
                 return
             if self._on_message_cb:
-                await self._on_message_cb(legacy)
+                await self._on_message_cb(bridge_message)
 
         @self._client.on_disconnect()
         async def _handle_disconnect(exc, reconnect, delay):
@@ -183,6 +289,30 @@ class PyMaxClientAdapter:
             )
             if self._on_disconnect_cb:
                 await self._on_disconnect_cb()
+
+        @self._client.on_message_read()
+        async def _handle_message_read(event, pymax_client):
+            if self._on_read_cb:
+                await self._on_read_cb(MaxReadEvent(
+                    chat_id=getattr(event, "chat_id", None),
+                    user_id=getattr(event, "user_id", None),
+                    mark=getattr(event, "mark", None),
+                    set_as_unread=bool(getattr(event, "set_as_unread", False)),
+                ))
+
+        @self._client.on_reaction_update()
+        async def _handle_reaction_update(event, pymax_client):
+            if self._on_reaction_cb:
+                counters = getattr(event, "counters", None) or []
+                await self._on_reaction_cb(MaxReactionEvent(
+                    chat_id=getattr(event, "chat_id", None),
+                    message_id=str(getattr(event, "message_id", "")),
+                    counters=[
+                        {"reaction": getattr(c, "reaction", "?"), "count": getattr(c, "count", 1)}
+                        for c in counters
+                    ],
+                    total_count=getattr(event, "total_count", 0),
+                ))
 
     async def run(self):
         await self._client.start()
@@ -199,46 +329,24 @@ class PyMaxClientAdapter:
             return
         await self.close()
 
+    async def fetch_chat(self, chat_id) -> dict:
+        try:
+            chat = await self._client.get_chat(int(chat_id))
+        except Exception as exc:
+            log.warning("PyMax fetch_chat failed for %s: %s", chat_id, exc)
+            return {"_max_error": {"message": str(exc)}}
+        return {"chat": _chat_to_dict(chat)} if chat else {}
+
     async def fetch_contacts(self, contact_ids: list[int]) -> dict:
         if not contact_ids:
             return {}
         users = await self._client.get_users(contact_ids)
-        return {"contacts": [_user_to_legacy(user) for user in users if user]}
+        return {"contacts": [_user_to_dict(user) for user in users if user]}
 
-    async def cmd(self, opcode: int, payload: dict, timeout: float = 10) -> dict:
-        if opcode == OpCode.CONTACT_GET:
-            ids = (
-                payload.get("contactIds")
-                or payload.get("userIds")
-                or [payload.get("userId")]
-            )
-            return await self.fetch_contacts([int(uid) for uid in ids if uid is not None])
-
-        if opcode == OpCode.CHAT_GET:
-            chat_ids = payload.get("chatIds") or [payload.get("chatId")]
-            chats = await self._client.get_chats(
-                [int(chat_id) for chat_id in chat_ids if chat_id is not None]
-            )
-            return {"chats": [_chat_to_legacy(chat) for chat in chats if chat]}
-
-        if opcode == OpCode.FILE_DOWNLOAD_URL:
-            file_req = await self._client.get_file_by_id(
-                int(payload["chatId"]),
-                payload["messageId"],
-                int(payload["fileId"]),
-            )
-            return _model_dict(file_req)
-
-        if opcode == OpCode.VIDEO_DOWNLOAD_URL:
-            video_req = await self._client.get_video_by_id(
-                int(payload["chatId"]),
-                payload["messageId"],
-                int(payload["videoId"]),
-            )
-            return _model_dict(video_req)
-
-        log.info("PyMax adapter does not implement legacy cmd opcode=%s", opcode)
-        return {}
+    async def resolve_file_url(self, chat_id, message_id, file_id) -> str | None:
+        result = await self._client.get_file_by_id(int(chat_id), int(message_id), int(file_id))
+        url = _model_dict(result).get("url")
+        return url if isinstance(url, str) else None
 
     async def send_message(
         self,
@@ -257,6 +365,9 @@ class PyMaxClientAdapter:
         except Exception as exc:
             log.exception("PyMax send_message failed for chat %s", chat_id)
             return {"_max_error": {"message": str(exc)}}
+        sent_cid = getattr(message, "cid", None)
+        if sent_cid is not None:
+            self._mark_outbound_cid(chat_id, sent_cid)
         return _model_dict(message) or {"ok": True}
 
     async def upload_photo(
@@ -283,22 +394,30 @@ class PyMaxClientAdapter:
 
         return File(raw=data, name=filename)
 
+    async def upload_video(
+        self,
+        data: bytes,
+        chat_id=None,
+        filename: str = "video.mp4",
+        mimetype: str = "video/mp4",
+        timeout: float = 60.0,
+    ):
+        from pymax import Video
+
+        return Video(raw=data, name=filename)
+
     async def upload_audio(
         self,
         data: bytes,
         chat_id=None,
         filename: str = "voice.ogg",
         mimetype: str = "audio/ogg",
+        duration: int | None = None,
         timeout: float = 60.0,
     ):
-        # Keep legacy behavior: Telegram voice is delivered to MAX as a file.
-        return await self.upload_file(
-            data,
-            chat_id=chat_id,
-            filename=filename,
-            mimetype=mimetype,
-            timeout=timeout,
-        )
+        from pymax import Voice
+
+        return Voice(raw=data, name=filename, duration=duration)
 
     async def open_by_link(self, link: str) -> dict:
         try:
@@ -312,7 +431,7 @@ class PyMaxClientAdapter:
         except Exception as exc:
             log.exception("PyMax open_by_link failed: %s", _redact_url(link))
             return {"_max_error": {"message": str(exc)}}
-        return {"chatId": getattr(chat, "id", None), "chat": _chat_to_legacy(chat)}
+        return {"chatId": getattr(chat, "id", None), "chat": _chat_to_dict(chat)}
 
     async def download_audio_url(
         self,
@@ -411,7 +530,25 @@ class PyMaxClientAdapter:
         chats = getattr(pymax_client, "chats", None) or []
         contacts = getattr(pymax_client, "contacts", None) or []
         return {
-            "profile": _user_to_legacy(contact) if contact is not None else {},
-            "chats": [_chat_to_legacy(chat) for chat in chats if chat],
-            "contacts": [_user_to_legacy(user) for user in contacts if user],
+            "profile": _user_to_dict(contact) if contact is not None else {},
+            "chats": [_chat_to_dict(chat) for chat in chats if chat],
+            "contacts": [_user_to_dict(user) for user in contacts if user],
         }
+
+    async def _add_configured_chats(self, snapshot: dict) -> None:
+        """Fetch filtered chats omitted from PyMax's incremental login sync."""
+        if not self.chat_ids:
+            return
+
+        known_ids = {chat.get("id") for chat in snapshot["chats"]}
+        missing_ids = [chat_id for chat_id in self.chat_ids if chat_id not in known_ids]
+        if not missing_ids:
+            return
+
+        try:
+            chats = await self._client.get_chats(missing_ids)
+        except Exception:
+            log.exception("PyMax failed to fetch configured chats: %s", missing_ids)
+            return
+
+        snapshot["chats"].extend(_chat_to_dict(chat) for chat in chats if chat)

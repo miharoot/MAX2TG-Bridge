@@ -1,7 +1,16 @@
 """Tests for app/max_listener.py — pure helper functions."""
 
 import pytest
-from app.max_listener import _human_size, _guess_media_kind
+from unittest.mock import AsyncMock, MagicMock
+
+from app.pymax_client import MaxMessage
+from app.max_listener import (
+    _guess_media_kind,
+    _human_size,
+    _send_attach,
+    _topic_title_for_message,
+    _try_send_media_group,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -151,12 +160,6 @@ class TestGuessMediaKind:
 # added the bridge to a group, instead of the group's own name"
 # ---------------------------------------------------------------------------
 
-from unittest.mock import AsyncMock, MagicMock
-
-from app.max_client import MaxMessage
-from app.max_listener import _topic_title_for_message
-
-
 def _msg(chat_id=-100, sender_id=1):
     return MaxMessage(chat_id=chat_id, sender_id=sender_id, message_id="m1")
 
@@ -214,3 +217,131 @@ class TestTopicTitleForMessage:
         assert title == "-555"
         assert title != "Наринэ Ермилова"
         assert force is False
+
+
+# ---------------------------------------------------------------------------
+# _send_attach — FILE / VIDEO edge cases against the PyMax client
+# ---------------------------------------------------------------------------
+
+class TestFileAttachment:
+    @pytest.mark.asyncio
+    async def test_resolves_file_id_and_sends_document(self):
+        client = MagicMock()
+        client.resolve_file_url = AsyncMock(return_value="https://i.oneme.ru/file.bin")
+        client.download_file = AsyncMock(return_value=b"file contents")
+        sender = MagicMock()
+        sender.send_document = AsyncMock(return_value=True)
+        sender.send = AsyncMock()
+        msg = MaxMessage(chat_id=-78273486848085, message_id="message-1")
+
+        result = await _send_attach(
+            {"_type": "FILE", "name": "report.pdf", "fileId": 12345},
+            client,
+            sender,
+            "header",
+            thread_id=42,
+            msg=msg,
+        )
+
+        assert result is None  # success — no fallback text message sent
+        client.resolve_file_url.assert_awaited_once_with(
+            -78273486848085, "message-1", 12345
+        )
+        client.download_file.assert_awaited_once_with("https://i.oneme.ru/file.bin")
+        sender.send_document.assert_awaited_once_with(
+            b"file contents",
+            caption="header",
+            filename="report.pdf",
+            message_thread_id=42,
+            chat_id=None,
+        )
+        sender.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_photo_preview_when_video_download_fails(self):
+        client = MagicMock()
+        client.download_video_url = AsyncMock(return_value=None)
+        client.download_file = AsyncMock(return_value=b"preview bytes")
+        sender = MagicMock()
+        sender.send_video = AsyncMock()
+        sender.send_photo = AsyncMock(return_value=True)
+        sender.send = AsyncMock()
+        msg = MaxMessage(chat_id=-78273486848085, message_id="message-1")
+
+        result = await _send_attach(
+            {"_type": "VIDEO", "videoId": 190714046, "thumbnail": "https://cdn/thumb.jpg"},
+            client,
+            sender,
+            "header",
+            thread_id=10,
+            msg=msg,
+        )
+
+        assert result is None
+        sender.send_video.assert_not_awaited()
+        sender.send_photo.assert_awaited_once_with(
+            b"preview bytes",
+            caption="header\n<i>[видео — превью, не удалось скачать полностью]</i>",
+            message_thread_id=10,
+            chat_id=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_sends_video_marker_when_telegram_upload_fails(self):
+        client = MagicMock()
+        client.download_video_url = AsyncMock(return_value="https://vd.example/video.mp4")
+        client.download_file = AsyncMock(return_value=b"video bytes")
+        sender = MagicMock()
+        sender.send_video = AsyncMock(return_value=False)
+        sender.send = AsyncMock()
+        msg = MaxMessage(chat_id=-78273486848085, message_id="message-1")
+
+        result = await _send_attach(
+            {"_type": "VIDEO", "videoId": 190714046},
+            client,
+            sender,
+            "header",
+            thread_id=10,
+            msg=msg,
+        )
+
+        assert result is sender.send.return_value
+        sender.send.assert_awaited_once_with(
+            "header\n<i>[видео — не удалось загрузить]</i>",
+            message_thread_id=10,
+            chat_id=None,
+        )
+
+
+class TestAttachmentGrouping:
+    @pytest.mark.asyncio
+    async def test_groups_photos_and_videos_in_original_order(self):
+        client = MagicMock()
+        client.download_video_url = AsyncMock(return_value="https://cdn/video.mp4")
+        client.download_file = AsyncMock(side_effect=[b"photo", b"video"])
+        sender = MagicMock()
+        sender.send_media_group = AsyncMock(return_value=True)
+        msg = MaxMessage(chat_id=-10, message_id="77")
+
+        grouped = await _try_send_media_group(
+            [
+                {"_type": "PHOTO", "baseUrl": "https://cdn/photo.jpg"},
+                {"_type": "VIDEO", "videoId": 123},
+            ],
+            client,
+            sender,
+            "header",
+            42,
+            msg,
+        )
+
+        assert grouped is True
+        sender.send_media_group.assert_awaited_once_with(
+            [
+                ("photo", b"photo", "photo-1.jpg"),
+                ("video", b"video", "123.mp4"),
+            ],
+            caption="header",
+            message_thread_id=42,
+            chat_id=None,
+        )

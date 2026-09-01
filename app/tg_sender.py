@@ -2,7 +2,7 @@ import asyncio
 import io
 import logging
 
-from telegram import Bot, InputFile
+from telegram import Bot, InputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
@@ -15,6 +15,8 @@ TG_MAX_LENGTH = 4096
 TG_CAPTION_MAX = 1024
 TG_TOPIC_NAME_MAX = 128
 MAX_RETRIES = 3
+TG_CONNECT_TIMEOUT = 20.0
+TG_REQUEST_TIMEOUT = 180.0
 
 
 def _looks_numeric(title: str) -> bool:
@@ -26,11 +28,15 @@ def _looks_numeric(title: str) -> bool:
 class TelegramSender:
     def __init__(self, token: str, default_chat_id: str, topic_store: TopicStore,
                  proxy_url: str | None = None, chat_routes: dict[str, int] | None = None):
-        if proxy_url:
-            request = HTTPXRequest(proxy=proxy_url)
-            self._bot = Bot(token=token, request=request)
-        else:
-            self._bot = Bot(token=token)
+        request = HTTPXRequest(
+            proxy=proxy_url,
+            connect_timeout=TG_CONNECT_TIMEOUT,
+            read_timeout=TG_REQUEST_TIMEOUT,
+            write_timeout=TG_REQUEST_TIMEOUT,
+            media_write_timeout=TG_REQUEST_TIMEOUT,
+            pool_timeout=TG_CONNECT_TIMEOUT,
+        )
+        self._bot = Bot(token=token, request=request)
         self._default_chat_id = str(default_chat_id)
         self._topics = topic_store
         self._chat_routes = {str(k): int(v) for k, v in (chat_routes or {}).items()}
@@ -220,9 +226,9 @@ class TelegramSender:
 
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
                          message_thread_id: int | None = None,
-                         chat_id: str | int | None = None):
+                         chat_id: str | int | None = None) -> bool:
         caption = self._truncate_caption(caption)
-        await self._retry(
+        result = await self._retry(
             lambda: self._bot.send_photo(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 photo=InputFile(io.BytesIO(data), filename=filename),
@@ -231,12 +237,13 @@ class TelegramSender:
                 message_thread_id=message_thread_id,
             )
         )
+        return result is not None
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
                             message_thread_id: int | None = None,
-                            chat_id: str | int | None = None):
+                            chat_id: str | int | None = None) -> bool:
         caption = self._truncate_caption(caption)
-        await self._retry(
+        result = await self._retry(
             lambda: self._bot.send_document(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 document=InputFile(io.BytesIO(data), filename=filename),
@@ -245,12 +252,13 @@ class TelegramSender:
                 message_thread_id=message_thread_id,
             )
         )
+        return result is not None
 
     async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4",
                          message_thread_id: int | None = None,
-                         chat_id: str | int | None = None):
+                         chat_id: str | int | None = None) -> bool:
         caption = self._truncate_caption(caption)
-        await self._retry(
+        result = await self._retry(
             lambda: self._bot.send_video(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 video=InputFile(io.BytesIO(data), filename=filename),
@@ -259,10 +267,11 @@ class TelegramSender:
                 message_thread_id=message_thread_id,
             )
         )
+        return result is not None
 
     async def send_voice(self, data: bytes, caption: str = "",
                          message_thread_id: int | None = None,
-                         chat_id: str | int | None = None):
+                         chat_id: str | int | None = None) -> bool:
         caption = self._truncate_caption(caption)
         target = chat_id if chat_id is not None else self._default_chat_id
         result = await self._retry(
@@ -285,14 +294,55 @@ class TelegramSender:
                     message_thread_id=message_thread_id,
                 )
             )
-        return result
+        return result is not None
 
     async def send_sticker(self, data: bytes, message_thread_id: int | None = None,
-                           chat_id: str | int | None = None):
-        return await self._retry(
+                           chat_id: str | int | None = None) -> bool:
+        result = await self._retry(
             lambda: self._bot.send_sticker(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 sticker=InputFile(io.BytesIO(data), filename="sticker.webp"),
                 message_thread_id=message_thread_id,
             )
         )
+        return result is not None
+
+    async def send_media_group(
+        self,
+        items: list[tuple[str, bytes, str]],
+        caption: str = "",
+        message_thread_id: int | None = None,
+        chat_id: str | int | None = None,
+    ) -> bool:
+        """Send photos/videos or documents as Telegram albums, max 10 per group."""
+        caption = self._truncate_caption(caption)
+        target = chat_id if chat_id is not None else self._default_chat_id
+        all_sent = True
+        for offset in range(0, len(items), 10):
+            chunk = items[offset:offset + 10]
+
+            def build_media():
+                media = []
+                for index, (kind, data, filename) in enumerate(chunk):
+                    kwargs = {
+                        "media": InputFile(data, filename=filename, attach=True),
+                        "caption": caption if index == 0 else None,
+                        "parse_mode": ParseMode.HTML if index == 0 else None,
+                    }
+                    if kind == "photo":
+                        media.append(InputMediaPhoto(**kwargs))
+                    elif kind == "video":
+                        media.append(InputMediaVideo(**kwargs))
+                    else:
+                        media.append(InputMediaDocument(**kwargs))
+                return media
+
+            result = await self._retry(
+                lambda: self._bot.send_media_group(
+                    chat_id=target,
+                    media=build_media(),
+                    message_thread_id=message_thread_id,
+                )
+            )
+            all_sent = all_sent and result is not None
+        return all_sent

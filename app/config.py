@@ -5,7 +5,6 @@ from typing import Literal
 
 from dotenv import load_dotenv
 
-MaxClientBackend = Literal["legacy", "pymax"]
 PyMaxAuthMode = Literal["sms", "qr"]
 
 
@@ -14,10 +13,7 @@ class Settings:
     tg_bot_token: str
     tg_chat_id: str                      # default/fallback Telegram supergroup
     chat_routes: dict[str, int] = field(default_factory=dict)  # max_chat_id -> tg_chat_id
-    max_token: str | None = None
-    max_device_id: str | None = None
-    max_client_backend: MaxClientBackend = "legacy"
-    max_pymax_auth: PyMaxAuthMode = "sms"
+    max_pymax_auth: PyMaxAuthMode = "qr"
     max_phone: str | None = None
     max_pymax_work_dir: str = "state/pymax"
     max_pymax_session_name: str = "pymax-sms.db"
@@ -86,15 +82,10 @@ def _normalized_choice(name: str, default: str, allowed: set[str]) -> str:
 def load_settings() -> Settings:
     load_dotenv()
 
-    max_client_backend = _normalized_choice(
-        "MAX_CLIENT_BACKEND", "legacy", {"legacy", "pymax"}
-    )
-    max_pymax_auth = _normalized_choice("MAX_PYMAX_AUTH", "sms", {"sms", "qr"})
+    max_pymax_auth = _normalized_choice("MAX_PYMAX_AUTH", "qr", {"sms", "qr"})
 
     required = ["TG_BOT_TOKEN", "TG_CHAT_ID"]
-    if max_client_backend == "legacy":
-        required += ["MAX_TOKEN", "MAX_DEVICE_ID"]
-    elif max_pymax_auth == "sms":
+    if max_pymax_auth == "sms":
         required += ["MAX_PHONE"]
 
     missing = [k for k in required if not os.environ.get(k)]
@@ -146,9 +137,6 @@ def load_settings() -> Settings:
         tg_bot_token=os.environ["TG_BOT_TOKEN"],
         tg_chat_id=tg_chat_id,
         chat_routes=chat_routes,
-        max_token=os.environ.get("MAX_TOKEN") or None,
-        max_device_id=os.environ.get("MAX_DEVICE_ID") or None,
-        max_client_backend=max_client_backend,  # type: ignore[arg-type]
         max_pymax_auth=max_pymax_auth,  # type: ignore[arg-type]
         max_phone=os.environ.get("MAX_PHONE") or None,
         max_pymax_work_dir=max_pymax_work_dir,

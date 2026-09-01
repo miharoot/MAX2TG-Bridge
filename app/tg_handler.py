@@ -6,6 +6,7 @@ from html import escape
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import MessageEntityType
+from telegram.error import TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -14,8 +15,9 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
-from app.max_client import MaxClient
+from app.pymax_client import PyMaxClient
 from app.topics import TopicStore
 
 log = logging.getLogger(__name__)
@@ -28,6 +30,13 @@ ALLOWED_USER_KEY = "allowed_user_ids"
 # and /add now operate on whichever supergroup they're invoked in, so the
 # bot is no longer limited to a single group.
 SUPERGROUP_KEY = "supergroup_id"
+MAX_UPLOAD_BYTES_KEY = "max_upload_bytes"
+MEDIA_GROUPS_KEY = "pending_media_groups"
+DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MEDIA_GROUP_DELAY = 0.8
+TG_FILE_RETRIES = 3
+TG_CONNECT_TIMEOUT = 20.0
+TG_FILE_TIMEOUT = 180.0
 
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
 
@@ -138,7 +147,7 @@ def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed_user_ids = context.bot_data.get(ALLOWED_USER_KEY)
     if allowed_user_ids and update.effective_user and update.effective_user.id not in allowed_user_ids:
         return None
-    max_client: MaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
+    max_client: PyMaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
     return message, max_chat_id, max_client
 
 
@@ -188,20 +197,147 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _surface_send_result(message, resp)
 
 
-async def _download_tg_file(file_obj) -> bytes | None:
+async def _download_tg_file(file_obj, max_bytes: int = DEFAULT_MAX_UPLOAD_BYTES) -> bytes | None:
     """Pull bytes from a Telegram File object via the Bot API."""
-    try:
-        tg_file = await file_obj.get_file()
-        return bytes(await tg_file.download_as_bytearray())
-    except Exception:
-        log.exception("Failed to download Telegram file")
+    file_size = getattr(file_obj, "file_size", None)
+    if file_size is not None and file_size > max_bytes:
+        log.warning("Telegram file is too large: %s bytes > %s bytes", file_size, max_bytes)
         return None
+    for attempt in range(1, TG_FILE_RETRIES + 1):
+        try:
+            tg_file = await file_obj.get_file()
+            data = bytes(await tg_file.download_as_bytearray())
+            if len(data) > max_bytes:
+                log.warning("Downloaded Telegram file is too large: %s bytes > %s bytes", len(data), max_bytes)
+                return None
+            return data
+        except TimedOut:
+            log.warning(
+                "Telegram file download timeout (attempt %d/%d)",
+                attempt,
+                TG_FILE_RETRIES,
+            )
+            if attempt < TG_FILE_RETRIES:
+                await asyncio.sleep(2 * attempt)
+        except Exception:
+            log.exception("Failed to download Telegram file")
+            return None
+    return None
+
+
+async def _upload_topic_attachment(message, max_client, max_chat_id, max_upload_bytes):
+    """Download one Telegram medium and upload it to MAX."""
+    if message.photo:
+        photo = message.photo[-1]
+        data = await _download_tg_file(photo, max_upload_bytes)
+        if data is None:
+            await message.reply_text("⚠️ Не удалось скачать фото из Telegram или файл слишком большой.")
+            return None
+        return await max_client.upload_photo(data, chat_id=max_chat_id)
+
+    if message.voice:
+        data = await _download_tg_file(message.voice, max_upload_bytes)
+        if data is None:
+            await message.reply_text("⚠️ Не удалось скачать голосовое из Telegram или файл слишком большой.")
+            return None
+        voice_duration = message.voice.duration
+        if hasattr(voice_duration, "total_seconds"):
+            duration_ms = int(voice_duration.total_seconds() * 1000)
+        else:
+            duration_ms = int(voice_duration * 1000) if voice_duration is not None else None
+        return await max_client.upload_audio(
+            data, chat_id=max_chat_id,
+            filename="voice.ogg",
+            mimetype="audio/ogg",
+            duration=duration_ms,
+        )
+
+    if message.audio:
+        data = await _download_tg_file(message.audio, max_upload_bytes)
+        if data is None:
+            await message.reply_text("⚠️ Не удалось скачать аудио из Telegram или файл слишком большой.")
+            return None
+        return await max_client.upload_file(
+            data, chat_id=max_chat_id,
+            filename=message.audio.file_name or "audio",
+            mimetype=message.audio.mime_type or "audio/mpeg",
+        )
+
+    if message.document:
+        data = await _download_tg_file(message.document, max_upload_bytes)
+        if data is None:
+            await message.reply_text("⚠️ Не удалось скачать файл из Telegram или файл слишком большой.")
+            return None
+        return await max_client.upload_file(
+            data, chat_id=max_chat_id,
+            filename=message.document.file_name or "file",
+            mimetype=message.document.mime_type or "application/octet-stream",
+        )
+
+    if message.video:
+        data = await _download_tg_file(message.video, max_upload_bytes)
+        if data is None:
+            await message.reply_text("⚠️ Не удалось скачать видео из Telegram или файл слишком большой.")
+            return None
+        return await max_client.upload_video(
+            data,
+            chat_id=max_chat_id,
+            filename=message.video.file_name or "video.mp4",
+            mimetype=message.video.mime_type or "video/mp4",
+        )
+
+    return None
+
+
+async def _send_topic_media_messages(messages, max_chat_id, max_client, max_upload_bytes):
+    """Upload a Telegram album and send all attachments in one MAX message."""
+    attaches = []
+    for message in messages:
+        attach = await _upload_topic_attachment(
+            message, max_client, max_chat_id, max_upload_bytes
+        )
+        if attach:
+            attaches.append(attach)
+        else:
+            await message.reply_text("⚠️ Не удалось загрузить файл в MAX.")
+
+    if not attaches:
+        return
+
+    caption_message = next((message for message in messages if message.caption), messages[0])
+    caption = caption_message.caption or ""
+    elements = _entities_to_max_elements(caption, caption_message.caption_entities)
+    try:
+        resp = await max_client.send_message(
+            max_chat_id,
+            text=caption,
+            elements=elements,
+            attaches=attaches,
+        )
+    except Exception:
+        log.exception("Failed to send media group to Max chat %s", max_chat_id)
+        await caption_message.reply_text("⚠️ Ошибка при отправке в Max.")
+        return
+
+    await _surface_send_result(caption_message, resp)
+
+
+async def _flush_media_group(key, context) -> None:
+    await asyncio.sleep(MEDIA_GROUP_DELAY)
+    groups = context.bot_data.get(MEDIA_GROUPS_KEY, {})
+    group = groups.pop(key, None)
+    if not group:
+        return
+    await _send_topic_media_messages(
+        group["messages"],
+        group["max_chat_id"],
+        group["max_client"],
+        group["max_upload_bytes"],
+    )
 
 
 async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route a media message (photo / voice / document / audio / video) from a
-    forum topic to the matching Max chat. Caption, if any, becomes the
-    accompanying text."""
+    """Route a single medium or a complete Telegram album to one MAX message."""
     target = _resolve_topic_target(update, context)
     if not target:
         return
@@ -211,85 +347,33 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("⚠️ Max клиент не подключён.")
         return
 
-    caption = message.caption or ""
-
-    # ── pick the right uploader for the attached media ────────────
-    attach = None
-    if message.photo:
-        # message.photo is a list of progressively larger PhotoSize objects;
-        # the last one is the highest resolution.
-        photo = message.photo[-1]
-        data = await _download_tg_file(photo)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать фото из Telegram.")
-            return
-        attach = await max_client.upload_photo(data, chat_id=max_chat_id)
-
-    elif message.voice:
-        data = await _download_tg_file(message.voice)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать голосовое из Telegram.")
-            return
-        attach = await max_client.upload_audio(
-            data, chat_id=max_chat_id,
-            filename="voice.ogg",
-            mimetype="audio/ogg",
+    max_upload_bytes = context.bot_data.get(MAX_UPLOAD_BYTES_KEY, DEFAULT_MAX_UPLOAD_BYTES)
+    media_group_id = message.media_group_id
+    if media_group_id:
+        groups = context.bot_data.setdefault(MEDIA_GROUPS_KEY, {})
+        key = (message.chat_id, media_group_id)
+        group = groups.setdefault(
+            key,
+            {
+                "messages": [],
+                "max_chat_id": max_chat_id,
+                "max_client": max_client,
+                "max_upload_bytes": max_upload_bytes,
+                "task": None,
+            },
         )
-
-    elif message.audio:
-        data = await _download_tg_file(message.audio)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать аудио из Telegram.")
-            return
-        attach = await max_client.upload_file(
-            data, chat_id=max_chat_id,
-            filename=message.audio.file_name or "audio",
-            mimetype=message.audio.mime_type or "audio/mpeg",
-        )
-
-    elif message.document:
-        data = await _download_tg_file(message.document)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать файл из Telegram.")
-            return
-        attach = await max_client.upload_file(
-            data, chat_id=max_chat_id,
-            filename=message.document.file_name or "file",
-            mimetype=message.document.mime_type or "application/octet-stream",
-        )
-
-    elif message.video:
-        data = await _download_tg_file(message.video)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать видео из Telegram.")
-            return
-        attach = await max_client.upload_file(
-            data, chat_id=max_chat_id,
-            filename=message.video.file_name or "video.mp4",
-            mimetype=message.video.mime_type or "video/mp4",
-        )
-
-    else:
-        return  # unsupported media kind
-
-    if not attach:
-        await message.reply_text("⚠️ Не удалось загрузить файл в MAX.")
+        group["messages"].append(message)
+        if group["task"]:
+            group["task"].cancel()
+        group["task"] = asyncio.create_task(_flush_media_group(key, context))
         return
 
-    elements = _entities_to_max_elements(caption, message.caption_entities)
-    try:
-        resp = await max_client.send_message(max_chat_id, text=caption,
-                                              elements=elements,
-                                              attaches=[attach])
-    except Exception:
-        log.exception("Failed to send media reply to Max chat %s", max_chat_id)
-        await message.reply_text("⚠️ Ошибка при отправке в Max.")
-        return
-
-    await _surface_send_result(message, resp)
+    await _send_topic_media_messages(
+        [message], max_chat_id, max_client, max_upload_bytes
+    )
 
 
-async def post_topic_intro(bot, supergroup_id, max_client: MaxClient,
+async def post_topic_intro(bot, supergroup_id, max_client: PyMaxClient,
                             max_chat_id, thread_id: int, *,
                             pin: bool = True) -> None:
     """Publish a profile/info card as the first message of a topic, then pin
@@ -440,7 +524,7 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    max_client: MaxClient = context.bot_data[MAX_CLIENT_KEY]
+    max_client: PyMaxClient = context.bot_data[MAX_CLIENT_KEY]
     resolver = getattr(max_client, "resolver", None)
 
     # Build a topic title: explicit second arg → known chat title → chat id.
@@ -544,7 +628,7 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    max_client: MaxClient = context.bot_data[MAX_CLIENT_KEY]
+    max_client: PyMaxClient = context.bot_data[MAX_CLIENT_KEY]
     try:
         resp = await max_client.open_by_link(link)
     except Exception as exc:
@@ -647,6 +731,9 @@ HELP_TEXT = (
     "• <code>/add &lt;https://max.ru/join/...&gt;</code> — открыть "
     "групповую/канальную ссылку MAX, создать топик в этой группе и "
     "поставить карточку.\n"
+    "• <code>/list</code> — только в основной группе (<code>TG_CHAT_ID</code>): "
+    "список всех групповых чатов/каналов MAX с id и ссылкой, чтобы "
+    "скопировать нужный chat_id в <code>/bind</code>.\n"
     "• <code>/profile</code> — внутри топика: показать профиль собеседника "
     "из MAX (имя, id, аватар).\n"
     "• <code>/intro</code> — перепостить и закрепить карточку профиля "
@@ -657,11 +744,91 @@ HELP_TEXT = (
     "Просто пиши в любом привязанном топике — сообщение уйдёт в "
     "соответствующий чат MAX. Поддерживается жирный/курсив/зачёркнутый/"
     "подчёркнутый текст, моноширинный код, цитаты и ссылки. Фото, "
-    "документы и видео тоже передаются. Голосовые приходят как .ogg "
-    "файл (пока MAX не вернул нам опкод нативной загрузки).\n\n"
+    "документы, видео и голосовые сообщения тоже передаются напрямую.\n\n"
     "Если кто-то новый пишет тебе в MAX — топик создастся автоматически "
     "и в нём сразу появится карточка собеседника."
 )
+
+
+async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all MAX chats known to the bridge, with their chat_id and a
+    web.max.ru link — so you can copy a chat_id/link straight into
+    `/bind` (or `/add`) to route it to a topic.
+
+    Restricted to the *main* Telegram supergroup (``TG_CHAT_ID``) — the
+    default/fallback group — rather than any group the bot happens to be
+    in, since this is meant as a one-stop directory of the whole MAX
+    account, not something you'd want repeated in every routed group.
+    """
+    message = update.message
+    if message is None:
+        return
+    target_chat_id = update.effective_chat.id if update.effective_chat else None
+    if target_chat_id is None:
+        return
+
+    supergroup_id = context.bot_data.get(SUPERGROUP_KEY)
+    if supergroup_id is None or target_chat_id != supergroup_id:
+        await message.reply_text(
+            "Команда <code>/list</code> доступна только в основной "
+            "Telegram-группе (задана в <code>TG_CHAT_ID</code>).",
+            parse_mode="HTML",
+        )
+        return
+
+    allowed_user_ids = context.bot_data.get(ALLOWED_USER_KEY)
+    if allowed_user_ids and update.effective_user and update.effective_user.id not in allowed_user_ids:
+        return
+
+    max_client: PyMaxClient = context.bot_data[MAX_CLIENT_KEY]
+    resolver = getattr(max_client, "resolver", None)
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+
+    if not resolver or not resolver.chats_raw:
+        await message.reply_text("Список чатов MAX пока пуст (нет данных снапшота).")
+        return
+
+    entries = []
+    for chat_id, chat in resolver.chats_raw.items():
+        if resolver.is_dm(chat_id):
+            continue  # personal DMs aren't useful in a shared chat directory
+        title = resolver.chat_name(chat_id)
+        if title == str(chat_id):
+            title = chat.get("title") or "(без названия)"
+        chat_type = resolver.chat_types.get(chat_id, chat.get("type", "?"))
+        entries.append((title, chat_id, chat_type))
+
+    if not entries:
+        await message.reply_text("В MAX пока нет групповых чатов или каналов.")
+        return
+
+    entries.sort(key=lambda e: e[0].lower())
+
+    lines = ["<b>Чаты MAX</b> (для привязки скопируй chat_id в /bind):\n"]
+    for title, chat_id, chat_type in entries:
+        bound_thread = topic_store.get_topic(chat_id)
+        status = f" — уже в топике #{bound_thread}" if bound_thread is not None else ""
+        lines.append(
+            f"• <b>{escape(title)}</b> ({escape(str(chat_type))}) — "
+            f"<code>{chat_id}</code> — "
+            f'<a href="https://web.max.ru/{chat_id}">открыть</a>{status}'
+        )
+
+    # Telegram caps messages at 4096 chars — chunk if the directory is large.
+    chunk: list[str] = []
+    chunk_len = 0
+    chunks: list[str] = []
+    for line in lines:
+        if chunk_len + len(line) + 1 > 3800 and chunk:
+            chunks.append("\n".join(chunk))
+            chunk, chunk_len = [], 0
+        chunk.append(line)
+        chunk_len += len(line) + 1
+    if chunk:
+        chunks.append("\n".join(chunk))
+
+    for part in chunks:
+        await message.reply_text(part, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -838,30 +1005,10 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     contact = resolver.contacts_raw.get(peer_id)
     if contact is None:
-        # Probe several payload shapes / opcodes so we can see in the log
-        # what MAX is willing to return for a peer that's not in contacts.
-        probes = [
-            (32, {"contactIds": [peer_id]}),
-            (32, {"contactIds": [str(peer_id)]}),
-            (32, {"userIds": [peer_id]}),
-            (32, {"userId": peer_id}),
-            (35, {"contactIds": [peer_id]}),   # CONTACT_PRESENCE
-            (33, {"contactIds": [peer_id]}),
-            (36, {"contactIds": [peer_id]}),
-        ]
-        for op, payload in probes:
-            try:
-                resp = await max_client.cmd(op, payload)
-            except Exception:
-                log.exception("/profile probe op=%d failed", op)
-                continue
-            log.info("/profile probe op=%d payload=%s → %s",
-                     op, payload, str(resp)[:600])
-            if resp and "_max_error" not in resp:
-                # Let the resolver opportunistically pick up new fields.
-                resolver._parse_contacts_response(resp)
-                if peer_id in resolver.contacts_raw:
-                    break
+        try:
+            resolver._parse_contacts_response(await max_client.fetch_contacts([peer_id]))
+        except Exception:
+            log.exception("/profile: PyMax contact fetch failed")
         contact = resolver.contacts_raw.get(peer_id)
 
     if contact is None:
@@ -932,9 +1079,11 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await message.reply_text(body, parse_mode="HTML")
 
 
-def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
-                 topic_store: TopicStore, allowed_user_ids=None,
-                 proxy_url: str | None = None) -> Application:
+def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
+                 topic_store: TopicStore, allowed_user_id: int | None = None,
+                 proxy_url: str | None = None,
+                 max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES,
+                 allowed_user_ids: set[int] | frozenset[int] | None = None) -> Application:
     """Build the Telegram Application that routes topic replies back to Max.
 
     ``supergroup_id`` is kept only as the *default* group (bot-status
@@ -944,14 +1093,28 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     you can add the bot to several Telegram groups and use /bind or /add in
     each one to route specific Max chats there.
     """
-    builder = Application.builder().token(token)
+    request = HTTPXRequest(
+        proxy=proxy_url,
+        connect_timeout=TG_CONNECT_TIMEOUT,
+        read_timeout=TG_FILE_TIMEOUT,
+        write_timeout=TG_FILE_TIMEOUT,
+        media_write_timeout=TG_FILE_TIMEOUT,
+        pool_timeout=TG_CONNECT_TIMEOUT,
+    )
+    builder = Application.builder().token(token).request(request)
     if proxy_url:
-        builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
+        builder = builder.get_updates_proxy(proxy_url)
     app = builder.build()
     app.bot_data[MAX_CLIENT_KEY] = max_client
     app.bot_data[TOPIC_STORE_KEY] = topic_store
-    app.bot_data[ALLOWED_USER_KEY] = frozenset(allowed_user_ids) if allowed_user_ids else None
+    if allowed_user_ids:
+        app.bot_data[ALLOWED_USER_KEY] = frozenset(map(int, allowed_user_ids))
+    elif allowed_user_id:
+        app.bot_data[ALLOWED_USER_KEY] = frozenset({int(allowed_user_id)})
+    else:
+        app.bot_data[ALLOWED_USER_KEY] = None
     app.bot_data[SUPERGROUP_KEY] = int(supergroup_id)
+    app.bot_data[MAX_UPLOAD_BYTES_KEY] = max_upload_bytes
 
     # Any supergroup, not just the configured default — routing is decided
     # per-command (/bind, /add operate on whichever group they're called in)
@@ -959,6 +1122,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     chat_filter = filters.ChatType.SUPERGROUP
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))
     app.add_handler(CommandHandler("add", _cmd_add, filters=chat_filter))
+    app.add_handler(CommandHandler("list", _cmd_list, filters=chat_filter))
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
     app.add_handler(CommandHandler("intro", _cmd_intro, filters=chat_filter))
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))

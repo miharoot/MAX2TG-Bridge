@@ -10,7 +10,7 @@ from telegram import Update
 
 from app.config import load_settings
 from app.health import start_health_server
-from app.max_listener import create_max_client, create_pymax_client
+from app.max_listener import create_pymax_client
 from app.tg_handler import build_tg_app
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
@@ -79,21 +79,13 @@ async def main():
                             proxy_url=settings.tg_proxy, chat_routes=settings.chat_routes)
     await sender.start()
 
-    if settings.max_client_backend == "pymax":
-        client = create_pymax_client(settings, sender)
-        log.info(
-            "Using PyMax client backend (auth=%s, session=%s/%s)",
-            settings.max_pymax_auth,
-            settings.max_pymax_work_dir,
-            settings.max_pymax_session_name,
-        )
-    else:
-        client = create_max_client(
-            settings.max_token, settings.max_device_id, sender, settings.max_chat_ids,
-            settings.max_ignore_chat_ids, debug=settings.debug,
-            debug_dump_json=settings.debug_dump_json,
-            max_download_mb=settings.max_download_mb,
-        )
+    client = create_pymax_client(settings, sender)
+    log.info(
+        "Using PyMax (auth=%s, session=%s/%s)",
+        settings.max_pymax_auth,
+        settings.max_pymax_work_dir,
+        settings.max_pymax_session_name,
+    )
 
     health_runner = None
     if settings.health_port:
@@ -103,7 +95,8 @@ async def main():
     if settings.reply_enabled:
         tg_app = build_tg_app(settings.tg_bot_token, client, settings.tg_chat_id,
                               topic_store, allowed_user_ids=settings.tg_allowed_user_ids,
-                              proxy_url=settings.tg_proxy)
+                              proxy_url=settings.tg_proxy,
+                              max_upload_bytes=settings.max_download_mb * 1024 * 1024)
         await tg_app.initialize()
         await tg_app.start()
         await tg_app.updater.start_polling(

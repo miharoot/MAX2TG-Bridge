@@ -2,16 +2,53 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
-from app.max_client import MaxMessage, MaxReactionEvent, MaxReadEvent
-from app.max_listener import create_max_client
+from app.pymax_client import MaxMessage, MaxReactionEvent, MaxReadEvent
+from app.max_listener import configure_pymax_client
+
+
+class _FakePyMaxClient:
+    """Minimal stand-in for PyMaxClient exposing just the decorator-based
+    wiring surface that configure_pymax_client() attaches callbacks to,
+    without needing a real PyMax session/connection."""
+
+    def __init__(self, my_id=None):
+        self.my_id = my_id
+        self._echoes: set = set()
+        self._on_ready_cb = None
+        self._on_message_cb = None
+        self._on_disconnect_cb = None
+        self._on_read_cb = None
+        self._on_reaction_cb = None
+
+    def on_ready(self, func):
+        self._on_ready_cb = func
+        return func
+
+    def on_message(self, func):
+        self._on_message_cb = func
+        return func
+
+    def on_disconnect(self, func):
+        self._on_disconnect_cb = func
+        return func
+
+    def on_read(self, func):
+        self._on_read_cb = func
+        return func
+
+    def on_reaction(self, func):
+        self._on_reaction_cb = func
+        return func
+
+    def is_bridge_echo(self, msg: MaxMessage) -> bool:
+        return False
 
 
 def _make_client(sender=None, my_id=None):
     if sender is None:
         sender = AsyncMock()
-    client = create_max_client(max_token="tok", max_device_id="dev", sender=sender)
-    if my_id is not None:
-        client._my_id = my_id
+    client = _FakePyMaxClient(my_id=my_id)
+    configure_pymax_client(client, sender)
     return client, sender
 
 

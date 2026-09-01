@@ -2,11 +2,9 @@ import asyncio
 import logging
 from datetime import datetime
 from html import escape
-from typing import Any
 
 from app.config import Settings
-from app.max_client import MaxClient, MaxMessage, MaxReactionEvent, MaxReadEvent, OpCode
-from app.pymax_client import PyMaxClientAdapter
+from app.pymax_client import MaxMessage, MaxReactionEvent, MaxReadEvent, PyMaxClient
 from app.resolver import ContactResolver
 from app.tg_sender import TelegramSender
 
@@ -14,6 +12,27 @@ log = logging.getLogger(__name__)
 
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+ATTACHMENT_LABELS = {
+    "PHOTO": "📷 <i>[фото — не удалось загрузить]</i>",
+    "VIDEO": "🎬 <i>[видео — не удалось загрузить]</i>",
+    "FILE": "📎 <i>[файл — не удалось загрузить]</i>",
+    "AUDIO": "🎵 <i>[аудио — не удалось загрузить]</i>",
+    "STICKER": "🏷 <i>[стикер — не удалось загрузить]</i>",
+    "LOCATION": "📍 <i>[геолокация — не удалось загрузить]</i>",
+    "CONTACT": "👤 <i>[контакт — не удалось загрузить]</i>",
+    "SHARE": "🔗 <i>[ссылка — не удалось загрузить]</i>",
+}
+
+
+def _attachment_failure(attach: dict) -> str:
+    atype = attach.get("_type", "")
+    if atype == "UNSUPPORTED" and attach.get("audioId") is not None:
+        return "🎙 <i>[голосовое сообщение — не удалось загрузить]</i>"
+    return ATTACHMENT_LABELS.get(
+        atype,
+        f"📎 <i>[вложение {escape(atype or 'неизвестного типа')} — не удалось загрузить]</i>",
+    )
 
 
 def _header(msg: MaxMessage, sender_label: str, chat_label: str, is_dm: bool,
@@ -50,36 +69,82 @@ def _guess_media_kind(filename: str) -> str:
     return "document"
 
 
+async def _try_send_media_group(
+    attaches: list[dict],
+    client: PyMaxClient,
+    sender: TelegramSender,
+    caption: str,
+    thread_id: int | None,
+    msg: MaxMessage,
+    target_chat_id: str | int | None = None,
+) -> bool | None:
+    """Group compatible MAX attachments. None means fall back to single sends."""
+    if len(attaches) < 2:
+        return None
+
+    types = {attach.get("_type") for attach in attaches}
+    if types <= {"PHOTO", "VIDEO"}:
+        items: list[tuple[str, bytes, str]] = []
+        for index, attach in enumerate(attaches):
+            if attach.get("_type") == "PHOTO":
+                url = _extract_photo_url(attach)
+                data = await client.download_file(url) if url else None
+                if not data:
+                    return None
+                items.append(("photo", data, f"photo-{index + 1}.jpg"))
+            else:
+                video_id = attach.get("videoId")
+                if video_id is None:
+                    return None
+                url = await client.download_video_url(
+                    video_id, chat_id=msg.chat_id, message_id=msg.message_id
+                )
+                data = await client.download_file(url) if url else None
+                if not data:
+                    return None
+                items.append(("video", data, f"{video_id}.mp4"))
+        return await sender.send_media_group(
+            items, caption=caption, message_thread_id=thread_id, chat_id=target_chat_id
+        )
+
+    if types == {"FILE"}:
+        items = []
+        for attach in attaches:
+            name = attach.get("name") or "file"
+            url = _extract_file_url(attach)
+            if not url and attach.get("fileId") is not None:
+                url = await client.resolve_file_url(
+                    msg.chat_id, msg.message_id, attach["fileId"]
+                )
+            data = await client.download_file(url) if url else None
+            if not data:
+                return None
+            items.append(("document", data, name))
+        return await sender.send_media_group(
+            items, caption=caption, message_thread_id=thread_id, chat_id=target_chat_id
+        )
+
+    return None
+
+
 async def _resolve_file_download_url(
-    attach: dict, client: MaxClient, msg: MaxMessage | None,
+    attach: dict, client: PyMaxClient, msg: MaxMessage | None,
 ) -> str | None:
     """FILE attaches sometimes arrive with only a ``fileId`` and no direct
-    ``url`` — resolve it via the WS FILE_DOWNLOAD_URL opcode, same as we
-    already do for audio."""
+    ``url`` — resolve it via PyMax's native file-URL resolver, same as we
+    already do for audio/video."""
     direct = _extract_file_url(attach)
     if direct:
         return direct
     file_id = attach.get("fileId")
     if file_id is None or msg is None or not msg.message_id:
         return None
-    try:
-        file_id_int = int(file_id)
-    except (TypeError, ValueError):
-        return None
-    resp = await client.cmd(OpCode.FILE_DOWNLOAD_URL, {
-        "fileId": file_id_int,
-        "chatId": msg.chat_id,
-        "messageId": str(msg.message_id),
-    })
-    if not isinstance(resp, dict) or "_max_error" in resp:
-        return None
-    url = resp.get("url")
-    return url if isinstance(url, str) and url.startswith("http") else None
+    return await client.resolve_file_url(msg.chat_id, msg.message_id, file_id)
 
 
 async def _send_attach(
     attach: dict,
-    client: MaxClient,
+    client: PyMaxClient,
     sender: TelegramSender,
     header_text: str,
     thread_id: int | None = None,
@@ -111,8 +176,9 @@ async def _send_attach(
         if url:
             data = await client.download_file(url)
             if data:
-                return await sender.send_voice(data, caption=header_text,
-                                         message_thread_id=thread_id, chat_id=chat_id)
+                if await sender.send_voice(data, caption=header_text,
+                                            message_thread_id=thread_id, chat_id=chat_id):
+                    return None
         dur_s = f" ({duration // 1000}с)" if duration else ""
         return await sender.send(
             f"{header_text}\n🎙 <i>[голосовое сообщение{dur_s} — не удалось скачать]</i>",
@@ -123,10 +189,14 @@ async def _send_attach(
         url = _extract_photo_url(attach)
         if not url:
             log.warning("PHOTO attach has no URL: %s", attach)
-            return None
+            return await sender.send(
+                f"{header_text}\n{_attachment_failure(attach)}",
+                message_thread_id=thread_id, chat_id=chat_id,
+            )
         data = await client.download_file(url)
         if data:
-            return await sender.send_photo(data, caption=header_text, message_thread_id=thread_id, chat_id=chat_id)
+            if await sender.send_photo(data, caption=header_text, message_thread_id=thread_id, chat_id=chat_id):
+                return None
         return await sender.send(f"{header_text}\n<i>[фото — не удалось загрузить]</i>", message_thread_id=thread_id, chat_id=chat_id)
 
     if atype == "VIDEO":
@@ -138,50 +208,69 @@ async def _send_attach(
             video_url = await client.download_video_url(
                 video_id, msg.chat_id, msg.message_id,
             )
+        elif video_id is not None:
+            log.warning(
+                "Cannot resolve VIDEO without chat/message context: videoId=%s",
+                video_id,
+            )
         if video_url:
             data = await client.download_file(video_url)
             if data:
-                return await sender.send_video(data, caption=header_text, message_thread_id=thread_id, chat_id=chat_id)
+                if await sender.send_video(data, caption=header_text, filename=f"{video_id}.mp4",
+                                            message_thread_id=thread_id, chat_id=chat_id):
+                    return None
 
         thumb = attach.get("thumbnail")
         if thumb:
             data = await client.download_file(thumb)
             if data:
-                return await sender.send_photo(data, caption=f"{header_text}\n<i>[видео — превью, не удалось скачать полностью]</i>", message_thread_id=thread_id, chat_id=chat_id)
-        return await sender.send(f"{header_text}\n<i>[видео]</i>", message_thread_id=thread_id, chat_id=chat_id)
+                if await sender.send_photo(data, caption=f"{header_text}\n<i>[видео — превью, не удалось скачать полностью]</i>",
+                                            message_thread_id=thread_id, chat_id=chat_id):
+                    return None
+        return await sender.send(f"{header_text}\n<i>[видео — не удалось загрузить]</i>", message_thread_id=thread_id, chat_id=chat_id)
 
     if atype == "FILE":
         name = attach.get("name", "file")
         size = attach.get("size", 0)
+        file_id = attach.get("fileId")
         token_url = await _resolve_file_download_url(attach, client, msg)
         if token_url:
             data = await client.download_file(token_url)
             if data:
                 kind = _guess_media_kind(name)
                 if kind == "photo":
-                    return await sender.send_photo(data, caption=header_text, filename=name, message_thread_id=thread_id, chat_id=chat_id)
+                    sent = await sender.send_photo(data, caption=header_text, filename=name, message_thread_id=thread_id, chat_id=chat_id)
                 elif kind == "video":
-                    await sender.send_video(data, caption=header_text, filename=name, message_thread_id=thread_id, chat_id=chat_id)
+                    sent = await sender.send_video(data, caption=header_text, filename=name, message_thread_id=thread_id, chat_id=chat_id)
                 else:
-                    await sender.send_document(data, caption=header_text, filename=name, message_thread_id=thread_id, chat_id=chat_id)
+                    sent = await sender.send_document(data, caption=header_text, filename=name, message_thread_id=thread_id, chat_id=chat_id)
+                if sent:
+                    return None
+        log.warning("FILE content unavailable; sending metadata only: fileId=%s name=%r", file_id, name)
         size_str = f" ({_human_size(size)})" if size else ""
-        return await sender.send(f"{header_text}\n📎 <b>{escape(name)}</b>{size_str}", message_thread_id=thread_id, chat_id=chat_id)
+        return await sender.send(
+            f"{header_text}\n📎 <b>{escape(name)}</b>{size_str}\n"
+            "<i>[файл — не удалось загрузить]</i>",
+            message_thread_id=thread_id, chat_id=chat_id,
+        )
 
     if atype == "AUDIO":
         url = attach.get("url")
         if url:
             data = await client.download_file(url)
             if data:
-                return await sender.send_voice(data, caption=header_text, message_thread_id=thread_id, chat_id=chat_id)
-        return await sender.send(f"{header_text}\n<i>[аудио]</i>", message_thread_id=thread_id, chat_id=chat_id)
+                if await sender.send_voice(data, caption=header_text, message_thread_id=thread_id, chat_id=chat_id):
+                    return None
+        return await sender.send(f"{header_text}\n{_attachment_failure(attach)}", message_thread_id=thread_id, chat_id=chat_id)
 
     if atype == "STICKER":
         url = attach.get("url")
         if url:
             data = await client.download_file(url)
             if data:
-                return await sender.send_sticker(data, message_thread_id=thread_id, chat_id=chat_id)
-        return await sender.send(f"{header_text}\n<i>[стикер]</i>", message_thread_id=thread_id, chat_id=chat_id)
+                if await sender.send_sticker(data, message_thread_id=thread_id, chat_id=chat_id):
+                    return None
+        return await sender.send(f"{header_text}\n{_attachment_failure(attach)}", message_thread_id=thread_id, chat_id=chat_id)
 
     if atype == "SHARE":
         share_url = attach.get("url", "")
@@ -220,7 +309,7 @@ async def _handle_linked_message(
     link: dict,
     link_type: str,
     header_text: str,
-    client: MaxClient,
+    client: PyMaxClient,
     sender: TelegramSender,
     resolver: ContactResolver,
     thread_id: int | None = None,
@@ -256,6 +345,25 @@ async def _handle_linked_message(
 
     last_message = None
     if fwd_meaningful:
+        group_caption = full_header
+        if fwd_text:
+            group_caption = f"{full_header}\n{escape(fwd_text)}"
+        try:
+            grouped = await _try_send_media_group(
+                fwd_meaningful, client, sender, group_caption, thread_id, msg, chat_id
+            ) if msg else None
+        except Exception:
+            log.exception("Failed to prepare linked attachment group")
+            grouped = None
+        if grouped is True:
+            return
+        if grouped is False:
+            await sender.send(
+                f"{group_caption}\n<i>[группа вложений — не удалось загрузить]</i>",
+                message_thread_id=thread_id, chat_id=chat_id,
+            )
+            return
+
         text_sent = False
         for i, attach in enumerate(fwd_meaningful):
             if i == 0 and fwd_text:
@@ -263,9 +371,19 @@ async def _handle_linked_message(
                 text_sent = True
             else:
                 cap = full_header
-            result = await _send_attach(attach, client, sender, cap, thread_id=thread_id, msg=msg, chat_id=chat_id)
-            if result is not None:
-                last_message = result
+            try:
+                result = await _send_attach(attach, client, sender, cap, thread_id=thread_id, msg=msg, chat_id=chat_id)
+                if result is not None:
+                    last_message = result
+            except Exception:
+                log.exception(
+                    "Failed to forward linked attach _type=%s",
+                    attach.get("_type"),
+                )
+                await sender.send(
+                    f"{cap}\n{_attachment_failure(attach)}",
+                    message_thread_id=thread_id, chat_id=chat_id,
+                )
 
         if fwd_text and not text_sent:
             last_message = await sender.send(f"{full_header}\n{escape(fwd_text)}", message_thread_id=thread_id, chat_id=chat_id)
@@ -320,27 +438,12 @@ async def _topic_title_for_message(msg: MaxMessage, resolver: ContactResolver,
     return str(msg.chat_id), False
 
 
-def create_max_client(
-    max_token: str, max_device_id: str, sender: TelegramSender,
-    max_chat_ids: str | None = None, max_ignore_chat_ids: str | None = None,
-    debug: bool = False, debug_dump_json: bool = False,
-    max_download_mb: int = 50,
-) -> MaxClient:
-    client = MaxClient(
-        token=max_token, device_id=max_device_id, debug=debug,
-        debug_dump_json=debug_dump_json, chat_ids=max_chat_ids,
-        ignore_chat_ids=max_ignore_chat_ids,
-        max_download_bytes=max_download_mb * 1024 * 1024,
-    )
-    return configure_max_client(client, sender)
+def create_pymax_client(settings: Settings, sender: TelegramSender) -> PyMaxClient:
+    client = PyMaxClient(settings)
+    return configure_pymax_client(client, sender)
 
 
-def create_pymax_client(settings: Settings, sender: TelegramSender) -> PyMaxClientAdapter:
-    client = PyMaxClientAdapter(settings)
-    return configure_max_client(client, sender)
-
-
-def configure_max_client(client: Any, sender: TelegramSender):
+def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
     resolver = ContactResolver(client=client)
     # Expose for tg_handler commands like /profile.
     client.resolver = resolver
@@ -505,6 +608,32 @@ def configure_max_client(client: Any, sender: TelegramSender):
         ]
 
         if meaningful_attaches:
+            group_caption = header_text
+            if msg.text:
+                group_caption = f"{header_text}\n{escape(msg.text)}"
+            try:
+                grouped = await _try_send_media_group(
+                    meaningful_attaches,
+                    client,
+                    sender,
+                    group_caption,
+                    thread_id,
+                    msg,
+                    target_chat_id,
+                )
+            except Exception:
+                log.exception("Failed to prepare attachment group")
+                grouped = None
+            if grouped is True:
+                log.info("Forwarded %d attachments as media group", len(meaningful_attaches))
+                return
+            if grouped is False:
+                await sender.send(
+                    f"{group_caption}\n<i>[группа вложений — не удалось загрузить]</i>",
+                    message_thread_id=thread_id, chat_id=target_chat_id,
+                )
+                return
+
             text_sent = False
             for i, attach in enumerate(meaningful_attaches):
                 if i == 0 and msg.text:
@@ -512,10 +641,20 @@ def configure_max_client(client: Any, sender: TelegramSender):
                     text_sent = True
                 else:
                     cap = header_text
-                result = await _send_attach(attach, client, sender, cap, thread_id=thread_id, msg=msg, chat_id=target_chat_id)
-                if result is not None:
-                    last_message = result
-                log.info("Forwarded attach _type=%s → TG", attach.get("_type"))
+                try:
+                    result = await _send_attach(attach, client, sender, cap, thread_id=thread_id, msg=msg, chat_id=target_chat_id)
+                    if result is not None:
+                        last_message = result
+                except Exception:
+                    log.exception(
+                        "Failed to forward attach _type=%s",
+                        attach.get("_type"),
+                    )
+                    await sender.send(
+                        f"{cap}\n{_attachment_failure(attach)}",
+                        message_thread_id=thread_id, chat_id=target_chat_id,
+                    )
+                log.info("Processed attach _type=%s", attach.get("_type"))
 
             if msg.text and not text_sent:
                 last_message = await sender.send(f"{header_text}\n{escape(msg.text)}", message_thread_id=thread_id, chat_id=target_chat_id)
