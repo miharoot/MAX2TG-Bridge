@@ -23,6 +23,10 @@ log = logging.getLogger(__name__)
 MAX_CLIENT_KEY = "max_client"
 TOPIC_STORE_KEY = "topic_store"
 ALLOWED_USER_KEY = "allowed_user_id"
+# Default/fallback Telegram supergroup — used for status messages and as the
+# target for brand-new Max chats with no explicit route. Commands like /bind
+# and /add now operate on whichever supergroup they're invoked in, so the
+# bot is no longer limited to a single group.
 SUPERGROUP_KEY = "supergroup_id"
 
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
@@ -119,7 +123,11 @@ def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if thread_id is None or not message.is_topic_message:
         return None
     topic_store: TopicStore | None = context.bot_data.get(TOPIC_STORE_KEY)
-    max_chat_id = topic_store.chat_for_topic(thread_id) if topic_store else None
+    tg_chat_id = update.effective_chat.id if update.effective_chat else None
+    max_chat_id = (
+        topic_store.chat_for_topic(tg_chat_id, thread_id)
+        if topic_store and tg_chat_id is not None else None
+    )
     if max_chat_id is None:
         return None
     allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
@@ -380,13 +388,17 @@ async def post_topic_intro(bot, supergroup_id, max_client: MaxClient,
 async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Create a forum topic bound to a specific Max chat id.
 
-    Usage: `/bind <chat_id-or-url> [optional-title]` — typed anywhere in the
-    supergroup. The bot creates a new forum topic (or reports an existing
-    binding) and stores the mapping so messages typed there get forwarded
-    to the Max chat.
+    Usage: `/bind <chat_id-or-url> [optional-title]` — typed in whichever
+    Telegram supergroup you want that Max chat routed to. The bot creates a
+    new forum topic there (or reports an existing binding) and stores the
+    mapping so messages typed in that topic get forwarded to the Max chat,
+    and future messages from that Max chat land in this same group.
     """
     message = update.message
     if message is None:
+        return
+    target_chat_id = update.effective_chat.id if update.effective_chat else None
+    if target_chat_id is None:
         return
 
     allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
@@ -431,27 +443,30 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         title = str(max_chat_id)
     title = title[:128]
 
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
     try:
         topic = await context.bot.create_forum_topic(
-            chat_id=int(supergroup_id), name=title,
+            chat_id=target_chat_id, name=title,
         )
     except Exception as exc:
-        log.exception("Failed to create forum topic for %s", max_chat_id)
-        await message.reply_text(f"Не удалось создать топик: {exc}")
+        log.exception("Failed to create forum topic for %s in %s", max_chat_id, target_chat_id)
+        await message.reply_text(
+            f"Не удалось создать топик: {exc}\n\n"
+            "Убедитесь, что в этой группе включены темы (Topics) и бот — "
+            "администратор с правом «Управление темами»."
+        )
         return
 
     thread_id = topic.message_thread_id
-    topic_store.set_topic(max_chat_id, thread_id, title)
+    topic_store.set_topic(max_chat_id, int(target_chat_id), thread_id, title)
     await message.reply_text(
         f"Готово: <b>{escape(title)}</b> ↔ MAX <code>{max_chat_id}</code> "
-        f"(thread_id=<code>{thread_id}</code>). Пиши в новом топике — улетит в MAX.",
+        f"(thread_id=<code>{thread_id}</code>) в этой группе. "
+        "Пиши в новом топике — улетит в MAX.",
         parse_mode="HTML",
     )
     # Post & pin a profile card in the freshly-created topic.
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
     asyncio.create_task(
-        post_topic_intro(context.bot, supergroup_id, max_client,
+        post_topic_intro(context.bot, target_chat_id, max_client,
                           max_chat_id, thread_id)
     )
 
@@ -494,6 +509,9 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     message = update.message
     if message is None:
+        return
+    target_chat_id = update.effective_chat.id if update.effective_chat else None
+    if target_chat_id is None:
         return
 
     allowed_user_id = context.bot_data.get(ALLOWED_USER_KEY)
@@ -581,36 +599,45 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         title = str(chat_id)
     title = title[:128]
 
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
     try:
         topic = await context.bot.create_forum_topic(
-            chat_id=int(supergroup_id), name=title,
+            chat_id=target_chat_id, name=title,
         )
     except Exception as exc:
-        log.exception("/add: create_forum_topic failed")
-        await message.reply_text(f"Не удалось создать топик: {exc}")
+        log.exception("/add: create_forum_topic failed for %s", target_chat_id)
+        await message.reply_text(
+            f"Не удалось создать топик: {exc}\n\n"
+            "Убедитесь, что в этой группе включены темы (Topics) и бот — "
+            "администратор с правом «Управление темами»."
+        )
         return
 
     thread_id = topic.message_thread_id
-    topic_store.set_topic(chat_id, thread_id, title)
+    topic_store.set_topic(chat_id, int(target_chat_id), thread_id, title)
     await message.reply_text(
         f"Готово: <b>{escape(title)}</b> ↔ MAX <code>{chat_id}</code> "
-        f"(thread_id=<code>{thread_id}</code>).",
+        f"(thread_id=<code>{thread_id}</code>) в этой группе.",
         parse_mode="HTML",
     )
     asyncio.create_task(
-        post_topic_intro(context.bot, supergroup_id, max_client,
+        post_topic_intro(context.bot, target_chat_id, max_client,
                           chat_id, thread_id)
     )
 
 
 HELP_TEXT = (
     "<b>max2tg — мост MAX ↔ Telegram</b>\n\n"
+    "Бот можно добавить в несколько Telegram-групп (с включёнными темами) — "
+    "команды ниже работают в той группе, где их вводишь, и привязывают "
+    "MAX-чат именно к ней. Так один и тот же MAX-аккаунт можно "
+    "маршрутизировать в разные Telegram-группы: часть контактов — в одну, "
+    "часть — в другую.\n\n"
     "Команды в супергруппе:\n"
     "• <code>/bind &lt;chat_id или URL&gt; [название]</code> — привязать "
-    "новый топик к чату MAX.\n"
+    "новый топик к чату MAX в этой группе.\n"
     "• <code>/add &lt;https://max.ru/join/...&gt;</code> — открыть "
-    "групповую/канальную ссылку MAX, создать топик и поставить карточку.\n"
+    "групповую/канальную ссылку MAX, создать топик в этой группе и "
+    "поставить карточку.\n"
     "• <code>/profile</code> — внутри топика: показать профиль собеседника "
     "из MAX (имя, id, аватар).\n"
     "• <code>/intro</code> — перепостить и закрепить карточку профиля "
@@ -656,11 +683,12 @@ async def _cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     _, max_chat_id, _ = target
     thread_id = message.message_thread_id
+    tg_chat_id = update.effective_chat.id
 
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🗑 Удалить топик",
-                                 callback_data=f"del:ok:{thread_id}:{max_chat_id}"),
+                                 callback_data=f"del:ok:{tg_chat_id}:{thread_id}:{max_chat_id}"),
             InlineKeyboardButton("Отмена", callback_data="del:cancel"),
         ]
     ])
@@ -692,18 +720,18 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
         return
 
-    if len(parts) != 4 or parts[0] != "del" or parts[1] != "ok":
+    if len(parts) != 5 or parts[0] != "del" or parts[1] != "ok":
         return
     try:
-        thread_id = int(parts[2])
+        tg_chat_id = int(parts[2])
+        thread_id = int(parts[3])
     except ValueError:
         return
     try:
-        max_chat_id: int | str = int(parts[3])
+        max_chat_id: int | str = int(parts[4])
     except ValueError:
-        max_chat_id = parts[3]
+        max_chat_id = parts[4]
 
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
 
     # Remove mapping first — even if delete_forum_topic fails the stale link
@@ -712,7 +740,7 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     try:
         await context.bot.delete_forum_topic(
-            chat_id=int(supergroup_id), message_thread_id=thread_id,
+            chat_id=tg_chat_id, message_thread_id=thread_id,
         )
     except Exception as exc:
         log.exception("/del: delete_forum_topic failed")
@@ -749,9 +777,8 @@ async def _cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not max_client:
         await message.reply_text("⚠️ Max клиент не подключён.")
         return
-    supergroup_id = context.bot_data[SUPERGROUP_KEY]
     await post_topic_intro(
-        context.bot, supergroup_id, max_client, max_chat_id,
+        context.bot, update.effective_chat.id, max_client, max_chat_id,
         message.message_thread_id,
     )
 
@@ -899,7 +926,15 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
                  topic_store: TopicStore, allowed_user_id: int | None = None,
                  proxy_url: str | None = None) -> Application:
-    """Build the Telegram Application that routes topic replies back to Max."""
+    """Build the Telegram Application that routes topic replies back to Max.
+
+    ``supergroup_id`` is kept only as the *default* group (bot-status
+    messages, fallback target for brand-new unbound Max chats) — it is no
+    longer the only group the bot will respond in. Commands and topic
+    messages are accepted from *any* supergroup the bot is a member of, so
+    you can add the bot to several Telegram groups and use /bind or /add in
+    each one to route specific Max chats there.
+    """
     builder = Application.builder().token(token)
     if proxy_url:
         builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
@@ -909,7 +944,10 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.bot_data[ALLOWED_USER_KEY] = int(allowed_user_id) if allowed_user_id else None
     app.bot_data[SUPERGROUP_KEY] = int(supergroup_id)
 
-    chat_filter = filters.Chat(chat_id=int(supergroup_id))
+    # Any supergroup, not just the configured default — routing is decided
+    # per-command (/bind, /add operate on whichever group they're called in)
+    # and per-topic (TopicStore keys on (tg_chat_id, thread_id)).
+    chat_filter = filters.ChatType.SUPERGROUP
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))
     app.add_handler(CommandHandler("add", _cmd_add, filters=chat_filter))
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))

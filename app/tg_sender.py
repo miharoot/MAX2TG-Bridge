@@ -24,15 +24,16 @@ def _looks_numeric(title: str) -> bool:
 
 
 class TelegramSender:
-    def __init__(self, token: str, chat_id: str, topic_store: TopicStore,
-                 proxy_url: str | None = None):
+    def __init__(self, token: str, default_chat_id: str, topic_store: TopicStore,
+                 proxy_url: str | None = None, chat_routes: dict[str, int] | None = None):
         if proxy_url:
             request = HTTPXRequest(proxy=proxy_url)
             self._bot = Bot(token=token, request=request)
         else:
             self._bot = Bot(token=token)
-        self._chat_id = chat_id
+        self._default_chat_id = str(default_chat_id)
         self._topics = topic_store
+        self._chat_routes = {str(k): int(v) for k, v in (chat_routes or {}).items()}
         self._topic_lock = asyncio.Lock()
 
     @property
@@ -41,7 +42,9 @@ class TelegramSender:
 
     @property
     def chat_id(self) -> str:
-        return self._chat_id
+        """Default/fallback Telegram chat — used for bot-status messages and
+        as the target for Max chats that have no explicit route yet."""
+        return self._default_chat_id
 
     @property
     def topic_store(self) -> TopicStore:
@@ -55,17 +58,38 @@ class TelegramSender:
     async def stop(self):
         await self._bot.shutdown()
 
+    # ── routing ─────────────────────────────────────────────────────
+
+    def resolve_chat_id(self, max_chat_id) -> str:
+        """Which Telegram supergroup a given Max chat should be forwarded to.
+
+        Priority: (1) an existing topic binding (TopicStore) — this is the
+        source of truth once a topic exists, since /bind may have created it
+        in a non-default group; (2) a static MAX_CHAT_ROUTES entry, for
+        chats that should land in a specific group the very first time a
+        message arrives; (3) the configured default group.
+        """
+        bound = self._topics.get_chat_id(max_chat_id)
+        if bound is not None:
+            return str(bound)
+        routed = self._chat_routes.get(str(max_chat_id))
+        if routed is not None:
+            return str(routed)
+        return self._default_chat_id
+
     # ── forum topics ───────────────────────────────────────────────
 
     async def ensure_topic(self, max_chat_id, title: str) -> int | None:
         """Return the Telegram forum topic (thread) ID for a Max chat.
 
-        Creates the topic on first use. If a previously created topic still
-        carries a placeholder (numeric) name and a real name is now known,
-        the topic is renamed. Returns None if topic creation fails — callers
-        then fall back to the General topic.
+        Creates the topic (in the resolved target group — see
+        ``resolve_chat_id``) on first use. If a previously created topic
+        still carries a placeholder (numeric) name and a real name is now
+        known, the topic is renamed. Returns None if topic creation fails —
+        callers then fall back to the General topic.
         """
         title = (title or str(max_chat_id)).strip()[:TG_TOPIC_NAME_MAX]
+        target_chat_id = self.resolve_chat_id(max_chat_id)
 
         existing = self._topics.get_topic(max_chat_id)
         if existing is not None:
@@ -73,7 +97,7 @@ class TelegramSender:
             if title and title != stored and _looks_numeric(stored) and not _looks_numeric(title):
                 try:
                     await self._bot.edit_forum_topic(
-                        chat_id=self._chat_id, message_thread_id=existing, name=title
+                        chat_id=target_chat_id, message_thread_id=existing, name=title
                     )
                     self._topics.update_title(max_chat_id, title)
                     log.info("Renamed forum topic %s → %r", existing, title)
@@ -87,19 +111,19 @@ class TelegramSender:
                 return existing
             try:
                 topic = await self._bot.create_forum_topic(
-                    chat_id=self._chat_id, name=title
+                    chat_id=target_chat_id, name=title
                 )
             except Exception:
                 log.exception(
-                    "Failed to create forum topic for Max chat %s — is the supergroup "
-                    "a forum and is the bot an admin with 'Manage Topics'?",
-                    max_chat_id,
+                    "Failed to create forum topic for Max chat %s in %s — is the "
+                    "supergroup a forum and is the bot an admin with 'Manage Topics'?",
+                    max_chat_id, target_chat_id,
                 )
                 return None
             thread_id = topic.message_thread_id
-            self._topics.set_topic(max_chat_id, thread_id, title)
-            log.info("Created forum topic %r (thread=%s) for Max chat %s",
-                     title, thread_id, max_chat_id)
+            self._topics.set_topic(max_chat_id, int(target_chat_id), thread_id, title)
+            log.info("Created forum topic %r (chat=%s thread=%s) for Max chat %s",
+                     title, target_chat_id, thread_id, max_chat_id)
             return thread_id
 
     # ── helpers ────────────────────────────────────────────────────
@@ -127,8 +151,12 @@ class TelegramSender:
         return None
 
     # ── send methods ───────────────────────────────────────────────
+    # Every send_* method accepts an explicit ``chat_id``; callers that don't
+    # care about routing (e.g. bot-status notifications) can omit it and it
+    # falls back to the configured default group.
 
-    async def send(self, text: str, message_thread_id: int | None = None) -> None:
+    async def send(self, text: str, message_thread_id: int | None = None,
+                    chat_id: str | int | None = None) -> None:
         if not text:
             return
 
@@ -137,7 +165,7 @@ class TelegramSender:
 
         await self._retry(
             lambda: self._bot.send_message(
-                chat_id=self._chat_id,
+                chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 message_thread_id=message_thread_id,
@@ -145,11 +173,12 @@ class TelegramSender:
         )
 
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
-                         message_thread_id: int | None = None) -> None:
+                         message_thread_id: int | None = None,
+                         chat_id: str | int | None = None) -> None:
         caption = self._truncate_caption(caption)
         await self._retry(
             lambda: self._bot.send_photo(
-                chat_id=self._chat_id,
+                chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 photo=InputFile(io.BytesIO(data), filename=filename),
                 caption=caption or None,
                 parse_mode=ParseMode.HTML,
@@ -158,11 +187,12 @@ class TelegramSender:
         )
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
-                            message_thread_id: int | None = None) -> None:
+                            message_thread_id: int | None = None,
+                            chat_id: str | int | None = None) -> None:
         caption = self._truncate_caption(caption)
         await self._retry(
             lambda: self._bot.send_document(
-                chat_id=self._chat_id,
+                chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 document=InputFile(io.BytesIO(data), filename=filename),
                 caption=caption or None,
                 parse_mode=ParseMode.HTML,
@@ -171,11 +201,12 @@ class TelegramSender:
         )
 
     async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4",
-                         message_thread_id: int | None = None) -> None:
+                         message_thread_id: int | None = None,
+                         chat_id: str | int | None = None) -> None:
         caption = self._truncate_caption(caption)
         await self._retry(
             lambda: self._bot.send_video(
-                chat_id=self._chat_id,
+                chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 video=InputFile(io.BytesIO(data), filename=filename),
                 caption=caption or None,
                 parse_mode=ParseMode.HTML,
@@ -184,11 +215,13 @@ class TelegramSender:
         )
 
     async def send_voice(self, data: bytes, caption: str = "",
-                         message_thread_id: int | None = None) -> None:
+                         message_thread_id: int | None = None,
+                         chat_id: str | int | None = None) -> None:
         caption = self._truncate_caption(caption)
+        target = chat_id if chat_id is not None else self._default_chat_id
         result = await self._retry(
             lambda: self._bot.send_voice(
-                chat_id=self._chat_id,
+                chat_id=target,
                 voice=InputFile(io.BytesIO(data), filename="voice.ogg"),
                 caption=caption or None,
                 parse_mode=ParseMode.HTML,
@@ -199,7 +232,7 @@ class TelegramSender:
             log.info("send_voice failed, falling back to send_audio")
             await self._retry(
                 lambda: self._bot.send_audio(
-                    chat_id=self._chat_id,
+                    chat_id=target,
                     audio=InputFile(io.BytesIO(data), filename="audio.m4a"),
                     caption=caption or None,
                     parse_mode=ParseMode.HTML,
@@ -207,10 +240,11 @@ class TelegramSender:
                 )
             )
 
-    async def send_sticker(self, data: bytes, message_thread_id: int | None = None) -> None:
+    async def send_sticker(self, data: bytes, message_thread_id: int | None = None,
+                           chat_id: str | int | None = None) -> None:
         await self._retry(
             lambda: self._bot.send_sticker(
-                chat_id=self._chat_id,
+                chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 sticker=InputFile(io.BytesIO(data), filename="sticker.webp"),
                 message_thread_id=message_thread_id,
             )

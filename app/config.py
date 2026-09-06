@@ -1,5 +1,6 @@
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -9,13 +10,40 @@ class Settings:
     max_token: str
     max_device_id: str
     tg_bot_token: str
-    tg_chat_id: str
+    tg_chat_id: str                      # default/fallback Telegram supergroup
+    chat_routes: dict[str, int] = field(default_factory=dict)  # max_chat_id -> tg_chat_id
     max_chat_ids: str | None = None
     tg_proxy: str | None = None
     debug: bool = False
     reply_enabled: bool = False
     state_dir: str = "state"
     tg_allowed_user_id: int | None = None
+
+
+def _parse_chat_routes(raw: str | None) -> dict[str, int]:
+    """Parse MAX_CHAT_ROUTES — a JSON object mapping Max chat IDs (as strings,
+    the JSON key type) to target Telegram chat IDs, e.g.:
+
+        MAX_CHAT_ROUTES={"-75107924425434": -1002233445566, "123456": -1009988776655}
+
+    Chats not listed here fall back to TG_CHAT_ID once a message arrives, or
+    can be bound later at runtime with /bind inside the desired group.
+    """
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"MAX_CHAT_ROUTES is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit("MAX_CHAT_ROUTES must be a JSON object of {max_chat_id: tg_chat_id}")
+    result: dict[str, int] = {}
+    for key, value in data.items():
+        try:
+            result[str(key)] = int(value)
+        except (TypeError, ValueError):
+            raise SystemExit(f"MAX_CHAT_ROUTES: invalid tg_chat_id for key {key!r}: {value!r}")
+    return result
 
 
 def load_settings() -> Settings:
@@ -47,11 +75,14 @@ def load_settings() -> Settings:
                 f"TG_ALLOWED_USER_ID must be a valid integer, got: {allowed_raw!r}"
             )
 
+    chat_routes = _parse_chat_routes(os.environ.get("MAX_CHAT_ROUTES"))
+
     return Settings(
         max_token=os.environ["MAX_TOKEN"],
         max_device_id=os.environ["MAX_DEVICE_ID"],
         tg_bot_token=os.environ["TG_BOT_TOKEN"],
         tg_chat_id=tg_chat_id,
+        chat_routes=chat_routes,
         max_chat_ids=os.environ.get("MAX_CHAT_IDS") or None,
         tg_proxy=os.environ.get("TG_PROXY") or None,
         debug=os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"),
