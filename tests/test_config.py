@@ -181,3 +181,41 @@ class TestLoadSettingsMissing:
         with pytest.raises(SystemExit) as exc:
             _load_settings_with_env(_env(MAX_TOKEN=""))
         assert "MAX_TOKEN" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# load_settings — MAX_CHAT_ROUTES
+# ---------------------------------------------------------------------------
+
+class TestChatRoutes:
+    def test_empty_dict_when_not_set(self):
+        s = _load_settings_with_env(_env())
+        assert s.chat_routes == {}
+
+    def test_empty_dict_when_empty_string(self):
+        s = _load_settings_with_env(_env(MAX_CHAT_ROUTES=""))
+        assert s.chat_routes == {}
+
+    def test_parses_valid_json_mapping(self):
+        s = _load_settings_with_env(_env(
+            MAX_CHAT_ROUTES='{"-75107924425434": -1002233445566, "123456": -1009988776655}'
+        ))
+        assert s.chat_routes == {
+            "-75107924425434": -1002233445566,
+            "123456": -1009988776655,
+        }
+
+    def test_invalid_json_raises(self):
+        with pytest.raises(SystemExit) as exc:
+            _load_settings_with_env(_env(MAX_CHAT_ROUTES="{not json"))
+        assert "MAX_CHAT_ROUTES" in str(exc.value)
+
+    def test_non_object_json_raises(self):
+        with pytest.raises(SystemExit) as exc:
+            _load_settings_with_env(_env(MAX_CHAT_ROUTES="[1, 2, 3]"))
+        assert "MAX_CHAT_ROUTES" in str(exc.value)
+
+    def test_non_integer_value_raises(self):
+        with pytest.raises(SystemExit) as exc:
+            _load_settings_with_env(_env(MAX_CHAT_ROUTES='{"42": "not-a-number"}'))
+        assert "MAX_CHAT_ROUTES" in str(exc.value)

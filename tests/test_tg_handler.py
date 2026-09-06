@@ -15,15 +15,32 @@ from app.tg_handler import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_topic_store(mapping: dict | None = None):
-    """A TopicStore stand-in: chat_for_topic(thread_id) → max_chat_id."""
+DEFAULT_TG_CHAT_ID = -100999
+
+
+def _make_topic_store(mapping: dict | None = None, tg_chat_id: int = DEFAULT_TG_CHAT_ID):
+    """A TopicStore stand-in: chat_for_topic(tg_chat_id, thread_id) → max_chat_id.
+
+    ``mapping`` keys by thread_id (as before); all entries are assumed to
+    live in ``tg_chat_id`` unless the caller passes full (chat_id, thread_id)
+    tuple keys instead.
+    """
     mapping = mapping or {10: 42}
+
+    def _lookup(cid, tid):
+        if (cid, tid) in mapping:
+            return mapping[(cid, tid)]
+        if cid == tg_chat_id:
+            return mapping.get(tid)
+        return None
+
     store = MagicMock()
-    store.chat_for_topic = MagicMock(side_effect=lambda tid: mapping.get(tid))
+    store.chat_for_topic = MagicMock(side_effect=_lookup)
     return store
 
 
-def _make_update(text="Hello", thread_id=10, is_topic_message=True, user_id=100):
+def _make_update(text="Hello", thread_id=10, is_topic_message=True, user_id=100,
+                 tg_chat_id: int = DEFAULT_TG_CHAT_ID):
     update = MagicMock()
     update.message = MagicMock()
     update.message.text = text
@@ -33,6 +50,8 @@ def _make_update(text="Hello", thread_id=10, is_topic_message=True, user_id=100)
     update.message.set_reaction = AsyncMock()
     update.effective_user = MagicMock()
     update.effective_user.id = user_id
+    update.effective_chat = MagicMock()
+    update.effective_chat.id = tg_chat_id
     return update
 
 
