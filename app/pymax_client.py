@@ -101,6 +101,28 @@ def _model_dict(value: Any) -> dict:
             return _plain(value.model_dump(by_alias=True, mode="json"))
         except UnicodeDecodeError:
             return _plain(value.model_dump(by_alias=True, mode="python"))
+        except TypeError as exc:
+            # pymax/pydantic models can occasionally end up with an
+            # unresolved forward-ref schema (MockValSer) right after
+            # startup, due to circular imports inside pymax itself
+            # (it never calls model_rebuild()). Force a rebuild once
+            # and retry; if that still fails, degrade gracefully
+            # instead of crashing the whole listener.
+            if "MockValSer" not in str(exc) and "SchemaSerializer" not in str(exc):
+                raise
+            model_cls = type(value)
+            try:
+                model_cls.model_rebuild(force=True)
+                return _plain(value.model_dump(by_alias=True, mode="json"))
+            except Exception:
+                log.warning(
+                    "model_dump failed for %s (unresolved pydantic schema); "
+                    "falling back to raw attributes",
+                    model_cls.__name__,
+                )
+                return _plain(
+                    {k: v for k, v in vars(value).items() if not k.startswith("_")}
+                )
     return _plain(vars(value))
 
 
