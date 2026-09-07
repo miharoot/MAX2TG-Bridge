@@ -2,6 +2,8 @@ import logging
 
 from app.config import Settings
 
+from pymax import Client, ConsoleQrHandler, ExtraConfig, WebClient
+
 log = logging.getLogger(__name__)
 
 
@@ -40,7 +42,7 @@ def build_pymax_client(settings: Settings):
             work_dir=settings.max_pymax_work_dir,
             session_name=settings.max_pymax_session_name,
             extra_config=extra_config,
-            qr_provider=LoggingQrHandler(),
+            qr_provider=ConsoleQrHandler(),
         )
 
     if not settings.max_phone:
