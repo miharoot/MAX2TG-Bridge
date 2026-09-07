@@ -197,6 +197,7 @@ class PyMaxClient:
 
         self._client = build_pymax_client(settings)
         self._my_id: Any = None
+        self._is_connected = False
         self._on_ready_cb = None
         self._on_message_cb = None
         self._on_disconnect_cb = None
@@ -214,6 +215,10 @@ class PyMaxClient:
     @property
     def my_id(self) -> Any:
         return self._my_id
+
+    @property
+    def is_connected(self) -> bool:
+        return self._is_connected
 
     def on_ready(self, func):
         self._on_ready_cb = func
@@ -262,6 +267,7 @@ class PyMaxClient:
         @self._client.on_start()
         async def _handle_start(pymax_client):
             self._my_id = self._extract_my_id(pymax_client)
+            self._is_connected = True
             snapshot = self._build_snapshot(pymax_client)
             await self._add_configured_chats(snapshot)
             if self._on_ready_cb:
@@ -281,6 +287,7 @@ class PyMaxClient:
 
         @self._client.on_disconnect()
         async def _handle_disconnect(exc, reconnect, delay):
+            self._is_connected = False
             log.warning(
                 "PyMax disconnected: %s; reconnect=%s delay=%s",
                 exc,
