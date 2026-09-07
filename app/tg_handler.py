@@ -848,19 +848,51 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("В MAX пока нет чатов.")
         return
 
-    entries.sort(key=lambda e: e[0].lower())
     log.info("/list: showing %d MAX chats to user_id=%s",
              len(entries), update.effective_user.id if update.effective_user else None)
 
-    lines = ["<b>Чаты MAX</b> (для привязки скопируй chat_id в /bind):\n"]
+    # Group by chat type for readability instead of one flat alphabetical
+    # list — groups/channels/DMs answer different questions ("what can I
+    # bind?" vs "who messaged me directly?").
+    SECTIONS = [
+        ("CHAT", "👥 Группы"),
+        ("CHANNEL", "📢 Каналы"),
+        ("DIALOG", "👤 Личные сообщения"),
+    ]
+    by_type: dict[str, list] = {key: [] for key, _ in SECTIONS}
+    other: list = []
     for title, chat_id, chat_type in entries:
-        bound_thread = topic_store.get_topic(chat_id)
-        status = f" — уже в топике #{bound_thread}" if bound_thread is not None else ""
-        lines.append(
-            f"• <b>{escape(title)}</b> ({escape(str(chat_type))}) — "
-            f"<code>{chat_id}</code> — "
-            f'<a href="https://web.max.ru/{chat_id}">открыть</a>{status}'
-        )
+        bucket = by_type.get(str(chat_type))
+        (bucket if bucket is not None else other).append((title, chat_id, chat_type))
+
+    counts = ", ".join(
+        f"{label.split(' ', 1)[1].lower()}: {len(by_type[key])}"
+        for key, label in SECTIONS
+        if by_type[key]
+    )
+    lines = [
+        f"<b>Чаты MAX</b> — всего {len(entries)} ({counts})" if counts
+        else f"<b>Чаты MAX</b> — всего {len(entries)}",
+        "Скопируй <code>chat_id</code> в <code>/bind</code>, чтобы привязать к топику.",
+    ]
+
+    def _add_section(title: str, chats: list) -> None:
+        if not chats:
+            return
+        chats = sorted(chats, key=lambda e: e[0].lower())
+        lines.append(f"\n<b>{title}</b>")
+        for chat_title, chat_id, _chat_type in chats:
+            bound_thread = topic_store.get_topic(chat_id)
+            status = f"🔗 топик #{bound_thread}" if bound_thread is not None else "◌ не привязан"
+            lines.append(
+                f"• <b>{escape(chat_title)}</b>\n"
+                f"  <code>{chat_id}</code> · "
+                f'<a href="https://web.max.ru/{chat_id}">открыть</a> · {status}'
+            )
+
+    for key, label in SECTIONS:
+        _add_section(label, by_type[key])
+    _add_section("❓ Прочее", other)
 
     # Telegram caps messages at 4096 chars — chunk if the directory is large.
     chunk: list[str] = []
