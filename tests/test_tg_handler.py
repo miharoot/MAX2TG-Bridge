@@ -93,6 +93,26 @@ class TestOnTopicMessage:
 
         update.message.set_reaction.assert_called_once()
 
+    async def test_logs_warning_when_reaction_fails(self, caplog):
+        """A failed 👀 reaction (e.g. missing Telegram permission) must be
+        visible at warning level, not silently swallowed at debug."""
+        max_client = MagicMock()
+        max_client.send_message = AsyncMock(return_value={"ok": True})
+
+        update = _make_update()
+        update.message.set_reaction = AsyncMock(side_effect=RuntimeError("Forbidden"))
+        update.message.chat_id = -100999
+        update.message.message_id = 42
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
+
+        with caplog.at_level("WARNING", logger="app.tg_handler"):
+            await _on_topic_message(update, ctx)
+
+        assert any(
+            r.levelname == "WARNING" and "reaction" in r.message.lower()
+            for r in caplog.records
+        )
+
     async def test_ignores_general_topic(self):
         max_client = MagicMock()
         max_client.send_message = AsyncMock()

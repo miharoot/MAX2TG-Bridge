@@ -156,7 +156,11 @@ async def _surface_send_result(message, resp) -> None:
     try:
         await message.set_reaction("👀")
     except Exception:
-        log.debug("Could not set reaction on confirmed message", exc_info=True)
+        log.warning(
+            "Could not set 👀 reaction on confirmed message (chat=%s, message_id=%s): "
+            "likely missing permission or an unsupported reaction for this chat",
+            message.chat_id, message.message_id, exc_info=True,
+        )
 
 
 async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
