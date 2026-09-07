@@ -1144,9 +1144,25 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
         media_write_timeout=TG_FILE_TIMEOUT,
         pool_timeout=TG_CONNECT_TIMEOUT,
     )
-    builder = Application.builder().token(token).request(request)
-    if proxy_url:
-        builder = builder.get_updates_proxy(proxy_url)
+    # get_updates (long-polling) uses its own connection/request object in
+    # PTB — separate from the one above, which is for regular bot-API calls
+    # (sendMessage, sendPhoto, etc). Once .request() is set on the builder,
+    # .get_updates_proxy() can no longer be used (PTB raises), so the proxy
+    # has to be applied to a second request instance and passed via
+    # .get_updates_request() instead — otherwise long-polling would silently
+    # skip the proxy entirely.
+    get_updates_request = HTTPXRequest(
+        proxy=proxy_url,
+        connect_timeout=TG_CONNECT_TIMEOUT,
+        read_timeout=TG_CONNECT_TIMEOUT,
+        pool_timeout=TG_CONNECT_TIMEOUT,
+    )
+    builder = (
+        Application.builder()
+        .token(token)
+        .request(request)
+        .get_updates_request(get_updates_request)
+    )
     app = builder.build()
     app.bot_data[MAX_CLIENT_KEY] = max_client
     app.bot_data[TOPIC_STORE_KEY] = topic_store
