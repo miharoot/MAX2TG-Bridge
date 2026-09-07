@@ -40,6 +40,7 @@ class FakeRawClient:
         )
         self.get_chats = AsyncMock(return_value=self.chats)
         self.get_chat = AsyncMock(return_value=self.chats[1])
+        self.fetch_chats = AsyncMock(return_value=[])
         self.get_file_by_id = AsyncMock(
             return_value=FakeModel(url="https://i.oneme.ru/file.bin", unsafe=False)
         )
@@ -154,6 +155,91 @@ async def test_run_fetches_configured_chats_missing_from_login_sync(monkeypatch)
     raw.get_chats.assert_awaited_once_with([-123])
     snapshot = on_ready.await_args.args[0]
     assert snapshot["chats"][1]["title"] == "Configured group"
+
+
+async def test_run_pages_through_full_chat_list_beyond_login_sync_window(adapter):
+    """Regression test for the /list bug: PyMax's login/sync only returns a
+    limited window of recently-active chats, so a group that isn't among
+    the most recent ones is missing from client.chats right after login.
+    fetch_chats(marker=...) must be paginated to pull in the rest — even
+    when the first page entirely overlaps with what login already knew."""
+    client, raw = adapter
+
+    recent_overlap = FakeModel(
+        id=20, type="CHAT", title="Team", participants={7: 0, 9: 0},
+        last_event_time=2000,
+    )
+    older_group = FakeModel(
+        id=30, type="CHAT", title="Older Group", participants={7: 0, 11: 0},
+        last_event_time=1000,
+    )
+
+    async def fake_fetch_chats(marker=None):
+        if marker is None:
+            # First page overlaps entirely with login-sync's own chats —
+            # still non-empty, so pagination must keep going.
+            return [recent_overlap]
+        if marker >= 999 and older_group not in raw.chats:
+            raw.chats.append(older_group)
+            return [older_group]
+        return []
+
+    raw.fetch_chats = AsyncMock(side_effect=fake_fetch_chats)
+
+    on_ready = AsyncMock()
+    client.on_ready(on_ready)
+    await client.run()
+
+    snapshot = on_ready.await_args.args[0]
+    chat_ids = {chat["id"] for chat in snapshot["chats"]}
+    assert 30 in chat_ids
+
+
+async def test_run_pagination_stops_on_empty_page(adapter):
+    client, raw = adapter
+    raw.fetch_chats = AsyncMock(return_value=[])
+
+    on_ready = AsyncMock()
+    client.on_ready(on_ready)
+    await client.run()
+
+    raw.fetch_chats.assert_awaited_once_with(marker=None)
+
+
+async def test_run_pagination_stops_when_no_new_chats(adapter):
+    """If a page returns only chats we've already seen, stop instead of
+    looping forever (guards against a MAX server bug returning a stuck
+    marker)."""
+    client, raw = adapter
+    already_known = raw.chats[0]  # id=10, already in login-sync
+    raw.fetch_chats = AsyncMock(return_value=[already_known])
+
+    on_ready = AsyncMock()
+    client.on_ready(on_ready)
+    await client.run()
+
+    raw.fetch_chats.assert_awaited_once()
+
+
+async def test_run_pagination_respects_page_cap(adapter):
+    """Even a pathological server that always returns "new" chats and a
+    strictly decreasing marker must not page forever."""
+    client, raw = adapter
+    counter = {"n": 0}
+
+    async def fake_fetch_chats(marker=None):
+        counter["n"] += 1
+        t = 100000 - counter["n"]
+        return [FakeModel(id=1000 + counter["n"], type="CHAT",
+                          title=f"G{counter['n']}", participants={}, last_event_time=t)]
+
+    raw.fetch_chats = AsyncMock(side_effect=fake_fetch_chats)
+
+    on_ready = AsyncMock()
+    client.on_ready(on_ready)
+    await client.run()
+
+    assert counter["n"] == PyMaxClient.MAX_CHAT_LIST_PAGES
 
 
 async def test_message_handler_receives_bridge_message(adapter):

@@ -182,6 +182,7 @@ class PyMaxClient:
     MESSAGE_DEDUPE_MAX = 4096
     OUTBOUND_ECHO_TTL_SEC = 60 * 60
     OUTBOUND_ECHO_MAX = 4096
+    MAX_CHAT_LIST_PAGES = 50   # safety cap on fetch_chats pagination at startup
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -268,6 +269,7 @@ class PyMaxClient:
         async def _handle_start(pymax_client):
             self._my_id = self._extract_my_id(pymax_client)
             self._is_connected = True
+            await self._fetch_all_chats(pymax_client)
             snapshot = self._build_snapshot(pymax_client)
             await self._add_configured_chats(snapshot)
             if self._on_ready_cb:
@@ -525,6 +527,59 @@ class PyMaxClient:
             return None
         finally:
             await session.close()
+
+    async def _fetch_all_chats(self, pymax_client) -> None:
+        """Page through the complete MAX chat list before building the snapshot.
+
+        PyMax's login/sync only returns a limited window of the most
+        recently *active* chats (the underlying MAX server applies its own
+        default page size when the client doesn't request a specific count
+        — historically as low as ~10 in the raw WS protocol this bridge
+        used before migrating to PyMax). A group or channel you haven't
+        posted in recently can be completely absent from
+        ``pymax_client.chats`` right after login — which is exactly why
+        ``/list`` (and topic auto-creation for anything not yet messaged)
+        could report "no chats" even though the account has plenty.
+
+        ``Client.fetch_chats(marker=...)`` pages backward in time and, per
+        PyMax's own ``ChatService._cache_chat``, merges every chat it sees
+        straight into ``pymax_client.chats`` — so nothing further needs to
+        be merged manually here; ``_build_snapshot`` just needs to run
+        after this completes. Pagination continues purely on "did this page
+        have anything, and did the marker move further back" — NOT on
+        whether the page introduced any chat *not already known*, since an
+        early page can legitimately overlap entirely with what login-sync
+        already returned while older, still-undiscovered chats remain
+        further back.
+        """
+        fetch_chats = getattr(pymax_client, "fetch_chats", None)
+        if fetch_chats is None:
+            return
+
+        total_seen = {chat.id for chat in (getattr(pymax_client, "chats", None) or [])}
+        marker = None
+        for _ in range(self.MAX_CHAT_LIST_PAGES):
+            try:
+                page = await fetch_chats(marker=marker)
+            except Exception:
+                log.exception("PyMax fetch_chats page failed (marker=%s)", marker)
+                break
+            if not page:
+                break
+
+            total_seen.update(chat.id for chat in page)
+            event_times = [getattr(chat, "last_event_time", 0) for chat in page]
+            event_times = [t for t in event_times if t]
+            oldest = min(event_times) if event_times else None
+            if not oldest or oldest <= 0:
+                break
+
+            next_marker = oldest - 1
+            if marker is not None and next_marker >= marker:
+                break  # marker isn't moving further back — avoid looping forever
+            marker = next_marker
+
+        log.info("PyMax full chat list loaded: %d chats total", len(total_seen))
 
     def _extract_my_id(self, pymax_client) -> Any:
         me = getattr(pymax_client, "me", None)
