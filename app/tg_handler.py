@@ -108,6 +108,26 @@ def _parse_max_chat_id(s: str) -> int | None:
     return None
 
 
+def _log_command(update: Update, name: str) -> None:
+    """Log every command invocation: who ran it, where, and with what args.
+    Called at the very top of each command handler, before any permission
+    or validity checks, so denied/invalid attempts show up in the logs too."""
+    user = update.effective_user
+    chat = update.effective_chat
+    message = update.message
+    args = message.text if message and message.text else ""
+    thread_id = message.message_thread_id if message else None
+    log.info(
+        "/%s invoked by user_id=%s (@%s) in chat_id=%s thread_id=%s: %r",
+        name,
+        user.id if user else None,
+        user.username if user else None,
+        chat.id if chat else None,
+        thread_id,
+        args,
+    )
+
+
 def _peer_id_in_dm(resolver, chat_id) -> int | None:
     """Return the other participant of a DIALOG chat (i.e., not us)."""
     chat = resolver.chats_raw.get(chat_id) or {}
@@ -490,16 +510,16 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
         return
+    _log_command(update, "bind")
     target_chat_id = update.effective_chat.id if update.effective_chat else None
     if target_chat_id is None:
         return
 
     allowed_user_ids = context.bot_data.get(ALLOWED_USER_KEY)
     if allowed_user_ids and update.effective_user and update.effective_user.id not in allowed_user_ids:
+        log.warning("/bind denied for user_id=%s (not in allowed list)",
+                    update.effective_user.id)
         return
-
-    args = context.args or []
-    if not args:
         await message.reply_text(
             "Использование: <code>/bind &lt;chat_id или https://web.max.ru/-...&gt; "
             "[название]</code>",
@@ -551,6 +571,8 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     thread_id = topic.message_thread_id
     topic_store.set_topic(max_chat_id, int(target_chat_id), thread_id, title)
+    log.info("/bind: created topic thread=%s title=%r for max_chat_id=%s in tg_chat_id=%s",
+             thread_id, title, max_chat_id, target_chat_id)
     await message.reply_text(
         f"Готово: <b>{escape(title)}</b> ↔ MAX <code>{max_chat_id}</code> "
         f"(thread_id=<code>{thread_id}</code>) в этой группе. "
@@ -603,16 +625,16 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
         return
+    _log_command(update, "add")
     target_chat_id = update.effective_chat.id if update.effective_chat else None
     if target_chat_id is None:
         return
 
     allowed_user_ids = context.bot_data.get(ALLOWED_USER_KEY)
     if allowed_user_ids and update.effective_user and update.effective_user.id not in allowed_user_ids:
+        log.warning("/add denied for user_id=%s (not in allowed list)",
+                    update.effective_user.id)
         return
-
-    args = context.args or []
-    link = args[0] if args else ""
     # Try to extract a max.ru link from anywhere in the message text too,
     # so `/add` works if the link was just pasted alongside the command.
     if not link.startswith(("http://", "https://")) and message.text:
@@ -629,6 +651,7 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     max_client: PyMaxClient = context.bot_data[MAX_CLIENT_KEY]
+    log.info("/add: opening link %s", link)
     try:
         resp = await max_client.open_by_link(link)
     except Exception as exc:
@@ -707,6 +730,8 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     thread_id = topic.message_thread_id
     topic_store.set_topic(chat_id, int(target_chat_id), thread_id, title)
+    log.info("/add: created topic thread=%s title=%r for max_chat_id=%s in tg_chat_id=%s",
+             thread_id, title, chat_id, target_chat_id)
     await message.reply_text(
         f"Готово: <b>{escape(title)}</b> ↔ MAX <code>{chat_id}</code> "
         f"(thread_id=<code>{thread_id}</code>) в этой группе.",
@@ -763,12 +788,15 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
         return
+    _log_command(update, "list")
     target_chat_id = update.effective_chat.id if update.effective_chat else None
     if target_chat_id is None:
         return
 
     supergroup_id = context.bot_data.get(SUPERGROUP_KEY)
     if supergroup_id is None or target_chat_id != supergroup_id:
+        log.info("/list rejected: invoked outside main supergroup (chat_id=%s, expected=%s)",
+                  target_chat_id, supergroup_id)
         await message.reply_text(
             "Команда <code>/list</code> доступна только в основной "
             "Telegram-группе (задана в <code>TG_CHAT_ID</code>).",
@@ -778,6 +806,8 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     allowed_user_ids = context.bot_data.get(ALLOWED_USER_KEY)
     if allowed_user_ids and update.effective_user and update.effective_user.id not in allowed_user_ids:
+        log.warning("/list denied for user_id=%s (not in allowed list)",
+                    update.effective_user.id)
         return
 
     max_client: PyMaxClient = context.bot_data[MAX_CLIENT_KEY]
@@ -803,6 +833,8 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     entries.sort(key=lambda e: e[0].lower())
+    log.info("/list: showing %d MAX chats to user_id=%s",
+             len(entries), update.effective_user.id if update.effective_user else None)
 
     lines = ["<b>Чаты MAX</b> (для привязки скопируй chat_id в /bind):\n"]
     for title, chat_id, chat_type in entries:
@@ -835,6 +867,7 @@ async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
         return
+    _log_command(update, "help")
     await message.reply_text(HELP_TEXT, parse_mode="HTML",
                               disable_web_page_preview=True)
 
@@ -846,9 +879,12 @@ async def _cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
         return
+    _log_command(update, "del")
 
     allowed_user_ids = context.bot_data.get(ALLOWED_USER_KEY)
     if allowed_user_ids and update.effective_user and update.effective_user.id not in allowed_user_ids:
+        log.warning("/del denied for user_id=%s (not in allowed list)",
+                    update.effective_user.id)
         return
 
     target = _resolve_topic_target(update, context)
@@ -883,9 +919,14 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if query is None or not query.data:
         return
     await query.answer()
+    user = update.effective_user
+    log.info("/del callback %r from user_id=%s (@%s)",
+             query.data, user.id if user else None, user.username if user else None)
 
     allowed_user_ids = context.bot_data.get(ALLOWED_USER_KEY)
     if allowed_user_ids and update.effective_user and update.effective_user.id not in allowed_user_ids:
+        log.warning("/del callback denied for user_id=%s (not in allowed list)",
+                    update.effective_user.id)
         return
 
     parts = query.data.split(":")
@@ -944,6 +985,7 @@ async def _cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     message = update.message
     if message is None:
         return
+    _log_command(update, "intro")
     if not target:
         await message.reply_text(
             "Команда работает только внутри топика, связанного с чатом MAX."
@@ -965,6 +1007,7 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message = update.message
     if message is None:
         return
+    _log_command(update, "profile")
     if not target:
         await message.reply_text(
             "Команда работает только внутри топика, связанного с чатом MAX."
