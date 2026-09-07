@@ -2,7 +2,7 @@ import logging
 
 from app.config import Settings
 
-from pymax import Client, ExtraConfig, WebClient
+from pymax import Client, ConsoleQrHandler, ExtraConfig, WebClient
 
 log = logging.getLogger(__name__)
 
@@ -13,11 +13,6 @@ class EnvPasswordProvider:
 
     async def get_password(self, hint: str | None = None) -> str:
         return self._password
-
-
-class LoggingQrHandler:
-    async def show_qr(self, qr_url: str) -> None:
-        log.warning("PyMax QR authorization URL: %s", qr_url)
 
 
 def build_pymax_client(settings: Settings):
@@ -42,7 +37,7 @@ def build_pymax_client(settings: Settings):
             work_dir=settings.max_pymax_work_dir,
             session_name=settings.max_pymax_session_name,
             extra_config=extra_config,
-            qr_provider=LoggingQrHandler(),
+            qr_provider=ConsoleQrHandler(),
         )
 
     if not settings.max_phone:
