@@ -198,6 +198,32 @@ def _chat_to_dict(chat: Any) -> dict:
     return data
 
 
+def _safe_chat_to_dict(chat: Any) -> dict | None:
+    """``_chat_to_dict`` wrapped so one broken chat can't blank out the
+    whole snapshot (and with it ``resolver.chats_raw``) — see ``/list``
+    reporting no chats when ``_build_snapshot`` raised partway through."""
+    try:
+        return _chat_to_dict(chat)
+    except Exception:
+        log.exception(
+            "Failed to convert chat id=%s to dict; skipping it, "
+            "other chats will still load",
+            getattr(chat, "id", "?"),
+        )
+        return None
+
+
+def _safe_user_to_dict(user: Any) -> dict | None:
+    try:
+        return _user_to_dict(user)
+    except Exception:
+        log.exception(
+            "Failed to convert contact id=%s to dict; skipping it",
+            getattr(user, "id", "?"),
+        )
+        return None
+
+
 class PyMaxClient:
     """Bridge client backed exclusively by PyMax."""
 
@@ -613,10 +639,15 @@ class PyMaxClient:
         contact = getattr(me, "contact", None)
         chats = getattr(pymax_client, "chats", None) or []
         contacts = getattr(pymax_client, "contacts", None) or []
+        try:
+            profile = _user_to_dict(contact) if contact is not None else {}
+        except Exception:
+            log.exception("Failed to convert own profile to dict")
+            profile = {}
         return {
-            "profile": _user_to_dict(contact) if contact is not None else {},
-            "chats": [_chat_to_dict(chat) for chat in chats if chat],
-            "contacts": [_user_to_dict(user) for user in contacts if user],
+            "profile": profile,
+            "chats": [d for d in (_safe_chat_to_dict(chat) for chat in chats if chat) if d],
+            "contacts": [d for d in (_safe_user_to_dict(user) for user in contacts if user) if d],
         }
 
     async def _add_configured_chats(self, snapshot: dict) -> None:
@@ -635,4 +666,6 @@ class PyMaxClient:
             log.exception("PyMax failed to fetch configured chats: %s", missing_ids)
             return
 
-        snapshot["chats"].extend(_chat_to_dict(chat) for chat in chats if chat)
+        snapshot["chats"].extend(
+            d for d in (_safe_chat_to_dict(chat) for chat in chats if chat) if d
+        )

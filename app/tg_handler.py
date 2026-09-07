@@ -820,16 +820,32 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     entries = []
     for chat_id, chat in resolver.chats_raw.items():
-        if resolver.is_dm(chat_id):
-            continue  # personal DMs aren't useful in a shared chat directory
-        title = resolver.chat_name(chat_id)
-        if title == str(chat_id):
-            title = chat.get("title") or "(без названия)"
         chat_type = resolver.chat_types.get(chat_id, chat.get("type", "?"))
+        if resolver.is_dm(chat_id):
+            # DM chats don't get a real "title" from MAX — resolve the
+            # peer's name instead of showing the "DM:<id>" placeholder.
+            peer_id = None
+            for uid_str in chat.get("participants", {}) or {}:
+                try:
+                    uid_int = int(uid_str)
+                except (TypeError, ValueError):
+                    continue
+                if uid_int != resolver.my_id:
+                    peer_id = uid_int
+                    break
+            title = resolver.user_name(peer_id) if peer_id is not None else None
+            if not title or title == str(peer_id):
+                title = chat.get("title") or (
+                    f"Личный чат {peer_id}" if peer_id is not None else "(без названия)"
+                )
+        else:
+            title = resolver.chat_name(chat_id)
+            if title == str(chat_id):
+                title = chat.get("title") or "(без названия)"
         entries.append((title, chat_id, chat_type))
 
     if not entries:
-        await message.reply_text("В MAX пока нет групповых чатов или каналов.")
+        await message.reply_text("В MAX пока нет чатов.")
         return
 
     entries.sort(key=lambda e: e[0].lower())
