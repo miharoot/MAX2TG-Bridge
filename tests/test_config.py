@@ -51,6 +51,12 @@ class TestSettingsDataclass:
         assert s.debug is False
         assert s.reply_enabled is False
         assert s.max_chat_ids is None
+        assert s.max_ignore_chat_ids is None
+        assert s.tg_allowed_user_ids is None
+        assert s.debug_dump_json is False
+        assert s.max_download_mb == 50
+        assert s.tg_upload_mb == 50
+        assert s.health_port is None
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +187,86 @@ class TestLoadSettingsMissing:
         with pytest.raises(SystemExit) as exc:
             _load_settings_with_env(_env(MAX_TOKEN=""))
         assert "MAX_TOKEN" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# load_settings — MAX_IGNORE_CHAT_IDS
+# ---------------------------------------------------------------------------
+
+class TestIgnoreChatIds:
+    def test_none_when_not_set(self):
+        s = _load_settings_with_env(_env())
+        assert s.max_ignore_chat_ids is None
+
+    def test_populated_when_set(self):
+        s = _load_settings_with_env(_env(MAX_IGNORE_CHAT_IDS="-789,-101112"))
+        assert s.max_ignore_chat_ids == "-789,-101112"
+
+    def test_none_when_empty_string(self):
+        s = _load_settings_with_env(_env(MAX_IGNORE_CHAT_IDS=""))
+        assert s.max_ignore_chat_ids is None
+
+
+# ---------------------------------------------------------------------------
+# load_settings — TG_ALLOWED_USER_IDS
+# ---------------------------------------------------------------------------
+
+class TestAllowedUserIds:
+    def test_none_when_not_set(self):
+        s = _load_settings_with_env(_env())
+        assert s.tg_allowed_user_ids is None
+
+    def test_plural_list(self):
+        s = _load_settings_with_env(_env(TG_ALLOWED_USER_IDS="100, 200"))
+        assert s.tg_allowed_user_ids == frozenset({100, 200})
+
+    def test_legacy_singular_still_works(self):
+        s = _load_settings_with_env(_env(TG_ALLOWED_USER_ID="100"))
+        assert s.tg_allowed_user_ids == frozenset({100})
+
+    def test_plural_takes_precedence_over_singular(self):
+        s = _load_settings_with_env(
+            _env(TG_ALLOWED_USER_IDS="100", TG_ALLOWED_USER_ID="200")
+        )
+        assert s.tg_allowed_user_ids == frozenset({100})
+
+    def test_invalid_value_raises(self):
+        with pytest.raises(SystemExit) as exc:
+            _load_settings_with_env(_env(TG_ALLOWED_USER_IDS="abc"))
+        assert "TG_ALLOWED_USER_IDS" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# load_settings — debug/media settings
+# ---------------------------------------------------------------------------
+
+class TestDebugAndMediaSettings:
+    def test_debug_dump_json_true_via_true(self):
+        s = _load_settings_with_env(_env(DEBUG_DUMP_JSON="true"))
+        assert s.debug_dump_json is True
+
+    def test_media_limits_can_be_configured(self):
+        s = _load_settings_with_env(_env(MAX_DOWNLOAD_MB="50", TG_UPLOAD_MB="10"))
+        assert s.max_download_mb == 50
+        assert s.tg_upload_mb == 10
+
+    def test_media_limits_reject_non_integer(self):
+        with pytest.raises(SystemExit) as exc:
+            _load_settings_with_env(_env(MAX_DOWNLOAD_MB="large"))
+        assert "MAX_DOWNLOAD_MB" in str(exc.value)
+
+    def test_media_limits_reject_zero(self):
+        with pytest.raises(SystemExit) as exc:
+            _load_settings_with_env(_env(TG_UPLOAD_MB="0"))
+        assert "TG_UPLOAD_MB" in str(exc.value)
+
+    def test_health_port_none_by_default(self):
+        s = _load_settings_with_env(_env())
+        assert s.health_port is None
+
+    def test_health_port_can_be_configured(self):
+        s = _load_settings_with_env(_env(HEALTH_PORT="8080"))
+        assert s.health_port == 8080
 
 
 # ---------------------------------------------------------------------------

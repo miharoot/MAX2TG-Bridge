@@ -219,9 +219,14 @@ class TestGetName:
         resolver.chat_types[2] = "GROUP"
         assert resolver.is_dm(2) is False
 
-    def test_is_dm_false_for_unknown(self):
+    def test_is_dm_true_for_unknown_positive_chat_id(self):
+        """MAX convention: unknown positive chat_id looks like a DM peer id."""
         resolver = ContactResolver()
-        assert resolver.is_dm(999) is False
+        assert resolver.is_dm(999) is True
+
+    def test_is_dm_false_for_unknown_negative_chat_id(self):
+        resolver = ContactResolver()
+        assert resolver.is_dm(-999) is False
 
 
 # ---------------------------------------------------------------------------
@@ -340,3 +345,137 @@ class TestResolveUser:
         result = await resolver.resolve_user(77)
         assert result == "Fetched User"
         assert 77 not in resolver._fetch_failed
+
+
+# ---------------------------------------------------------------------------
+# resolve_chat — live MAX lookup for chats missing from the snapshot
+# ---------------------------------------------------------------------------
+
+class TestResolveChat:
+    """Tests for resolve_chat: this is what fixes new-group topics being
+    named after whoever added the bridge instead of the group itself."""
+
+    @pytest.mark.asyncio
+    async def test_returns_cached_title_without_fetching(self):
+        from unittest.mock import AsyncMock
+
+        resolver = ContactResolver()
+        resolver.chats[-100] = "Already known"
+        resolver._ws_fetch_chat = AsyncMock()
+
+        result = await resolver.resolve_chat(-100)
+
+        assert result == "Already known"
+        resolver._ws_fetch_chat.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fetches_and_returns_title_for_unknown_chat(self):
+        resolver = ContactResolver()
+
+        async def fake_fetch(chat_id):
+            resolver.chats[chat_id] = "Дружная команда"
+            resolver.chat_types[chat_id] = "CHAT"
+
+        resolver._ws_fetch_chat = fake_fetch
+        result = await resolver.resolve_chat(-68192506787240)
+
+        assert result == "Дружная команда"
+
+    @pytest.mark.asyncio
+    async def test_caches_failure_and_skips_refetch(self):
+        from unittest.mock import AsyncMock
+
+        resolver = ContactResolver()
+        resolver._ws_fetch_chat = AsyncMock()  # does nothing → stays unresolved
+
+        first = await resolver.resolve_chat(-999)
+        resolver._ws_fetch_chat.assert_awaited_once()
+        resolver._ws_fetch_chat.reset_mock()
+
+        second = await resolver.resolve_chat(-999)
+        resolver._ws_fetch_chat.assert_not_awaited()
+        assert first == second == "-999"
+
+    @pytest.mark.asyncio
+    async def test_refresh_bypasses_cached_failure(self):
+        resolver = ContactResolver()
+        resolver._chat_fetch_failed.add(-999)
+
+        async def fake_fetch(chat_id):
+            resolver.chats[chat_id] = "Now known"
+
+        resolver._ws_fetch_chat = fake_fetch
+        result = await resolver.resolve_chat(-999, refresh=True)
+
+        assert result == "Now known"
+
+    @pytest.mark.asyncio
+    async def test_refresh_bypasses_cache_even_if_already_known(self):
+        """Used when a topic already exists and the MAX chat may have been
+        renamed since — refresh=True re-queries even a 'known' chat."""
+        from unittest.mock import AsyncMock
+
+        resolver = ContactResolver()
+        resolver.chats[-100] = "Old Name"
+        resolver._ws_fetch_chat = AsyncMock(
+            side_effect=lambda cid: resolver.chats.__setitem__(cid, "New Name")
+        )
+
+        result = await resolver.resolve_chat(-100, refresh=True)
+
+        assert result == "New Name"
+        resolver._ws_fetch_chat.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# _parse_chat_response — CHAT_GET (opcode 48) response shapes
+# ---------------------------------------------------------------------------
+
+class TestParseChatResponse:
+    def test_parses_single_chat_object(self):
+        resolver = ContactResolver()
+        resolver._parse_chat_response(
+            {"chat": {"id": -100, "type": "CHAT", "title": "Дружная команда"}}
+        )
+        assert resolver.chats[-100] == "Дружная команда"
+        assert resolver.chat_types[-100] == "CHAT"
+
+    def test_parses_chats_list(self):
+        resolver = ContactResolver()
+        resolver._parse_chat_response(
+            {"chats": [{"id": -100, "type": "CHAT", "title": "A"},
+                      {"id": -101, "type": "DIALOG", "title": "B"}]}
+        )
+        assert resolver.chats[-100] == "A"
+        assert resolver.chats[-101] == "B"
+        assert resolver.chat_types[-101] == "DIALOG"
+
+    def test_parses_chats_dict(self):
+        resolver = ContactResolver()
+        resolver._parse_chat_response(
+            {"chats": {"-100": {"id": -100, "type": "CHAT", "title": "A"}}}
+        )
+        assert resolver.chats[-100] == "A"
+
+    def test_parses_flat_response_using_requested_chat_id(self):
+        resolver = ContactResolver()
+        resolver._parse_chat_response(
+            {"title": "Дружная команда", "type": "CHAT"},
+            requested_chat_id=-100,
+        )
+        assert resolver.chats[-100] == "Дружная команда"
+
+    def test_ignores_error_response(self):
+        resolver = ContactResolver()
+        resolver._parse_chat_response({"_max_error": {"code": "not.found"}})
+        assert resolver.chats == {}
+
+    def test_ignores_empty_response(self):
+        resolver = ContactResolver()
+        resolver._parse_chat_response({})
+        assert resolver.chats == {}
+
+    def test_ignores_non_dict_response(self):
+        resolver = ContactResolver()
+        resolver._parse_chat_response(None)
+        assert resolver.chats == {}

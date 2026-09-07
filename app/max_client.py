@@ -4,15 +4,36 @@ import logging
 import os
 import random
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
+from yarl import URL
 
 log = logging.getLogger(__name__)
 
 DEBUG_DIR = "debug"
+DEFAULT_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+ALLOWED_DOWNLOAD_HOSTS = frozenset({
+    "i.oneme.ru",
+    "oneme.ru",
+    "web.max.ru",
+    "max.ru",
+})
+ALLOWED_DOWNLOAD_SUFFIXES = (".oneme.ru", ".max.ru", ".okcdn.ru")
+SENSITIVE_KEY_PARTS = (
+    "token",
+    "auth",
+    "authorization",
+    "cookie",
+    "secret",
+    "password",
+    "phone",
+    "deviceid",
+)
 
 
 def _log_task_exception(task: "asyncio.Task") -> None:
@@ -72,10 +93,36 @@ class OpCode(IntEnum):
     ATTACH_TYPING = 65        # "I'm uploading <type> in this chat"
     EDIT_MESSAGE = 67
     PHOTO_UPLOAD_URL = 80     # get URL for photo upload
+    VIDEO_DOWNLOAD_URL = 83   # resolve incoming videoId to CDN URLs
     AUDIO_UPLOAD_URL = 86     # get URL for voice/audio upload (experimental)
     FILE_UPLOAD_URL = 87      # get URL for file upload
+    FILE_DOWNLOAD_URL = 88    # resolve incoming fileId to a download URL
     DISPATCH = 128
+    NOTIF_TYPING = 129       # peer is typing
+    NOTIF_MARK = 130         # a chat's read marker moved (confirmed via MaxApiTeam/PyMax)
+    NOTIF_PRESENCE = 132
     UPLOAD_READY = 136        # server says an uploaded file/video is processed
+    NOTIF_MSG_REACTIONS_CHANGED = 155  # a message's reaction counters changed
+
+
+@dataclass
+class MaxReadEvent:
+    """A chat's read marker moved — either the peer read up to some point,
+    or (set_as_unread=True) explicitly marked it unread again."""
+    chat_id: Any = None
+    user_id: Any = None
+    mark: Any = None
+    set_as_unread: bool = False
+
+
+@dataclass
+class MaxReactionEvent:
+    """A message's reaction counters changed (someone added/removed a
+    reaction emoji, e.g. 👀/👍, on a MAX message)."""
+    chat_id: Any = None
+    message_id: str = ""
+    counters: list = field(default_factory=list)   # [{"reaction": "👍", "count": 2}, ...]
+    total_count: int = 0
 
 
 @dataclass
@@ -85,6 +132,7 @@ class MaxMessage:
     text: str = ""
     timestamp: Any = None
     message_id: str = ""
+    cid: Any = None
     is_self: bool = False
     attaches: list = field(default_factory=list)
     link: dict = field(default_factory=dict)
@@ -95,13 +143,32 @@ class MaxClient:
     WS_URL = "wss://ws-api.oneme.ru/websocket"
     HEARTBEAT_SEC = 30
     RECONNECT_SEC = 5
-    chat_ids = []
+    MESSAGE_DEDUPE_TTL_SEC = 24 * 60 * 60
+    MESSAGE_DEDUPE_MAX = 4096
+    OUTBOUND_ECHO_TTL_SEC = 60 * 60
+    OUTBOUND_ECHO_MAX = 4096
 
-    def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False):
+    def __init__(
+        self,
+        token: str,
+        device_id: str,
+        chat_ids: str | None = None,
+        ignore_chat_ids: str | None = None,
+        debug: bool = False,
+        debug_dump_json: bool = False,
+        max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
+    ):
         self.token = token
         self.device_id = device_id
         self.debug = debug
+        self.debug_dump_json = debug_dump_json
+        self.max_download_bytes = max_download_bytes
+        # Instance-local (not a class attribute!) — a shared mutable class
+        # default here would leak chat_ids across every MaxClient instance.
+        self.chat_ids = self._parse_chat_ids(chat_ids, "MAX_CHAT_IDS")
+        self.ignore_chat_ids = self._parse_chat_ids(ignore_chat_ids, "MAX_IGNORE_CHAT_IDS")
         self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._authorized = False
         self._seq = 0
         self._my_id = None
         self._on_ready_cb = None
@@ -111,9 +178,142 @@ class MaxClient:
         self._dispatch_counter = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._file_pending: dict[int, asyncio.Future] = {}
+        self._delivered_messages: OrderedDict[tuple[Any, str], float] = OrderedDict()
+        self._inflight_messages: set[tuple[Any, str]] = set()
+        self._outbound_cids: OrderedDict[tuple[Any, str], float] = OrderedDict()
         self._on_disconnect_cb = None
-        if chat_ids:
-            self.chat_ids += map(int, map(str.strip, chat_ids.split(',')))
+        self._on_read_cb = None
+        self._on_reaction_cb = None
+        if self.chat_ids:
+            log.info("Listening only to MAX chats: %s", self.chat_ids)
+        if self.ignore_chat_ids:
+            log.info("Ignoring MAX chats: %s", self.ignore_chat_ids)
+
+    @staticmethod
+    def _parse_chat_ids(raw: str | None, env_name: str) -> list[int]:
+        if not raw:
+            return []
+        try:
+            return [int(value.strip()) for value in raw.split(",")]
+        except ValueError as exc:
+            raise SystemExit(
+                f"{env_name} must contain comma-separated integer chat IDs"
+            ) from exc
+
+    def _should_dispatch_message(self, msg: "MaxMessage | None") -> bool:
+        if msg is None:
+            return False
+        if msg.chat_id in self.ignore_chat_ids:
+            return False
+        return not self.chat_ids or msg.chat_id in self.chat_ids
+
+    # ── message dedupe (protects against MAX resending on reconnect) ──
+    #
+    # Two-phase: an in-flight set claims a message the instant it starts
+    # processing (so a second, near-simultaneous delivery of the same
+    # message_id is rejected immediately), and a delivered map remembers it
+    # only *after* the handler actually completes successfully. A message
+    # whose handler crashed or was cancelled is NOT remembered as delivered,
+    # so a later resend (e.g. after a reconnect) can still get through
+    # instead of being silently dropped forever.
+
+    def _message_dedupe_key(self, msg: MaxMessage) -> tuple[Any, str] | None:
+        if not msg.message_id:
+            return None
+        return (msg.chat_id, msg.message_id)
+
+    def _prune_delivered_messages(self, now: float | None = None) -> None:
+        if now is None:
+            now = time.monotonic()
+
+        cutoff = now - self.MESSAGE_DEDUPE_TTL_SEC
+        while self._delivered_messages:
+            _, seen_at = next(iter(self._delivered_messages.items()))
+            if seen_at >= cutoff:
+                break
+            self._delivered_messages.popitem(last=False)
+
+    def _can_start_message(self, msg: MaxMessage, now: float | None = None) -> bool:
+        key = self._message_dedupe_key(msg)
+        if key is None:
+            return True
+
+        self._prune_delivered_messages(now)
+        if key in self._delivered_messages or key in self._inflight_messages:
+            return False
+
+        self._inflight_messages.add(key)
+        return True
+
+    def _finish_message(self, msg: MaxMessage, delivered: bool, now: float | None = None) -> None:
+        key = self._message_dedupe_key(msg)
+        if key is None:
+            return
+
+        self._inflight_messages.discard(key)
+        if not delivered:
+            return
+
+        if now is None:
+            now = time.monotonic()
+        self._delivered_messages[key] = now
+        while len(self._delivered_messages) > self.MESSAGE_DEDUPE_MAX:
+            self._delivered_messages.popitem(last=False)
+
+    async def _run_message_callback(self, msg: MaxMessage) -> None:
+        delivered = False
+        try:
+            await self._on_message_cb(msg)
+            delivered = True
+        finally:
+            self._finish_message(msg, delivered)
+
+    # ── bridge-echo detection ──────────────────────────────────────
+    #
+    # Messages you send THROUGH THE BRIDGE come back over the same
+    # WebSocket as a normal is_self=True DISPATCH — those must not be
+    # re-forwarded to Telegram (infinite echo). But messages you type
+    # manually on your own phone/other MAX client are ALSO is_self=True,
+    # and those SHOULD be mirrored to Telegram. We tell them apart by
+    # remembering the `cid` (client message id) of everything the bridge
+    # itself sent; only a self-message whose cid matches one we generated
+    # is an echo.
+
+    def _prune_outbound_cids(self, now: float | None = None) -> None:
+        if now is None:
+            now = time.monotonic()
+
+        cutoff = now - self.OUTBOUND_ECHO_TTL_SEC
+        while self._outbound_cids:
+            _, seen_at = next(iter(self._outbound_cids.items()))
+            if seen_at >= cutoff:
+                break
+            self._outbound_cids.popitem(last=False)
+
+    def _mark_outbound_cid(self, chat_id, cid, now: float | None = None) -> None:
+        if cid is None:
+            return
+        if now is None:
+            now = time.monotonic()
+
+        self._prune_outbound_cids(now)
+        self._outbound_cids[(chat_id, str(cid))] = now
+        while len(self._outbound_cids) > self.OUTBOUND_ECHO_MAX:
+            self._outbound_cids.popitem(last=False)
+
+    def _is_bridge_echo(self, msg: MaxMessage, now: float | None = None) -> bool:
+        if not msg.is_self or msg.cid is None:
+            return False
+
+        self._prune_outbound_cids(now)
+        return (msg.chat_id, str(msg.cid)) in self._outbound_cids
+
+    def is_bridge_echo(self, msg: MaxMessage) -> bool:
+        """Public wrapper: True if this is_self message is an echo of a
+        message the bridge itself just sent (must not be re-forwarded to
+        avoid an infinite loop), as opposed to something typed manually on
+        your own phone/other MAX client (which SHOULD be mirrored)."""
+        return self._is_bridge_echo(msg)
 
     # ── decorator API ──────────────────────────────────────────────
 
@@ -128,6 +328,30 @@ class MaxClient:
     def on_disconnect(self, func):
         self._on_disconnect_cb = func
         return func
+
+    def on_read(self, func):
+        """Register a handler for MaxReadEvent (opcode 130, NOTIF_MARK) —
+        fires when a chat's read marker moves, e.g. the other person read
+        up to some point in the conversation."""
+        self._on_read_cb = func
+        return func
+
+    def on_reaction(self, func):
+        """Register a handler for MaxReactionEvent (opcode 155,
+        NOTIF_MSG_REACTIONS_CHANGED) — fires when a message's reaction
+        counters change (someone added/removed an emoji reaction in MAX)."""
+        self._on_reaction_cb = func
+        return func
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(
+            self._authorized and self._ws is not None and not self._ws.closed
+        )
+
+    @property
+    def my_id(self):
+        return self._my_id
 
     # ── transport ──────────────────────────────────────────────────
 
@@ -144,7 +368,9 @@ class MaxClient:
         }
         self._seq += 1
         raw = json.dumps(pkt, ensure_ascii=False)
-        log.debug(">>> SEND op=%d seq=%d | %s", opcode, seq, raw[:800])
+        safe_pkt = _redact_sensitive(pkt)
+        safe_raw = json.dumps(safe_pkt, ensure_ascii=False)
+        log.debug(">>> SEND op=%d seq=%d | %s", opcode, seq, safe_raw[:800])
         await self._ws.send_str(raw)
         return seq
 
@@ -153,6 +379,8 @@ class MaxClient:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict] = loop.create_future()
         seq = await self._send(opcode, payload)
+        if seq < 0:
+            return {}
         self._pending[seq] = fut
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
@@ -177,7 +405,7 @@ class MaxClient:
     # ── main loop ──────────────────────────────────────────────────
 
     async def run(self):
-        if self.debug:
+        if self.debug_dump_json:
             os.makedirs(DEBUG_DIR, exist_ok=True)
 
         async with aiohttp.ClientSession(headers=_BROWSER_HEADERS) as session:
@@ -189,6 +417,7 @@ class MaxClient:
                         self.WS_URL, headers=_WS_HEADERS
                     ) as ws:
                         self._ws = ws
+                        self._authorized = False
                         self._seq = 0
                         self._pending.clear()
 
@@ -223,6 +452,8 @@ class MaxClient:
                     log.exception("Connection error")
 
                 finally:
+                    self._authorized = False
+                    self._ws = None
                     if self._heartbeat_task:
                         self._heartbeat_task.cancel()
                     for fut in self._pending.values():
@@ -281,8 +512,9 @@ class MaxClient:
 
             elif op == OpCode.AUTH_SNAPSHOT and cmd == 1:
                 self._my_id = payload.get("profile", {}).get("id")
+                self._authorized = True
                 log.info("Authorized! my_id=%s", self._my_id)
-                if self.debug:
+                if self.debug_dump_json:
                     self._dump_json("snapshot.json", payload)
 
                 if self._on_ready_cb:
@@ -290,16 +522,25 @@ class MaxClient:
 
             elif op == OpCode.DISPATCH:
                 self._dispatch_counter += 1
-                if self.debug and self._dispatch_counter <= 20:
+                if self.debug_dump_json and self._dispatch_counter <= 20:
                     self._dump_json(
                         f"dispatch_{self._dispatch_counter:04d}.json", payload
                     )
 
                 if self._on_message_cb:
                     msg = self._parse_message(payload)
-                    if msg is not None and ((not self.chat_ids) or (msg.chat_id in self.chat_ids)):
-                        task = asyncio.create_task(self._on_message_cb(msg))
-                        task.add_done_callback(_log_task_exception)
+                    if self._should_dispatch_message(msg):
+                        if not self._can_start_message(msg):
+                            log.info(
+                                "Skipping duplicate MAX message: chat=%s message_id=%s",
+                                msg.chat_id,
+                                msg.message_id,
+                            )
+                        else:
+                            task = asyncio.create_task(
+                                self._run_message_callback(msg)
+                            )
+                            task.add_done_callback(_log_task_exception)
 
             elif op == OpCode.UPLOAD_READY:
                 # Server confirms an uploaded file/video finished server-side processing.
@@ -310,22 +551,54 @@ class MaxClient:
                         fut.set_result(payload)
                 log.debug("UPLOAD_READY op=136: %s", payload)
 
+            elif op == OpCode.NOTIF_MARK:
+                if self._on_read_cb:
+                    event = self._parse_read_event(payload)
+                    if event is not None:
+                        task = asyncio.create_task(self._on_read_cb(event))
+                        task.add_done_callback(_log_task_exception)
+
+            elif op == OpCode.NOTIF_MSG_REACTIONS_CHANGED:
+                if self._on_reaction_cb:
+                    event = self._parse_reaction_event(payload)
+                    if event is not None:
+                        task = asyncio.create_task(self._on_reaction_cb(event))
+                        task.add_done_callback(_log_task_exception)
+
             elif op in (OpCode.HEARTBEAT_PING,):
                 log.debug("Heartbeat op=%s", op)
 
             elif cmd not in (1, 3):
                 log.info("<<< EVENT op=%-4s cmd=%-3s | %s", op, cmd, payload_preview[:500])
 
-    # ── WebSocket RPC: fetch contacts ──────────────────────────────
+    # ── WebSocket RPC: fetch contacts / chats ──────────────────────
 
     async def fetch_contacts(self, contact_ids: list[int]) -> dict:
         """Fetch contact info via WS opcode 32. Returns raw response payload."""
         if not contact_ids:
             return {}
         resp = await self.cmd(OpCode.CONTACT_GET, {"contactIds": contact_ids})
-        if self.debug:
+        if self.debug_dump_json:
             self._dump_json("contacts_response.json", resp)
         log.info("fetch_contacts(%s) → keys: %s", contact_ids, list(resp.keys()))
+        return resp
+
+    async def fetch_chat(self, chat_id) -> dict:
+        """Fetch chat metadata via WS opcode 48. Returns raw response payload.
+
+        Used to resolve the real title of a MAX chat that wasn't in the
+        startup snapshot yet (e.g. the bridge's account was just added to a
+        brand-new group) — without this, a new chat's forum topic would be
+        named after whoever sent the first message instead of the group.
+        """
+        resp = await self.cmd(OpCode.CHAT_GET, {"chatIds": [chat_id]})
+        if self.debug_dump_json:
+            self._dump_json(f"chat_{chat_id}.json", resp)
+        log.info(
+            "fetch_chat(%s) → keys: %s",
+            chat_id,
+            list(resp.keys()) if isinstance(resp, dict) else type(resp).__name__,
+        )
         return resp
 
     async def send_message(self, chat_id, text: str = "", elements=None,
@@ -341,6 +614,7 @@ class MaxClient:
         if attaches is None:
             attaches = []
         cid = int(time.time() * 1000) * 1000 + random.randint(0, 999)
+        self._mark_outbound_cid(chat_id, cid)
         message = {"text": text, "cid": cid, "elements": elements}
         if attaches:
             message["attaches"] = attaches
@@ -409,7 +683,7 @@ class MaxClient:
         """
         resp = await self.cmd(57, {"link": link})
         log.info("open_by_link(%s) → %s",
-                 link[:60], str(resp)[:300] if resp else resp)
+                 _redact_url(link)[:60], str(_redact_sensitive(resp))[:300] if resp else resp)
         return resp
 
     async def download_audio_url(self, audio_id, chat_id, message_id,
@@ -439,7 +713,7 @@ class MaxClient:
         for url in candidates:
             ok = await self._probe_audio_url(url)
             if ok:
-                log.info("download_audio_url: found audio at %s", url[:80])
+                log.info("download_audio_url: found audio at %s", _redact_url(url)[:80])
                 return url
 
         # Last cheap try: maybe the audio is stored in the same backend as
@@ -450,19 +724,53 @@ class MaxClient:
         except (TypeError, ValueError):
             audio_id_int = None
         if audio_id_int is not None and chat_id is not None and message_id:
-            resp = await self.cmd(88, {
+            resp = await self.cmd(OpCode.FILE_DOWNLOAD_URL, {
                 "fileId": audio_id_int,
                 "chatId": chat_id,
                 "messageId": str(message_id),
             })
             log.info("download_audio_url op=88(file-as-audio) → %s",
-                     str(resp)[:400] if resp else resp)
+                     str(_redact_sensitive(resp))[:400] if resp else resp)
             if resp and "_max_error" not in resp:
                 url = resp.get("url")
                 if isinstance(url, str) and url.startswith("http"):
                     return url
 
         log.warning("download_audio_url: nothing resolved an audio URL")
+        return None
+
+    async def download_video_url(
+        self, video_id, chat_id, message_id,
+    ) -> str | None:
+        """Resolve an incoming MAX video ID to the best available MP4 URL."""
+        try:
+            numeric_video_id = int(video_id)
+        except (TypeError, ValueError):
+            log.warning("Invalid videoId: %r", video_id)
+            return None
+
+        resp = await self.cmd(
+            OpCode.VIDEO_DOWNLOAD_URL,
+            {
+                "videoId": numeric_video_id,
+                "chatId": chat_id,
+                "messageId": message_id,
+            },
+        )
+        if not isinstance(resp, dict) or "_max_error" in resp:
+            log.warning("Could not resolve VIDEO URL for videoId=%s", numeric_video_id)
+            return None
+
+        preferred_qualities = (
+            "MP4_1080", "MP4_720", "MP4_480", "MP4_360", "MP4_240", "MP4_144",
+        )
+        for quality in preferred_qualities:
+            url = resp.get(quality)
+            if isinstance(url, str) and _is_allowed_download_url(url):
+                log.info("Resolved VIDEO URL videoId=%s quality=%s", numeric_video_id, quality)
+                return url
+
+        log.warning("VIDEO response has no allowed MP4 URL for videoId=%s", numeric_video_id)
         return None
 
     async def _probe_audio_url(self, url: str) -> bool:
@@ -479,7 +787,7 @@ class MaxClient:
             ) as resp:
                 ct = resp.headers.get("Content-Type", "")
                 log.info("probe %s → HTTP %d, Content-Type=%s",
-                          url[:80], resp.status, ct)
+                          _redact_url(url)[:80], resp.status, ct)
                 if resp.status != 200:
                     return False
                 # Reject obviously-HTML responses (error/redirect pages).
@@ -487,7 +795,7 @@ class MaxClient:
                     return False
                 return True
         except Exception:
-            log.exception("probe error for %s", url[:80])
+            log.exception("probe error for %s", _redact_url(url)[:80])
             return False
         finally:
             if close_after:
@@ -595,31 +903,87 @@ class MaxClient:
                 await resp.read()
                 return True
         except Exception:
-            log.exception("Upload POST error: %s", url[:120])
+            log.exception("Upload POST error: %s", _redact_url(url)[:120])
             return None
         finally:
             if close_after:
                 await session.close()
 
     async def download_file(self, url: str) -> bytes | None:
-        """Download a file by URL, returning raw bytes or None on failure."""
-        session = getattr(self, "_session", None)
-        close_after = False
+        """Download a file by URL, returning raw bytes or None on failure.
+
+        Refuses non-MAX-CDN hosts (SSRF protection: attach URLs come from
+        the MAX server, but we still don't want to blindly fetch whatever
+        host a crafted payload might point at) and enforces
+        ``max_download_bytes`` both from the declared Content-Length and by
+        counting bytes while streaming, so a malicious/broken huge response
+        can't be read fully into memory.
+        """
+        if not _is_allowed_download_url(url):
+            log.warning("Blocked download from disallowed URL: %s", _redact_url(url)[:120])
+            return None
+
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        is_okcdn = host == "okcdn.ru" or host.endswith(".okcdn.ru")
+        if is_okcdn:
+            # Signed OK CDN URLs (used for MAX video) are sensitive to
+            # browser-origin headers; MAX's own web client sends only
+            # User-Agent here.
+            session = aiohttp.ClientSession(headers={"User-Agent": _USER_AGENT})
+            request_headers = {}
+            request_url = URL(url, encoded=True)
+            close_after = True
+        else:
+            session = getattr(self, "_session", None)
+            request_headers = _HTTP_HEADERS
+            request_url = url
+            close_after = False
         if session is None or session.closed:
             session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
             close_after = True
         try:
             async with session.get(
-                url, headers=_HTTP_HEADERS,
+                request_url, headers=request_headers,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.read()
-                    log.info("Downloaded %s (%d bytes)", url[:120], len(data))
+                    content_length = resp.headers.get("Content-Length")
+                    try:
+                        declared_size = int(content_length) if content_length else None
+                    except ValueError:
+                        declared_size = None
+                    if declared_size is not None and declared_size > self.max_download_bytes:
+                        log.warning(
+                            "Blocked oversized download %s: %s bytes > %s bytes",
+                            _redact_url(url)[:120],
+                            declared_size,
+                            self.max_download_bytes,
+                        )
+                        return None
+
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        total += len(chunk)
+                        if total > self.max_download_bytes:
+                            log.warning(
+                                "Blocked oversized streaming download %s: %d bytes > %d bytes",
+                                _redact_url(url)[:120],
+                                total,
+                                self.max_download_bytes,
+                            )
+                            return None
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                    log.info("Downloaded %s (%d bytes)", _redact_url(url)[:120], len(data))
                     return data
-                log.warning("Download failed %s — HTTP %d", url[:120], resp.status)
+                error_body = (await resp.text(errors="replace"))[:200]
+                log.warning(
+                    "Download failed %s — HTTP %d: %r",
+                    _redact_url(url)[:120], resp.status, error_body,
+                )
         except Exception:
-            log.exception("Download error: %s", url[:120])
+            log.exception("Download error: %s", _redact_url(url)[:120])
         finally:
             if close_after:
                 await session.close()
@@ -638,6 +1002,7 @@ class MaxClient:
             text=msg_body.get("text", ""),
             timestamp=msg_body.get("time"),
             message_id=str(msg_body.get("id", "")),
+            cid=msg_body.get("cid"),
             attaches=msg_body.get("attaches") or [],
             link=msg_body.get("link") or {},
             raw=payload,
@@ -648,6 +1013,29 @@ class MaxClient:
 
         return msg
 
+    def _parse_read_event(self, payload: dict) -> "MaxReadEvent | None":
+        chat_id = payload.get("chatId")
+        if chat_id is None:
+            return None
+        return MaxReadEvent(
+            chat_id=chat_id,
+            user_id=payload.get("userId"),
+            mark=payload.get("mark"),
+            set_as_unread=bool(payload.get("setAsUnread", False)),
+        )
+
+    def _parse_reaction_event(self, payload: dict) -> "MaxReactionEvent | None":
+        chat_id = payload.get("chatId")
+        message_id = payload.get("messageId")
+        if chat_id is None or not message_id:
+            return None
+        return MaxReactionEvent(
+            chat_id=chat_id,
+            message_id=str(message_id),
+            counters=payload.get("counters") or [],
+            total_count=payload.get("totalCount", 0),
+        )
+
     # ── debug helpers ──────────────────────────────────────────────
 
     @staticmethod
@@ -655,7 +1043,58 @@ class MaxClient:
         path = os.path.join(DEBUG_DIR, filename)
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                json.dump(_redact_sensitive(data), f, ensure_ascii=False, indent=2)
             log.info("Dumped %s (%d bytes)", path, os.path.getsize(path))
         except Exception:
             log.exception("Failed to dump %s", path)
+
+
+def _is_allowed_download_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host in ALLOWED_DOWNLOAD_HOSTS or host.endswith(ALLOWED_DOWNLOAD_SUFFIXES)
+
+
+def _redact_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return "<invalid-url>"
+    path = parsed.path
+    host = (parsed.hostname or "").lower().rstrip(".")
+    parts = path.strip("/").split("/")
+    if host.endswith("max.ru") and parts and parts[0] in {"join", "u"}:
+        path = "/" + parts[0] + "/<redacted>"
+    query = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if _is_sensitive_key(key):
+            query.append((key, "<redacted>"))
+        else:
+            query.append((key, value))
+    return urlunsplit((parsed.scheme, parsed.netloc, path, urlencode(query), parsed.fragment))
+
+
+def _is_sensitive_key(key: str) -> bool:
+    normalized = key.replace("_", "").replace("-", "").lower()
+    return any(part in normalized for part in SENSITIVE_KEY_PARTS)
+
+
+def _redact_sensitive(value):
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if _is_sensitive_key(str(key)):
+                redacted[key] = "<redacted>"
+            elif isinstance(item, str) and item.startswith(("http://", "https://")):
+                redacted[key] = _redact_url(item)
+            else:
+                redacted[key] = _redact_sensitive(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value

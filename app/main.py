@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 from telegram import Update
 
 from app.config import load_settings
+from app.health import start_health_server
 from app.max_listener import create_max_client
 from app.tg_handler import build_tg_app
 from app.tg_sender import TelegramSender
@@ -80,13 +81,19 @@ async def main():
 
     client = create_max_client(
         settings.max_token, settings.max_device_id, sender, settings.max_chat_ids,
-        debug=settings.debug,
+        settings.max_ignore_chat_ids, debug=settings.debug,
+        debug_dump_json=settings.debug_dump_json,
+        max_download_mb=settings.max_download_mb,
     )
+
+    health_runner = None
+    if settings.health_port:
+        health_runner = await start_health_server(client, settings.health_port)
 
     tg_app = None
     if settings.reply_enabled:
         tg_app = build_tg_app(settings.tg_bot_token, client, settings.tg_chat_id,
-                              topic_store, allowed_user_id=settings.tg_allowed_user_id,
+                              topic_store, allowed_user_ids=settings.tg_allowed_user_ids,
                               proxy_url=settings.tg_proxy)
         await tg_app.initialize()
         await tg_app.start()
@@ -107,6 +114,8 @@ async def main():
             await tg_app.updater.stop()
             await tg_app.stop()
             await tg_app.shutdown()
+        if health_runner:
+            await health_runner.cleanup()
         await sender.stop()
 
 

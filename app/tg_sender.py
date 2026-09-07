@@ -77,15 +77,58 @@ class TelegramSender:
             return str(routed)
         return self._default_chat_id
 
+    def all_known_chat_ids(self) -> set[int]:
+        """Every distinct Telegram supergroup the bridge currently knows
+        about: groups with at least one bound topic, groups pre-configured
+        via MAX_CHAT_ROUTES, and the default group."""
+        ids = set(self._topics.all_tg_chat_ids())
+        ids.update(self._chat_routes.values())
+        ids.add(int(self._default_chat_id))
+        return ids
+
+    async def broadcast(self, text: str) -> None:
+        """Send a status message (General topic) to every Telegram group
+        the bridge is routing to — not just the default one. Used for
+        bot-wide notices like MAX connection loss/recovery, since with
+        multi-group routing a person watching only a non-default group
+        would otherwise never see them."""
+        for chat_id in self.all_known_chat_ids():
+            await self.send(text, chat_id=chat_id)
+
+    async def set_reaction(self, chat_id: str | int, message_id: int, emoji: str) -> bool:
+        """Best-effort: put a single emoji reaction on a Telegram message.
+
+        Used to mirror a MAX "read" event (✅) onto the last message we
+        forwarded into that chat's topic — matching the existing pattern
+        where a Telegram→MAX reply gets a 👀 reaction once MAX confirms
+        delivery. Returns False (and logs at debug level) on any failure —
+        e.g. the message is too old for Telegram to accept a reaction on,
+        or the bot lacks permission — since a missed reaction shouldn't be
+        treated as a hard error.
+        """
+        try:
+            await self._bot.set_message_reaction(
+                chat_id=chat_id, message_id=message_id, reaction=emoji,
+            )
+            return True
+        except Exception:
+            log.debug("Could not set reaction %r on message %s in %s",
+                     emoji, message_id, chat_id, exc_info=True)
+            return False
+
     # ── forum topics ───────────────────────────────────────────────
 
-    async def ensure_topic(self, max_chat_id, title: str) -> int | None:
+    async def ensure_topic(self, max_chat_id, title: str, *, force_rename: bool = False) -> int | None:
         """Return the Telegram forum topic (thread) ID for a Max chat.
 
         Creates the topic (in the resolved target group — see
         ``resolve_chat_id``) on first use. If a previously created topic
-        still carries a placeholder (numeric) name and a real name is now
-        known, the topic is renamed. Returns None if topic creation fails —
+        carries a different name, it's renamed when either the stored title
+        looks like a placeholder (numeric ID or a "DM:" fallback) and the
+        new one doesn't, or when ``force_rename=True`` — used by the caller
+        once it has *confirmed* (via a live MAX lookup, not just a guess)
+        what the chat is actually called, e.g. a group chat resolved after
+        being created at runtime. Returns None if topic creation fails —
         callers then fall back to the General topic.
         """
         title = (title or str(max_chat_id)).strip()[:TG_TOPIC_NAME_MAX]
@@ -94,7 +137,10 @@ class TelegramSender:
         existing = self._topics.get_topic(max_chat_id)
         if existing is not None:
             stored = self._topics.get_title(max_chat_id) or ""
-            if title and title != stored and _looks_numeric(stored) and not _looks_numeric(title):
+            should_rename = bool(title) and title != stored and (
+                force_rename or (_looks_numeric(stored) and not _looks_numeric(title))
+            )
+            if should_rename:
                 try:
                     await self._bot.edit_forum_topic(
                         chat_id=target_chat_id, message_thread_id=existing, name=title
@@ -156,14 +202,14 @@ class TelegramSender:
     # falls back to the configured default group.
 
     async def send(self, text: str, message_thread_id: int | None = None,
-                    chat_id: str | int | None = None) -> None:
+                    chat_id: str | int | None = None):
         if not text:
-            return
+            return None
 
         if len(text) > TG_MAX_LENGTH:
             text = text[: TG_MAX_LENGTH - 20] + "\n\n[...усечено]"
 
-        await self._retry(
+        return await self._retry(
             lambda: self._bot.send_message(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 text=text,
@@ -174,7 +220,7 @@ class TelegramSender:
 
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
                          message_thread_id: int | None = None,
-                         chat_id: str | int | None = None) -> None:
+                         chat_id: str | int | None = None):
         caption = self._truncate_caption(caption)
         await self._retry(
             lambda: self._bot.send_photo(
@@ -188,7 +234,7 @@ class TelegramSender:
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
                             message_thread_id: int | None = None,
-                            chat_id: str | int | None = None) -> None:
+                            chat_id: str | int | None = None):
         caption = self._truncate_caption(caption)
         await self._retry(
             lambda: self._bot.send_document(
@@ -202,7 +248,7 @@ class TelegramSender:
 
     async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4",
                          message_thread_id: int | None = None,
-                         chat_id: str | int | None = None) -> None:
+                         chat_id: str | int | None = None):
         caption = self._truncate_caption(caption)
         await self._retry(
             lambda: self._bot.send_video(
@@ -216,7 +262,7 @@ class TelegramSender:
 
     async def send_voice(self, data: bytes, caption: str = "",
                          message_thread_id: int | None = None,
-                         chat_id: str | int | None = None) -> None:
+                         chat_id: str | int | None = None):
         caption = self._truncate_caption(caption)
         target = chat_id if chat_id is not None else self._default_chat_id
         result = await self._retry(
@@ -230,7 +276,7 @@ class TelegramSender:
         )
         if result is None:
             log.info("send_voice failed, falling back to send_audio")
-            await self._retry(
+            result = await self._retry(
                 lambda: self._bot.send_audio(
                     chat_id=target,
                     audio=InputFile(io.BytesIO(data), filename="audio.m4a"),
@@ -239,10 +285,11 @@ class TelegramSender:
                     message_thread_id=message_thread_id,
                 )
             )
+        return result
 
     async def send_sticker(self, data: bytes, message_thread_id: int | None = None,
-                           chat_id: str | int | None = None) -> None:
-        await self._retry(
+                           chat_id: str | int | None = None):
+        return await self._retry(
             lambda: self._bot.send_sticker(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 sticker=InputFile(io.BytesIO(data), filename="sticker.webp"),

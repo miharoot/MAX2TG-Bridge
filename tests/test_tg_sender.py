@@ -117,3 +117,109 @@ class TestSendChatIdOverride:
 
         _, kwargs = sender._bot.send_message.call_args
         assert kwargs["chat_id"] == DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# ensure_topic — force_rename (confirmed real title always wins)
+# ---------------------------------------------------------------------------
+
+class TestEnsureTopicForceRename:
+    async def test_force_rename_overwrites_even_non_placeholder_title(self, tmp_path):
+        """A confirmed live-fetched chat title must win even over a stored
+        title that doesn't look like a placeholder — e.g. the group was
+        renamed on MAX's side after the topic was first created."""
+        sender, store = _sender(tmp_path)
+        store.set_topic(42, int(DEFAULT), 9, "Old Group Name")
+        sender._bot.edit_forum_topic = AsyncMock()
+
+        thread_id = await sender.ensure_topic(42, "New Group Name", force_rename=True)
+
+        assert thread_id == 9
+        sender._bot.edit_forum_topic.assert_called_once()
+        assert store.get_title(42) == "New Group Name"
+
+    async def test_without_force_rename_non_placeholder_title_is_kept(self, tmp_path):
+        sender, store = _sender(tmp_path)
+        store.set_topic(42, int(DEFAULT), 9, "Old Group Name")
+        sender._bot.edit_forum_topic = AsyncMock()
+
+        thread_id = await sender.ensure_topic(42, "New Group Name", force_rename=False)
+
+        assert thread_id == 9
+        sender._bot.edit_forum_topic.assert_not_called()
+        assert store.get_title(42) == "Old Group Name"
+
+    async def test_placeholder_title_still_self_heals_without_force_rename(self, tmp_path):
+        """Regression guard: the original numeric-placeholder self-heal
+        behavior must keep working even when force_rename isn't passed."""
+        sender, store = _sender(tmp_path)
+        store.set_topic(42, int(DEFAULT), 9, "42")
+        sender._bot.edit_forum_topic = AsyncMock()
+
+        thread_id = await sender.ensure_topic(42, "Real Name")
+
+        assert thread_id == 9
+        sender._bot.edit_forum_topic.assert_called_once()
+        assert store.get_title(42) == "Real Name"
+
+
+# ---------------------------------------------------------------------------
+# broadcast / all_known_chat_ids
+# ---------------------------------------------------------------------------
+
+class TestBroadcast:
+    def test_all_known_chat_ids_includes_default(self, tmp_path):
+        sender, _ = _sender(tmp_path)
+        assert sender.all_known_chat_ids() == {int(DEFAULT)}
+
+    def test_all_known_chat_ids_includes_static_routes(self, tmp_path):
+        sender, _ = _sender(tmp_path, chat_routes={"1": -100111, "2": -100222})
+        assert sender.all_known_chat_ids() == {int(DEFAULT), -100111, -100222}
+
+    def test_all_known_chat_ids_includes_bound_topic_groups(self, tmp_path):
+        sender, store = _sender(tmp_path)
+        store.set_topic(1, -100333, 5, "A")
+        assert sender.all_known_chat_ids() == {int(DEFAULT), -100333}
+
+    async def test_broadcast_sends_to_every_known_group_once(self, tmp_path):
+        sender, store = _sender(tmp_path, chat_routes={"1": -100111})
+        store.set_topic(2, -100222, 5, "A")
+        sender._bot.send_message = AsyncMock()
+
+        await sender.broadcast("hello")
+
+        sent_chat_ids = {c.kwargs["chat_id"] for c in sender._bot.send_message.call_args_list}
+        assert sent_chat_ids == {int(DEFAULT), -100111, -100222}
+
+    async def test_broadcast_deduplicates_default_and_route(self, tmp_path):
+        sender, _ = _sender(tmp_path, chat_routes={"1": int(DEFAULT)})
+        sender._bot.send_message = AsyncMock()
+
+        await sender.broadcast("hello")
+
+        assert sender._bot.send_message.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# set_reaction — used to mirror MAX read events onto Telegram messages
+# ---------------------------------------------------------------------------
+
+class TestSetReaction:
+    async def test_calls_bot_set_message_reaction(self, tmp_path):
+        sender, _ = _sender(tmp_path)
+        sender._bot.set_message_reaction = AsyncMock()
+
+        ok = await sender.set_reaction(chat_id="-100999", message_id=42, emoji="✅")
+
+        assert ok is True
+        sender._bot.set_message_reaction.assert_awaited_once_with(
+            chat_id="-100999", message_id=42, reaction="✅",
+        )
+
+    async def test_returns_false_on_failure_without_raising(self, tmp_path):
+        sender, _ = _sender(tmp_path)
+        sender._bot.set_message_reaction = AsyncMock(side_effect=RuntimeError("too old"))
+
+        ok = await sender.set_reaction(chat_id="-100999", message_id=42, emoji="✅")
+
+        assert ok is False

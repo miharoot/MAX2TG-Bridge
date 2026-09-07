@@ -57,7 +57,7 @@ def _make_update(text="Hello", thread_id=10, is_topic_message=True, user_id=100,
 
 def _make_context(max_client=None, topic_store=None, allowed_user_id=None):
     ctx = MagicMock()
-    bot_data = {ALLOWED_USER_KEY: allowed_user_id}
+    bot_data = {ALLOWED_USER_KEY: frozenset({allowed_user_id}) if allowed_user_id else None}
     if max_client is not None:
         bot_data[MAX_CLIENT_KEY] = max_client
     if topic_store is not None:
@@ -194,11 +194,17 @@ class TestBuildTgApp:
         topic_store = _make_topic_store()
 
         app = build_tg_app("123456:AAABBBCCC", max_client, "-100123456",
-                            topic_store, allowed_user_id=777)
+                            topic_store, allowed_user_ids={777})
 
         assert app.bot_data[MAX_CLIENT_KEY] is max_client
         assert app.bot_data[TOPIC_STORE_KEY] is topic_store
-        assert app.bot_data[ALLOWED_USER_KEY] == 777
+        assert app.bot_data[ALLOWED_USER_KEY] == frozenset({777})
+
+    def test_wires_multiple_allowed_user_ids(self):
+        app = build_tg_app("123456:AAABBBCCC", MagicMock(), "-100123456",
+                            _make_topic_store(), allowed_user_ids={777, 888})
+
+        assert app.bot_data[ALLOWED_USER_KEY] == frozenset({777, 888})
 
     def test_allowed_user_id_none_when_unset(self):
         app = build_tg_app("123456:AAABBBCCC", MagicMock(), "-100123456",

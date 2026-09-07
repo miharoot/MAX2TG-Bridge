@@ -13,11 +13,16 @@ class Settings:
     tg_chat_id: str                      # default/fallback Telegram supergroup
     chat_routes: dict[str, int] = field(default_factory=dict)  # max_chat_id -> tg_chat_id
     max_chat_ids: str | None = None
+    max_ignore_chat_ids: str | None = None
     tg_proxy: str | None = None
     debug: bool = False
     reply_enabled: bool = False
     state_dir: str = "state"
-    tg_allowed_user_id: int | None = None
+    tg_allowed_user_ids: frozenset[int] | None = None
+    debug_dump_json: bool = False
+    max_download_mb: int = 50
+    tg_upload_mb: int = 50
+    health_port: int | None = None
 
 
 def _parse_chat_routes(raw: str | None) -> dict[str, int]:
@@ -46,6 +51,19 @@ def _parse_chat_routes(raw: str | None) -> dict[str, int]:
     return result
 
 
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a valid integer, got: {raw!r}")
+    if value <= 0:
+        raise SystemExit(f"{name} must be greater than zero, got: {value!r}")
+    return value
+
+
 def load_settings() -> Settings:
     load_dotenv()
 
@@ -65,15 +83,23 @@ def load_settings() -> Settings:
             f"TG_CHAT_ID must be a valid integer, got: {tg_chat_id!r}"
         )
 
-    allowed_raw = os.environ.get("TG_ALLOWED_USER_ID") or None
-    allowed_user_id: int | None = None
+    # TG_ALLOWED_USER_IDS (plural, comma-separated) is the current name;
+    # TG_ALLOWED_USER_ID (singular) is kept working for existing .env files.
+    allowed_raw = (os.environ.get("TG_ALLOWED_USER_IDS")
+                   or os.environ.get("TG_ALLOWED_USER_ID") or None)
+    allowed_user_ids: frozenset[int] | None = None
     if allowed_raw:
         try:
-            allowed_user_id = int(allowed_raw)
+            allowed_user_ids = frozenset(
+                int(value.strip()) for value in allowed_raw.split(",") if value.strip()
+            )
         except ValueError:
             raise SystemExit(
-                f"TG_ALLOWED_USER_ID must be a valid integer, got: {allowed_raw!r}"
+                "TG_ALLOWED_USER_IDS must be a comma-separated list of integers, "
+                f"got: {allowed_raw!r}"
             )
+        if not allowed_user_ids:
+            allowed_user_ids = None
 
     chat_routes = _parse_chat_routes(os.environ.get("MAX_CHAT_ROUTES"))
 
@@ -84,9 +110,14 @@ def load_settings() -> Settings:
         tg_chat_id=tg_chat_id,
         chat_routes=chat_routes,
         max_chat_ids=os.environ.get("MAX_CHAT_IDS") or None,
+        max_ignore_chat_ids=os.environ.get("MAX_IGNORE_CHAT_IDS") or None,
         tg_proxy=os.environ.get("TG_PROXY") or None,
         debug=os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"),
         reply_enabled=os.environ.get("REPLY_ENABLED", "").lower() in ("1", "true", "yes"),
         state_dir=os.environ.get("STATE_DIR") or "state",
-        tg_allowed_user_id=allowed_user_id,
+        tg_allowed_user_ids=allowed_user_ids,
+        debug_dump_json=os.environ.get("DEBUG_DUMP_JSON", "").lower() in ("1", "true", "yes"),
+        max_download_mb=_int_env("MAX_DOWNLOAD_MB", 50),
+        tg_upload_mb=_int_env("TG_UPLOAD_MB", 50),
+        health_port=_int_env("HEALTH_PORT", 0) or None,
     )

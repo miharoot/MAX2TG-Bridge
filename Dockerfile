@@ -15,4 +15,9 @@ COPY --from=builder /usr/local/lib/python3.12/site-packages/ /usr/local/lib/pyth
 
 COPY . .
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import os,sys,urllib.request; \
+    port=os.environ.get('HEALTH_PORT'); \
+    sys.exit(0) if not port else sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3).status == 200 else 1)"
+
 CMD ["python", "-m", "app.main"]
