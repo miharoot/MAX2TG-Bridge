@@ -144,3 +144,73 @@ class TestGuessMediaKind:
     # Extension appearing in the middle of filename should not trigger false match
     def test_mp4_in_name_not_extension_is_document(self):
         assert _guess_media_kind("mp4_notes.txt") == "document"
+
+
+# ---------------------------------------------------------------------------
+# _topic_title_for_message — the actual fix for "topic named after whoever
+# added the bridge to a group, instead of the group's own name"
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock, MagicMock
+
+from app.max_client import MaxMessage
+from app.max_listener import _topic_title_for_message
+
+
+def _msg(chat_id=-100, sender_id=1):
+    return MaxMessage(chat_id=chat_id, sender_id=sender_id, message_id="m1")
+
+
+class TestTopicTitleForMessage:
+    async def test_dm_uses_sender_name_and_never_force_renames(self):
+        resolver = MagicMock()
+        title, force = await _topic_title_for_message(
+            _msg(), resolver, raw_sender="Наринэ Ермилова", is_dm=True,
+        )
+        assert title == "Наринэ Ермилова"
+        assert force is False
+        resolver.resolve_chat.assert_not_called()
+
+    async def test_group_with_known_title_from_snapshot(self):
+        resolver = MagicMock()
+        resolver.chat_name.return_value = "Рабочий чат"
+        title, force = await _topic_title_for_message(
+            _msg(), resolver, raw_sender="Наринэ Ермилова", is_dm=False,
+        )
+        assert title == "Рабочий чат"
+        assert force is True
+        resolver.resolve_chat.assert_not_called()
+
+    async def test_brand_new_group_resolves_live_instead_of_using_sender_name(self):
+        """This is the reported bug: a group the bridge's account was just
+        added to isn't in the startup snapshot, so chat_name() falls back to
+        the numeric chat ID — the old code then used the *sender's* name as
+        the topic title. It must now do a live lookup instead."""
+        resolver = MagicMock()
+        resolver.chat_name.return_value = "-68192506787240"  # unknown → numeric fallback
+        resolver.resolve_chat = AsyncMock(return_value="Дружная команда")
+
+        title, force = await _topic_title_for_message(
+            _msg(chat_id=-68192506787240), resolver,
+            raw_sender="Наринэ Ермилова", is_dm=False,
+        )
+
+        assert title == "Дружная команда"
+        assert title != "Наринэ Ермилова"
+        assert force is True
+        resolver.resolve_chat.assert_awaited_once_with(-68192506787240)
+
+    async def test_unresolvable_new_group_falls_back_to_chat_id_not_sender(self):
+        """If the live lookup also fails, fall back to the numeric chat ID
+        — never to the sender's name, since that's the bug being fixed."""
+        resolver = MagicMock()
+        resolver.chat_name.return_value = "-555"
+        resolver.resolve_chat = AsyncMock(return_value="-555")  # still unresolved
+
+        title, force = await _topic_title_for_message(
+            _msg(chat_id=-555), resolver, raw_sender="Наринэ Ермилова", is_dm=False,
+        )
+
+        assert title == "-555"
+        assert title != "Наринэ Ермилова"
+        assert force is False
