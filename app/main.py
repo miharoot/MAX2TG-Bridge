@@ -110,6 +110,19 @@ async def main():
     log.info("Starting Max listener...")
     try:
         await client.run()
+    except Exception:
+        log.exception("Max listener crashed")
+        try:
+            # broadcast(), not send() — every routed group should see
+            # this, not just the default one (same reasoning as the
+            # connection-lost/restored notices above).
+            await sender.broadcast(
+                "❌ <b>Max:</b> не удалось подключиться/авторизоваться. "
+                "Бот перезапустится через 30 секунд."
+            )
+        except Exception:
+            log.exception("Failed to notify Telegram about Max listener crash")
+        raise
     finally:
         log.info("Shutting down...")
         if tg_app:
