@@ -48,10 +48,11 @@ class LogQrHandler:
 
         log.warning("PyMax QR authorization URL: %s", qr_url)
         for row in qr.modules:
+            # 2 chars wide, 1 line tall per module: a monospace glyph is
+            # roughly twice as tall as it is wide, so this (not doubling
+            # the line too) is what keeps modules square instead of
+            # rendering as tall rectangles that break scanning.
             line = "".join("##" if cell else "  " for cell in row)
-            # print each module row twice: monospace glyphs are roughly
-            # twice as tall as wide, so this keeps modules square-ish
-            log.warning(line)
             log.warning(line)
 
         if self._bridge_client is None:
