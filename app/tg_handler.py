@@ -635,6 +635,8 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("/add denied for user_id=%s (not in allowed list)",
                     update.effective_user.id)
         return
+    # Primary source: the command argument itself (`/add <link>`).
+    link = context.args[0] if context.args else ""
     # Try to extract a max.ru link from anywhere in the message text too,
     # so `/add` works if the link was just pasted alongside the command.
     if not link.startswith(("http://", "https://")) and message.text:
