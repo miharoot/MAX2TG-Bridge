@@ -493,7 +493,11 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
 
     @client.on_qr
     async def handle_qr(qr_url: str, png_bytes: bytes):
-        await sender.broadcast_photo(
+        # Only the default chat gets the QR image (unlike the
+        # connect/disconnect/crash notices below, which go to every
+        # routed group) — logging into MAX is a one-off admin action,
+        # no need to spam every group with a login QR.
+        await sender.send_photo(
             png_bytes,
             caption=(
                 "🔑 <b>Max:</b> требуется авторизация — отсканируйте QR-код в MAX\n"
