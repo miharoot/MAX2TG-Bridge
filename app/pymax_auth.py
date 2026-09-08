@@ -1,10 +1,15 @@
+import io
 import logging
+from typing import TYPE_CHECKING
 
 import qrcode
 
 from app.config import Settings
 
 from pymax import Client, ExtraConfig, WebClient
+
+if TYPE_CHECKING:
+    from app.pymax_client import PyMaxClient
 
 log = logging.getLogger(__name__)
 
@@ -18,19 +23,23 @@ class EnvPasswordProvider:
 
 
 class LogQrHandler:
-    """Shows the login QR code through the app's own logger instead of
-    pymax's ``ConsoleQrHandler`` (which writes cp437 half-block chars
-    straight to stdout).
+    """Shows the login QR code as a real PNG broadcast to Telegram (via
+    ``bridge_client.notify_qr``, see app/pymax_client.py) — much more
+    reliably scannable than terminal ASCII art — and also logs it
+    through the app's own logger as a fallback for when Telegram isn't
+    reachable yet.
 
-    That matters when running under systemd without a TTY: journald
-    services often start in the ``C``/``POSIX`` locale, so raw non-ASCII
-    writes to stdout can throw ``UnicodeEncodeError`` (or just render as
-    garbage in some log viewers/fonts), and writing outside the logger
-    means the QR can get interleaved with other async log lines. This
-    renders with plain ``#``/space ASCII (safe under any encoding) and
-    doubles each module both ways to keep it roughly square and
-    scannable, then logs it one line at a time.
+    The ASCII fallback deliberately avoids pymax's own
+    ``ConsoleQrHandler``, which writes cp437 half-block chars straight
+    to stdout: under systemd without a TTY, journald services often
+    start in the ``C``/``POSIX`` locale, so raw non-ASCII writes can
+    throw ``UnicodeEncodeError`` or render as garbage. This uses plain
+    ``#``/space ASCII (safe under any encoding), doubled both ways to
+    stay roughly square.
     """
+
+    def __init__(self, bridge_client: "PyMaxClient | None" = None):
+        self._bridge_client = bridge_client
 
     async def show_qr(self, qr_url: str) -> None:
         qr = qrcode.QRCode(border=2)
@@ -45,11 +54,23 @@ class LogQrHandler:
             log.warning(line)
             log.warning(line)
 
+        if self._bridge_client is None:
+            return
+        try:
+            img = qr.make_image()
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            await self._bridge_client.notify_qr(qr_url, buf.getvalue())
+        except Exception:
+            log.exception("Failed to render/send QR PNG; ASCII log above is the fallback")
 
-def build_pymax_client(settings: Settings):
+
+def build_pymax_client(settings: Settings, bridge_client: "PyMaxClient | None" = None):
     """Build a PyMax client for the configured primary auth flow.
 
     Imports stay local so configuration errors remain easy to diagnose.
+    ``bridge_client`` (optional) lets the QR handler broadcast the code
+    via ``bridge_client.notify_qr`` instead of only logging it.
     """
     try:
         from pymax import Client, ExtraConfig, WebClient
@@ -68,7 +89,7 @@ def build_pymax_client(settings: Settings):
             work_dir=settings.max_pymax_work_dir,
             session_name=settings.max_pymax_session_name,
             extra_config=extra_config,
-            qr_provider=LogQrHandler(),
+            qr_provider=LogQrHandler(bridge_client),
         )
 
     if not settings.max_phone:

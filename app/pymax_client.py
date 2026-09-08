@@ -244,7 +244,8 @@ class PyMaxClient:
                 int, map(str.strip, settings.max_ignore_chat_ids.split(","))
             )
 
-        self._client = build_pymax_client(settings)
+        self._on_qr_cb = None
+        self._client = build_pymax_client(settings, self)
         self._my_id: Any = None
         self._is_connected = False
         self._on_ready_cb = None
@@ -288,6 +289,24 @@ class PyMaxClient:
     def on_reaction(self, func):
         self._on_reaction_cb = func
         return func
+
+    def on_qr(self, func):
+        """Register a callback fired with (qr_url, png_bytes) whenever a
+        fresh MAX login QR code is generated — lets the app broadcast it
+        somewhere (e.g. Telegram) instead of only logging it."""
+        self._on_qr_cb = func
+        return func
+
+    async def notify_qr(self, qr_url: str, png_bytes: bytes) -> None:
+        """Called by the QR auth handler (see app/pymax_auth.py) — not
+        part of the on_start/on_message event wiring since it can fire
+        before the pymax client has even finished connecting."""
+        if not self._on_qr_cb:
+            return
+        try:
+            await self._on_qr_cb(qr_url, png_bytes)
+        except Exception:
+            log.exception("on_qr callback failed")
 
     def _mark_outbound_cid(self, chat_id: Any, cid: Any) -> None:
         if cid is None:

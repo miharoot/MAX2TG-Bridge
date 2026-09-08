@@ -101,6 +101,14 @@ class TelegramSender:
         for chat_id in self.all_known_chat_ids():
             await self.send(text, chat_id=chat_id)
 
+    async def broadcast_photo(self, data: bytes, caption: str = "",
+                              filename: str = "photo.jpg") -> None:
+        """Same as broadcast() but for a photo — e.g. the MAX login QR
+        code, so it reaches every routed group as an actually-scannable
+        image instead of only ASCII art in the server log."""
+        for chat_id in self.all_known_chat_ids():
+            await self.send_photo(data, caption=caption, filename=filename, chat_id=chat_id)
+
     async def set_reaction(self, chat_id: str | int, message_id: int, emoji: str) -> bool:
         """Best-effort: put a single emoji reaction on a Telegram message.
 

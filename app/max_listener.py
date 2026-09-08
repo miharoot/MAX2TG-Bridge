@@ -491,6 +491,17 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             await sender.broadcast(f"✅ <b>Max:</b> подключён | чатов: {chat_count}")
         _first_connect = False
 
+    @client.on_qr
+    async def handle_qr(qr_url: str, png_bytes: bytes):
+        await sender.broadcast_photo(
+            png_bytes,
+            caption=(
+                "🔑 <b>Max:</b> требуется авторизация — отсканируйте QR-код в MAX\n"
+                f"Ссылка: {escape(qr_url)}"
+            ),
+            filename="max_login_qr.png",
+        )
+
     @client.on_disconnect
     async def handle_disconnect():
         nonlocal _notif_count, _last_notif_time
