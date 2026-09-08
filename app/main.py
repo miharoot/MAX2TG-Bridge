@@ -67,6 +67,13 @@ async def main():
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING if not settings.debug else logging.DEBUG)
 
+    _version_path = os.path.join(os.path.dirname(__file__), "..", "VERSION")
+    try:
+        with open(_version_path, encoding="utf-8") as f:
+            _version = f.read().strip()
+    except OSError:
+        _version = "unknown"
+    log.info("MAX2TG-Bridge v%s", _version)
     log.info("Debug mode: %s", "ON" if settings.debug else "OFF")
 
     if settings.tg_proxy:
