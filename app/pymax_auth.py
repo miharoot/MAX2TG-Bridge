@@ -1,5 +1,6 @@
 import io
 import logging
+import sys
 from typing import TYPE_CHECKING
 
 import qrcode
@@ -12,6 +13,21 @@ if TYPE_CHECKING:
     from app.pymax_client import PyMaxClient
 
 log = logging.getLogger(__name__)
+
+
+def _qr_fill_char() -> str:
+    """'#' has visible gaps inside the glyph itself (it's a hash, not a
+    fill), which hurts contrast enough that some cameras fail to scan
+    it. A real solid block ('█', U+2588) scans far more reliably — use
+    it whenever the log stream can actually encode it, since under
+    systemd without PYTHONUTF8=1/a UTF-8 locale, stderr may still be
+    stuck on ASCII and raising here would break the whole QR log."""
+    encoding = getattr(sys.stderr, "encoding", None) or "ascii"
+    try:
+        "█".encode(encoding)
+        return "█"
+    except (LookupError, UnicodeEncodeError):
+        return "#"
 
 
 class EnvPasswordProvider:
@@ -31,11 +47,9 @@ class LogQrHandler:
 
     The ASCII fallback deliberately avoids pymax's own
     ``ConsoleQrHandler``, which writes cp437 half-block chars straight
-    to stdout: under systemd without a TTY, journald services often
-    start in the ``C``/``POSIX`` locale, so raw non-ASCII writes can
-    throw ``UnicodeEncodeError`` or render as garbage. This uses plain
-    ``#``/space ASCII (safe under any encoding), doubled both ways to
-    stay roughly square.
+    to stdout and can throw ``UnicodeEncodeError`` under systemd's
+    default (non-UTF-8) locale. This picks the most solid character the
+    log stream can actually encode (see ``_qr_fill_char``) instead.
     """
 
     def __init__(self, bridge_client: "PyMaxClient | None" = None):
@@ -46,14 +60,16 @@ class LogQrHandler:
         qr.add_data(qr_url)
         qr.make(fit=True)
 
+        fill = _qr_fill_char() * 2
+        empty = "  "
+
         log.warning("PyMax QR authorization URL: %s", qr_url)
         for row in qr.modules:
             # 2 chars wide, 1 line tall per module: a monospace glyph is
             # roughly twice as tall as it is wide, so this (not doubling
             # the line too) is what keeps modules square instead of
             # rendering as tall rectangles that break scanning.
-            line = "".join("##" if cell else "  " for cell in row)
-            log.warning(line)
+            log.warning("".join(fill if cell else empty for cell in row))
 
         if self._bridge_client is None:
             return
