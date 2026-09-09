@@ -88,7 +88,7 @@ class FakeRawClient:
 @pytest.fixture
 def adapter(monkeypatch):
     raw = FakeRawClient()
-    monkeypatch.setattr("app.pymax_client.build_pymax_client", lambda settings: raw)
+    monkeypatch.setattr("app.pymax_client.build_pymax_client", lambda settings, bridge_client=None: raw)
     settings = Settings(
         tg_bot_token="tg",
         tg_chat_id="-100",
@@ -139,7 +139,7 @@ async def test_run_fetches_configured_chats_missing_from_login_sync(monkeypatch)
         id=-123, type="CHAT", title="Configured group", participants={7: 0, 9: 0}
     )
     raw.get_chats = AsyncMock(return_value=[configured_chat])
-    monkeypatch.setattr("app.pymax_client.build_pymax_client", lambda settings: raw)
+    monkeypatch.setattr("app.pymax_client.build_pymax_client", lambda settings, bridge_client=None: raw)
     settings = Settings(
         tg_bot_token="tg",
         tg_chat_id="-100",
