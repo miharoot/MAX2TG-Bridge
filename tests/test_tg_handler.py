@@ -77,6 +77,7 @@ def _make_context(max_client=None, topic_store=None, allowed_user_id=None):
 class TestOnTopicMessage:
     async def test_routes_topic_text_to_max(self):
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock(return_value={"ok": True})
 
         update = _make_update("Hello", thread_id=10)
@@ -88,6 +89,7 @@ class TestOnTopicMessage:
 
     async def test_reacts_on_success(self):
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock(return_value={"ok": True})
 
         update = _make_update()
@@ -101,6 +103,7 @@ class TestOnTopicMessage:
         """A failed 👀 reaction (e.g. missing Telegram permission) must be
         visible at warning level, not silently swallowed at debug."""
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock(return_value={"ok": True})
 
         update = _make_update()
@@ -119,6 +122,7 @@ class TestOnTopicMessage:
 
     async def test_ignores_general_topic(self):
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock()
 
         update = _make_update(thread_id=None, is_topic_message=False)
@@ -130,6 +134,7 @@ class TestOnTopicMessage:
 
     async def test_ignores_unknown_topic(self):
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock()
 
         update = _make_update(thread_id=999)
@@ -141,6 +146,7 @@ class TestOnTopicMessage:
 
     async def test_ignores_empty_text(self):
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock()
 
         update = _make_update(text=None)
@@ -152,6 +158,7 @@ class TestOnTopicMessage:
 
     async def test_respects_allowed_user_id(self):
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock()
 
         update = _make_update(user_id=555)
@@ -164,6 +171,7 @@ class TestOnTopicMessage:
 
     async def test_allows_matching_user_id(self):
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock(return_value={"ok": True})
 
         update = _make_update(user_id=100)
@@ -185,6 +193,7 @@ class TestOnTopicMessage:
 
     async def test_warns_on_send_failure(self):
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock(return_value=None)
 
         update = _make_update()
@@ -197,6 +206,7 @@ class TestOnTopicMessage:
 
     async def test_warns_on_exception(self):
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock(side_effect=RuntimeError("boom"))
 
         update = _make_update()
@@ -209,12 +219,95 @@ class TestOnTopicMessage:
 
 
 # ---------------------------------------------------------------------------
+# Read-receipt TG → MAX: replying in a topic marks the MAX chat as read up
+# to the last message we saw from it. Telegram gives bots no signal for an
+# actual "message read" event, so a reply is the best available proxy.
+# ---------------------------------------------------------------------------
+
+class TestReadReceiptOnReply:
+    async def test_marks_chat_read_up_to_last_known_message_on_successful_reply(self):
+        max_client = MagicMock()
+        max_client.last_message_ids = {42: "max-msg-77"}
+        max_client.send_message = AsyncMock(return_value={"ok": True})
+        max_client.read_message = AsyncMock(return_value=True)
+
+        update = _make_update("Hello", thread_id=10)
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
+
+        await _on_topic_message(update, ctx)
+
+        max_client.read_message.assert_awaited_once_with(42, "max-msg-77")
+
+    async def test_does_not_mark_read_when_no_message_seen_yet(self):
+        """A chat we've never received anything from has nothing to mark
+        as read — must not call read_message with a bogus/None id."""
+        max_client = MagicMock()
+        max_client.last_message_ids = {}
+        max_client.send_message = AsyncMock(return_value={"ok": True})
+        max_client.read_message = AsyncMock()
+
+        update = _make_update("Hello", thread_id=10)
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
+
+        await _on_topic_message(update, ctx)
+
+        max_client.read_message.assert_not_awaited()
+
+    async def test_does_not_mark_read_when_send_failed(self):
+        """No point marking the chat read if our reply never actually
+        went through to MAX."""
+        max_client = MagicMock()
+        max_client.last_message_ids = {42: "max-msg-77"}
+        max_client.send_message = AsyncMock(return_value=None)
+        max_client.read_message = AsyncMock()
+
+        update = _make_update("Hello", thread_id=10)
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
+
+        await _on_topic_message(update, ctx)
+
+        max_client.read_message.assert_not_awaited()
+
+    async def test_does_not_mark_read_on_max_error(self):
+        max_client = MagicMock()
+        max_client.last_message_ids = {42: "max-msg-77"}
+        max_client.send_message = AsyncMock(
+            return_value={"_max_error": {"message": "rate limited"}}
+        )
+        max_client.read_message = AsyncMock()
+
+        update = _make_update("Hello", thread_id=10)
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
+
+        await _on_topic_message(update, ctx)
+
+        max_client.read_message.assert_not_awaited()
+
+    async def test_read_message_failure_does_not_break_the_reply_flow(self):
+        """If MAX rejects the read-mark call, the reply itself already
+        succeeded and shouldn't be reported as failed to the user."""
+        max_client = MagicMock()
+        max_client.last_message_ids = {42: "max-msg-77"}
+        max_client.send_message = AsyncMock(return_value={"ok": True})
+        max_client.read_message = AsyncMock(return_value=False)
+
+        update = _make_update("Hello", thread_id=10)
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
+
+        await _on_topic_message(update, ctx)
+
+        update.message.set_reaction.assert_called_once()
+        update.message.reply_text.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # build_tg_app
 # ---------------------------------------------------------------------------
 
 class TestBuildTgApp:
     def test_wires_bot_data(self):
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         topic_store = _make_topic_store()
 
         app = build_tg_app("123456:AAABBBCCC", max_client, "-100123456",
@@ -258,6 +351,7 @@ class TestMediaGrouping:
         uploader = AsyncMock(side_effect=["attach-1", "attach-2"])
         monkeypatch.setattr("app.tg_handler._upload_topic_attachment", uploader)
         max_client = MagicMock()
+        max_client.last_message_ids = {}
         max_client.send_message = AsyncMock(return_value={"ok": True})
 
         await _send_topic_media_messages(

@@ -48,6 +48,7 @@ class FakeRawClient:
             return_value=FakeModel(url="https://i.oneme.ru/video.mp4")
         )
         self.send_message = AsyncMock(return_value=FakeModel(id=123, chatId=20))
+        self.read_message = AsyncMock(return_value=FakeModel(chat_id=20))
 
     def on_start(self):
         def decorator(func):
@@ -275,6 +276,55 @@ async def test_send_message_delegates_to_pymax(adapter):
         notify=True,
     )
     assert resp["id"] == 123
+
+
+async def test_read_message_delegates_to_pymax(adapter):
+    client, raw = adapter
+
+    ok = await client.read_message(20, "77")
+
+    raw.read_message.assert_awaited_once_with("77", 20)
+    assert ok is True
+
+
+async def test_read_message_returns_false_on_failure(adapter):
+    client, raw = adapter
+    raw.read_message = AsyncMock(side_effect=RuntimeError("nope"))
+
+    ok = await client.read_message(20, "77")
+
+    assert ok is False
+
+
+async def test_message_handler_tracks_last_message_id_per_chat(adapter):
+    """Needed for TG→MAX read receipts: replying in a topic marks the MAX
+    chat read up to whatever we last saw from it."""
+    client, raw = adapter
+    pymax_message = FakeModel(
+        id=77, chat_id=20, sender=8, text="hi", time=100, attaches=[], link=None,
+    )
+
+    await raw.message_handlers[0](pymax_message, raw)
+
+    assert client.last_message_ids[20] == "77"
+
+
+async def test_message_handler_tracks_last_message_id_even_when_filtered_out(adapter):
+    """A chat outside MAX_CHAT_IDS/MAX_IGNORE_CHAT_IDS still updates the
+    tracked id — filtering only affects forwarding to Telegram, not the
+    read-receipt bookkeeping."""
+    client, raw = adapter
+    client.chat_ids = [999]  # only chat 999 gets forwarded
+    on_message = AsyncMock()
+    client.on_message(on_message)
+    pymax_message = FakeModel(
+        id=77, chat_id=20, sender=8, text="hi", time=100, attaches=[], link=None,
+    )
+
+    await raw.message_handlers[0](pymax_message, raw)
+
+    on_message.assert_not_awaited()
+    assert client.last_message_ids[20] == "77"
 
 
 async def test_cmd_supports_contacts_and_file_download(adapter):

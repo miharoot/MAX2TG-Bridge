@@ -255,6 +255,7 @@ class PyMaxClient:
         self._on_reaction_cb = None
         self._outbound_cids: OrderedDict[tuple[Any, str], float] = OrderedDict()
         self.resolver = None
+        self.last_message_ids: dict[Any, str] = {}
 
         self._wire_events()
 
@@ -347,6 +348,8 @@ class PyMaxClient:
             bridge_message = _message_from_pymax(message, self._my_id)
             if bridge_message is None:
                 return
+            if bridge_message.message_id:
+                self.last_message_ids[bridge_message.chat_id] = bridge_message.message_id
             if self.chat_ids and bridge_message.chat_id not in self.chat_ids:
                 return
             if self.ignore_chat_ids and bridge_message.chat_id in self.ignore_chat_ids:
@@ -445,6 +448,20 @@ class PyMaxClient:
         if sent_cid is not None:
             self._mark_outbound_cid(chat_id, sent_cid)
         return _model_dict(message) or {"ok": True}
+
+    async def read_message(self, chat_id, message_id) -> bool:
+        """Mark the MAX chat as read up to (and including) message_id —
+        triggers the same 'прочитано' state on the peer's side as opening
+        the chat manually in a real MAX client would."""
+        try:
+            await self._client.read_message(message_id, int(chat_id))
+        except Exception:
+            log.exception(
+                "PyMax read_message failed for chat_id=%s message_id=%s",
+                chat_id, message_id,
+            )
+            return False
+        return True
 
     async def upload_photo(
         self,

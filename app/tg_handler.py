@@ -171,8 +171,16 @@ def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return message, max_chat_id, max_client
 
 
-async def _surface_send_result(message, resp) -> None:
-    """Translate a Max send_message response into a Telegram reaction or warning."""
+async def _surface_send_result(message, resp, max_client=None, max_chat_id=None) -> None:
+    """Translate a Max send_message response into a Telegram reaction or
+    warning, and — on success — mark the MAX chat as read up to the last
+    message we saw from it.
+
+    Telegram's Bot API gives bots no way to know when a human actually
+    reads a message, so there's no true "read receipt" trigger available.
+    Replying in the topic is the best available signal that you've seen
+    the conversation, so that's what drives the MAX-side read marker.
+    """
     err = (resp or {}).get("_max_error")
     if err:
         desc = (err.get("localizedMessage") or err.get("message")
@@ -190,6 +198,16 @@ async def _surface_send_result(message, resp) -> None:
             "likely missing permission or an unsupported reaction for this chat",
             message.chat_id, message.message_id, exc_info=True,
         )
+
+    if max_client is not None and max_chat_id is not None:
+        last_id = max_client.last_message_ids.get(max_chat_id)
+        if last_id:
+            ok = await max_client.read_message(max_chat_id, last_id)
+            if ok:
+                log.info(
+                    "Marked MAX chat_id=%s as read up to message_id=%s (reply in topic)",
+                    max_chat_id, last_id,
+                )
 
 
 async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -214,7 +232,7 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text("⚠️ Ошибка при отправке в Max.")
         return
 
-    await _surface_send_result(message, resp)
+    await _surface_send_result(message, resp, max_client, max_chat_id)
 
 
 async def _download_tg_file(file_obj, max_bytes: int = DEFAULT_MAX_UPLOAD_BYTES) -> bytes | None:
@@ -339,7 +357,7 @@ async def _send_topic_media_messages(messages, max_chat_id, max_client, max_uplo
         await caption_message.reply_text("⚠️ Ошибка при отправке в Max.")
         return
 
-    await _surface_send_result(caption_message, resp)
+    await _surface_send_result(caption_message, resp, max_client, max_chat_id)
 
 
 async def _flush_media_group(key, context) -> None:
@@ -772,6 +790,11 @@ HELP_TEXT = (
     "соответствующий чат MAX. Поддерживается жирный/курсив/зачёркнутый/"
     "подчёркнутый текст, моноширинный код, цитаты и ссылки. Фото, "
     "документы, видео и голосовые сообщения тоже передаются напрямую.\n\n"
+    "Как только твой ответ из топика доставлен в MAX, чат там "
+    "отмечается прочитанным (статус «прочитано» для собеседника). "
+    "Учти: Telegram не сообщает боту, когда ты именно <i>прочитал</i> "
+    "сообщение (такого события у ботов нет) — отметка ставится по "
+    "факту ответа, а не по факту открытия топика.\n\n"
     "Если кто-то новый пишет тебе в MAX — топик создастся автоматически "
     "и в нём сразу появится карточка собеседника."
 )
