@@ -1,9 +1,13 @@
 import asyncio
 import logging
+import os
+from dataclasses import asdict
 from datetime import datetime
 from html import escape
 
+from app import outbox
 from app.config import Settings
+from app.outbox import Outbox
 from app.pymax_client import MaxMessage, MaxReactionEvent, MaxReadEvent, PyMaxClient
 from app.resolver import ContactResolver
 from app.tg_sender import TelegramSender
@@ -448,6 +452,12 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
     # Expose for tg_handler commands like /profile.
     client.resolver = resolver
 
+    # Shared by both directions (see app/outbox.py); tg_handler.py reaches
+    # it via max_client.outbox the same way it already reaches .resolver.
+    _settings = getattr(client, "settings", None)
+    state_dir = getattr(_settings, "state_dir", None) or "state"
+    client.outbox = Outbox(os.path.join(state_dir, "outbox.db"))
+
     _first_connect = True
     # Reconnect ("восстановлено") should only ever follow a disconnect
     # notice the user actually saw — otherwise pymax's internal
@@ -557,6 +567,26 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
 
     @client.on_message
     async def handle_message(msg: MaxMessage):
+        # An echo of a message the bridge itself just sent — drop it, or it
+        # would loop back into Telegram. Not an outbox-worthy event: it was
+        # never meant to be forwarded, so there's nothing to persist/retry.
+        if client.is_bridge_echo(msg):
+            return
+
+        item_id = await client.outbox.add(outbox.MAX_TO_TG, asdict(msg))
+        try:
+            await _deliver_max_message(msg)
+        except Exception as exc:
+            log.exception(
+                "Failed to forward MAX message chat=%s id=%s to Telegram; "
+                "kept in outbox (id=%s) for retry",
+                msg.chat_id, msg.message_id, item_id,
+            )
+            await client.outbox.mark_failed(item_id, str(exc))
+            return
+        await client.outbox.remove(item_id)
+
+    async def _deliver_max_message(msg: MaxMessage):
         log.info(
             "New message: chat=%s sender=%s is_self=%s text=%r attaches=%d",
             msg.chat_id,
@@ -566,13 +596,10 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             len(msg.attaches),
         )
 
-        # An echo of a message the bridge itself just sent — drop it, or it
-        # would loop back into Telegram. A message YOU typed manually on
-        # your own phone/other MAX client is also is_self=True but is NOT
-        # an echo — that one gets forwarded (see is_manual_self below), so
-        # your own outgoing messages stay visible in the Telegram topic too.
-        if client.is_bridge_echo(msg):
-            return
+        # A message YOU typed manually on your own phone/other MAX client is
+        # also is_self=True but is NOT a bridge echo — that one gets
+        # forwarded, so your own outgoing messages stay visible in the
+        # Telegram topic too.
         is_manual_self = msg.is_self
 
         raw_sender = await resolver.resolve_user(msg.sender_id)
@@ -682,5 +709,11 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
 
         if last_message is not None:
             _last_tg_message[msg.chat_id] = (target_chat_id, last_message.message_id)
+
+    # Exposed for the background retry loop (see app/outbox_retry.py) to
+    # re-attempt a MAX→TG message that failed and is still sitting in the
+    # outbox — same delivery path a live message goes through, just called
+    # again with the payload reloaded from the DB.
+    client.redeliver_max_message = _deliver_max_message
 
     return client

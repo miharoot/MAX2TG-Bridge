@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from app.pymax_client import MaxMessage, MaxReactionEvent, MaxReadEvent
 from app.max_listener import configure_pymax_client
+from app.outbox import Outbox
 
 
 class _FakePyMaxClient:
@@ -53,6 +54,7 @@ def _make_client(sender=None, my_id=None):
         sender = AsyncMock()
     client = _FakePyMaxClient(my_id=my_id)
     configure_pymax_client(client, sender)
+    client.outbox = Outbox(":memory:")  # don't touch real disk in tests
     return client, sender
 
 

@@ -14,6 +14,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 from app.max_listener import configure_pymax_client
+from app.outbox import Outbox
 
 
 class FakeClient:
@@ -50,7 +51,9 @@ class FakeClient:
 def _make_client(sender=None):
     if sender is None:
         sender = AsyncMock()
-    return configure_pymax_client(FakeClient(), sender), sender
+    client = configure_pymax_client(FakeClient(), sender)
+    client.outbox = Outbox(":memory:")  # don't touch real disk in tests
+    return client, sender
 
 
 EMPTY_SNAPSHOT = {"profile": {"id": 1, "names": []}, "chats": []}

@@ -67,7 +67,27 @@ def _make_context(max_client=None, topic_store=None, allowed_user_id=None):
     if topic_store is not None:
         bot_data[TOPIC_STORE_KEY] = topic_store
     ctx.bot_data = bot_data
+    ctx.bot = AsyncMock()
     return ctx
+
+
+def _make_max_client(last_message_ids=None, send_message_return=None,
+                     send_message_side_effect=None, read_message_return=True):
+    """A MagicMock max_client wired with an async .outbox (add/remove/
+    mark_failed) — every _on_topic_message/_send_topic_media_messages call
+    touches the outbox now, so every test needs one."""
+    max_client = MagicMock()
+    max_client.last_message_ids = last_message_ids if last_message_ids is not None else {}
+    if send_message_side_effect is not None:
+        max_client.send_message = AsyncMock(side_effect=send_message_side_effect)
+    else:
+        max_client.send_message = AsyncMock(return_value=send_message_return)
+    max_client.read_message = AsyncMock(return_value=read_message_return)
+    max_client.outbox = MagicMock()
+    max_client.outbox.add = AsyncMock(return_value=1)
+    max_client.outbox.remove = AsyncMock()
+    max_client.outbox.mark_failed = AsyncMock()
+    return max_client
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +96,7 @@ def _make_context(max_client=None, topic_store=None, allowed_user_id=None):
 
 class TestOnTopicMessage:
     async def test_routes_topic_text_to_max(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock(return_value={"ok": True})
+        max_client = _make_max_client(send_message_return={"ok": True})
 
         update = _make_update("Hello", thread_id=10)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
@@ -88,29 +106,39 @@ class TestOnTopicMessage:
         max_client.send_message.assert_called_once_with(42, "Hello", elements=[])
 
     async def test_reacts_on_success(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock(return_value={"ok": True})
+        max_client = _make_max_client(send_message_return={"ok": True})
 
         update = _make_update()
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
 
         await _on_topic_message(update, ctx)
 
-        update.message.set_reaction.assert_called_once()
+        ctx.bot.set_message_reaction.assert_called_once()
+
+    async def test_removes_outbox_item_on_success(self):
+        """The whole point of the outbox: a confirmed delivery must not
+        stay queued for retry."""
+        max_client = _make_max_client(send_message_return={"ok": True})
+
+        update = _make_update()
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
+
+        await _on_topic_message(update, ctx)
+
+        max_client.outbox.add.assert_awaited_once()
+        max_client.outbox.remove.assert_awaited_once_with(1)
+        max_client.outbox.mark_failed.assert_not_awaited()
 
     async def test_logs_warning_when_reaction_fails(self, caplog):
         """A failed 👀 reaction (e.g. missing Telegram permission) must be
         visible at warning level, not silently swallowed at debug."""
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock(return_value={"ok": True})
+        max_client = _make_max_client(send_message_return={"ok": True})
 
         update = _make_update()
-        update.message.set_reaction = AsyncMock(side_effect=RuntimeError("Forbidden"))
         update.message.chat_id = -100999
         update.message.message_id = 42
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
+        ctx.bot.set_message_reaction = AsyncMock(side_effect=RuntimeError("Forbidden"))
 
         with caplog.at_level("WARNING", logger="app.tg_handler"):
             await _on_topic_message(update, ctx)
@@ -121,9 +149,7 @@ class TestOnTopicMessage:
         )
 
     async def test_ignores_general_topic(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock()
+        max_client = _make_max_client()
 
         update = _make_update(thread_id=None, is_topic_message=False)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
@@ -133,9 +159,7 @@ class TestOnTopicMessage:
         max_client.send_message.assert_not_called()
 
     async def test_ignores_unknown_topic(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock()
+        max_client = _make_max_client()
 
         update = _make_update(thread_id=999)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
@@ -145,9 +169,7 @@ class TestOnTopicMessage:
         max_client.send_message.assert_not_called()
 
     async def test_ignores_empty_text(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock()
+        max_client = _make_max_client()
 
         update = _make_update(text=None)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
@@ -157,9 +179,7 @@ class TestOnTopicMessage:
         max_client.send_message.assert_not_called()
 
     async def test_respects_allowed_user_id(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock()
+        max_client = _make_max_client()
 
         update = _make_update(user_id=555)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store(),
@@ -170,9 +190,7 @@ class TestOnTopicMessage:
         max_client.send_message.assert_not_called()
 
     async def test_allows_matching_user_id(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock(return_value={"ok": True})
+        max_client = _make_max_client(send_message_return={"ok": True})
 
         update = _make_update(user_id=100)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store(),
@@ -192,9 +210,7 @@ class TestOnTopicMessage:
         assert "⚠️" in update.message.reply_text.call_args[0][0]
 
     async def test_warns_on_send_failure(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock(return_value=None)
+        max_client = _make_max_client(send_message_return=None)
 
         update = _make_update()
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
@@ -203,11 +219,22 @@ class TestOnTopicMessage:
 
         update.message.reply_text.assert_called_once()
         assert "⚠️" in update.message.reply_text.call_args[0][0]
+
+    async def test_keeps_outbox_item_on_send_failure(self):
+        """A failed/unconfirmed delivery must stay in the outbox for the
+        retry loop to pick up — not get silently dropped."""
+        max_client = _make_max_client(send_message_return=None)
+
+        update = _make_update()
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
+
+        await _on_topic_message(update, ctx)
+
+        max_client.outbox.remove.assert_not_awaited()
+        max_client.outbox.mark_failed.assert_awaited_once()
 
     async def test_warns_on_exception(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+        max_client = _make_max_client(send_message_side_effect=RuntimeError("boom"))
 
         update = _make_update()
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
@@ -216,6 +243,17 @@ class TestOnTopicMessage:
 
         update.message.reply_text.assert_called_once()
         assert "⚠️" in update.message.reply_text.call_args[0][0]
+
+    async def test_keeps_outbox_item_on_exception(self):
+        max_client = _make_max_client(send_message_side_effect=RuntimeError("boom"))
+
+        update = _make_update()
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
+
+        await _on_topic_message(update, ctx)
+
+        max_client.outbox.remove.assert_not_awaited()
+        max_client.outbox.mark_failed.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +264,9 @@ class TestOnTopicMessage:
 
 class TestReadReceiptOnReply:
     async def test_marks_chat_read_up_to_last_known_message_on_successful_reply(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {42: "max-msg-77"}
-        max_client.send_message = AsyncMock(return_value={"ok": True})
-        max_client.read_message = AsyncMock(return_value=True)
+        max_client = _make_max_client(
+            last_message_ids={42: "max-msg-77"}, send_message_return={"ok": True},
+        )
 
         update = _make_update("Hello", thread_id=10)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
@@ -241,10 +278,7 @@ class TestReadReceiptOnReply:
     async def test_does_not_mark_read_when_no_message_seen_yet(self):
         """A chat we've never received anything from has nothing to mark
         as read — must not call read_message with a bogus/None id."""
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock(return_value={"ok": True})
-        max_client.read_message = AsyncMock()
+        max_client = _make_max_client(last_message_ids={}, send_message_return={"ok": True})
 
         update = _make_update("Hello", thread_id=10)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
@@ -256,10 +290,9 @@ class TestReadReceiptOnReply:
     async def test_does_not_mark_read_when_send_failed(self):
         """No point marking the chat read if our reply never actually
         went through to MAX."""
-        max_client = MagicMock()
-        max_client.last_message_ids = {42: "max-msg-77"}
-        max_client.send_message = AsyncMock(return_value=None)
-        max_client.read_message = AsyncMock()
+        max_client = _make_max_client(
+            last_message_ids={42: "max-msg-77"}, send_message_return=None,
+        )
 
         update = _make_update("Hello", thread_id=10)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
@@ -269,12 +302,10 @@ class TestReadReceiptOnReply:
         max_client.read_message.assert_not_awaited()
 
     async def test_does_not_mark_read_on_max_error(self):
-        max_client = MagicMock()
-        max_client.last_message_ids = {42: "max-msg-77"}
-        max_client.send_message = AsyncMock(
-            return_value={"_max_error": {"message": "rate limited"}}
+        max_client = _make_max_client(
+            last_message_ids={42: "max-msg-77"},
+            send_message_return={"_max_error": {"message": "rate limited"}},
         )
-        max_client.read_message = AsyncMock()
 
         update = _make_update("Hello", thread_id=10)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
@@ -286,17 +317,17 @@ class TestReadReceiptOnReply:
     async def test_read_message_failure_does_not_break_the_reply_flow(self):
         """If MAX rejects the read-mark call, the reply itself already
         succeeded and shouldn't be reported as failed to the user."""
-        max_client = MagicMock()
-        max_client.last_message_ids = {42: "max-msg-77"}
-        max_client.send_message = AsyncMock(return_value={"ok": True})
-        max_client.read_message = AsyncMock(return_value=False)
+        max_client = _make_max_client(
+            last_message_ids={42: "max-msg-77"}, send_message_return={"ok": True},
+            read_message_return=False,
+        )
 
         update = _make_update("Hello", thread_id=10)
         ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
 
         await _on_topic_message(update, ctx)
 
-        update.message.set_reaction.assert_called_once()
+        ctx.bot.set_message_reaction.assert_called_once()
         update.message.reply_text.assert_not_called()
 
 
@@ -342,20 +373,21 @@ class TestMediaGrouping:
         first.caption = "Album caption"
         first.caption_entities = []
         first.reply_text = AsyncMock()
-        first.set_reaction = AsyncMock()
+        first.chat_id = -100999
+        first.message_thread_id = 10
+        first.message_id = 501
         second = MagicMock()
         second.caption = None
         second.caption_entities = []
         second.reply_text = AsyncMock()
-        second.set_reaction = AsyncMock()
+
         uploader = AsyncMock(side_effect=["attach-1", "attach-2"])
-        monkeypatch.setattr("app.tg_handler._upload_topic_attachment", uploader)
-        max_client = MagicMock()
-        max_client.last_message_ids = {}
-        max_client.send_message = AsyncMock(return_value={"ok": True})
+        monkeypatch.setattr("app.tg_handler._upload_media_by_spec", uploader)
+        max_client = _make_max_client(send_message_return={"ok": True})
+        bot = AsyncMock()
 
         await _send_topic_media_messages(
-            [first, second], 42, max_client, 1024
+            [first, second], 42, max_client, 1024, bot
         )
 
         max_client.send_message.assert_awaited_once_with(
@@ -364,7 +396,24 @@ class TestMediaGrouping:
             elements=[],
             attaches=["attach-1", "attach-2"],
         )
-        first.set_reaction.assert_awaited_once()
+        bot.set_message_reaction.assert_awaited_once()
+        max_client.outbox.remove.assert_awaited_once()
+
+    async def test_keeps_outbox_item_when_all_uploads_fail(self, monkeypatch):
+        first = MagicMock()
+        first.caption = "Caption"
+        first.caption_entities = []
+        first.reply_text = AsyncMock()
+
+        monkeypatch.setattr("app.tg_handler._upload_media_by_spec", AsyncMock(return_value=None))
+        max_client = _make_max_client()
+        bot = AsyncMock()
+
+        await _send_topic_media_messages([first], 42, max_client, 1024, bot)
+
+        max_client.send_message.assert_not_called()
+        max_client.outbox.remove.assert_not_awaited()
+        max_client.outbox.mark_failed.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
