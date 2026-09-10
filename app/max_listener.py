@@ -449,8 +449,12 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
     client.resolver = resolver
 
     _first_connect = True
-    _notif_count = 0
-    _last_notif_time: datetime | None = None
+    # Reconnect ("восстановлено") should only ever follow a disconnect
+    # notice the user actually saw — otherwise pymax's internal
+    # reconnects (or a throttled/suppressed disconnect) make "✅
+    # восстановлено" show up with no matching "⚠️ потеряно" before it.
+    _last_disconnect_notif_time: datetime | None = None
+    _disconnect_notice_pending = False
     # Tracks the most recent Telegram message we forwarded for each Max
     # chat: max_chat_id -> (tg_chat_id, tg_message_id). Used to mirror MAX
     # "read" events as a ✅ reaction on that message (see @client.on_read
@@ -458,19 +462,15 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
     # Telegram→MAX replies once MAX confirms delivery.
     _last_tg_message: dict[Any, tuple[str | int, int]] = {}
 
-    def _can_notify() -> bool:
-        if _last_notif_time is None:
+    def _can_notify_disconnect() -> bool:
+        if _last_disconnect_notif_time is None:
             return True
-        elapsed = (datetime.now() - _last_notif_time).total_seconds()
-        if _notif_count == 1:
-            return elapsed >= 3600    # 2-е: через 1 час
-        if _notif_count == 2:
-            return elapsed >= 10800   # 3-е: через 3 часа
-        return elapsed >= 86400       # 4-е и далее: раз в сутки
+        elapsed = (datetime.now() - _last_disconnect_notif_time).total_seconds()
+        return elapsed >= 3600  # не чаще раза в час
 
     @client.on_ready
     async def handle_ready(snapshot: dict):
-        nonlocal _first_connect
+        nonlocal _first_connect, _disconnect_notice_pending
         participant_ids = resolver.load_snapshot(snapshot)
 
         if participant_ids:
@@ -485,7 +485,9 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         # currently routing to (not just the default one) — otherwise
         # someone only watching a non-default group would never see them.
         if not _first_connect:
-            await sender.broadcast("✅ <b>Max:</b> соединение восстановлено")
+            if _disconnect_notice_pending:
+                await sender.broadcast("✅ <b>Max:</b> соединение восстановлено")
+                _disconnect_notice_pending = False
         else:
             chat_count = len(resolver.chats)
             await sender.broadcast(f"✅ <b>Max:</b> подключён | чатов: {chat_count}")
@@ -508,12 +510,12 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
 
     @client.on_disconnect
     async def handle_disconnect():
-        nonlocal _notif_count, _last_notif_time
-        if not _can_notify():
+        nonlocal _last_disconnect_notif_time, _disconnect_notice_pending
+        if not _can_notify_disconnect():
             log.info("Disconnect notification suppressed (throttle)")
             return
-        _notif_count += 1
-        _last_notif_time = datetime.now()
+        _last_disconnect_notif_time = datetime.now()
+        _disconnect_notice_pending = True
         await sender.broadcast("⚠️ <b>Max:</b> соединение потеряно, переподключение...")
 
     @client.on_read

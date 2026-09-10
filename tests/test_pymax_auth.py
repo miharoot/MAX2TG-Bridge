@@ -4,7 +4,7 @@ import types
 import pytest
 
 from app.config import Settings
-from app.pymax_auth import EnvPasswordProvider, LoggingQrHandler, build_pymax_client
+from app.pymax_auth import EnvPasswordProvider, LogQrHandler, build_pymax_client
 
 
 class FakeExtraConfig:
@@ -72,7 +72,7 @@ def test_builds_qr_web_client(monkeypatch):
     assert isinstance(client, FakeWebClient)
     assert client.kwargs["work_dir"] == "cache/max"
     assert client.kwargs["session_name"] == "web.db"
-    assert isinstance(client.kwargs["qr_provider"], LoggingQrHandler)
+    assert isinstance(client.kwargs["qr_provider"], LogQrHandler)
     assert client.kwargs["extra_config"].kwargs["log_level"] == "INFO"
 
 

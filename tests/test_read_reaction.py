@@ -40,6 +40,10 @@ class _FakePyMaxClient:
         self._on_reaction_cb = func
         return func
 
+    def on_qr(self, func):
+        self._on_qr_cb = func
+        return func
+
     def is_bridge_echo(self, msg: MaxMessage) -> bool:
         return False
 
