@@ -115,6 +115,25 @@ class TestReadEventForwarding:
 
         sender.set_reaction.assert_called_once_with("-100999", 99, "✅")
 
+    async def test_reacts_on_album_when_the_album_was_the_last_message(self):
+        """Regression test: forwarding a message whose attachments went
+        out as one Telegram media-group album must still update the
+        read-receipt tracking, same as a plain text message — otherwise
+        the ✅ lands on a stale, earlier message instead of the album."""
+        client, sender = _make_client(my_id=1)
+        sender.set_reaction = AsyncMock()
+        # An older plain-text message first, to prove the tracking really
+        # moved forward to the album and isn't just stuck on this one.
+        await _forward_simple_text(client, sender, chat_id=-100, tg_chat_id="-100999", tg_message_id=1)
+
+        await _forward_media_group(
+            client, sender, chat_id=-100, tg_chat_id="-100999", album_message_id=77,
+        )
+
+        await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
+
+        sender.set_reaction.assert_called_once_with("-100999", 77, "✅")
+
 
 class TestReactionEventForwarding:
     """A MAX message-reaction change becomes a short status line in the
@@ -178,4 +197,28 @@ async def _forward_simple_text(client, sender, chat_id, tg_chat_id, tg_message_i
     sender.bot = MagicMock()
 
     msg = MaxMessage(chat_id=chat_id, sender_id=2, text="hi", message_id="mid1")
+    await client._on_message_cb(msg)
+
+
+async def _forward_media_group(client, sender, chat_id, tg_chat_id, album_message_id):
+    """Forward a MAX message with 2+ PHOTO attaches, so it goes out as one
+    Telegram media-group album rather than individual sends."""
+    sent_album_message = MagicMock()
+    sent_album_message.message_id = album_message_id
+    sender.topic_store = MagicMock()
+    sender.topic_store.get_topic = MagicMock(return_value=5)
+    sender.ensure_topic = AsyncMock(return_value=5)
+    sender.resolve_chat_id = MagicMock(return_value=tg_chat_id)
+    sender.send = AsyncMock()
+    sender.send_media_group = AsyncMock(return_value=sent_album_message)
+    sender.bot = MagicMock()
+    client.download_file = AsyncMock(return_value=b"photo-bytes")
+
+    msg = MaxMessage(
+        chat_id=chat_id, sender_id=2, message_id="album-mid",
+        attaches=[
+            {"_type": "PHOTO", "baseUrl": "https://cdn/1.jpg"},
+            {"_type": "PHOTO", "baseUrl": "https://cdn/2.jpg"},
+        ],
+    )
     await client._on_message_cb(msg)

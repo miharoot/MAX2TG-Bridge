@@ -320,7 +320,8 @@ class TestAttachmentGrouping:
         client.download_video_url = AsyncMock(return_value="https://cdn/video.mp4")
         client.download_file = AsyncMock(side_effect=[b"photo", b"video"])
         sender = MagicMock()
-        sender.send_media_group = AsyncMock(return_value=True)
+        sent_message = MagicMock(message_id=555)
+        sender.send_media_group = AsyncMock(return_value=sent_message)
         msg = MaxMessage(chat_id=-10, message_id="77")
 
         grouped = await _try_send_media_group(
@@ -335,7 +336,9 @@ class TestAttachmentGrouping:
             msg,
         )
 
-        assert grouped is True
+        # Success returns the actual sent Message (for ✅ read-receipt
+        # tracking), not just a bool.
+        assert grouped is sent_message
         sender.send_media_group.assert_awaited_once_with(
             [
                 ("photo", b"photo", "photo-1.jpg"),
@@ -345,3 +348,55 @@ class TestAttachmentGrouping:
             message_thread_id=42,
             chat_id=None,
         )
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_telegram_send_fails(self):
+        """All downloads succeed, but Telegram itself rejects the album —
+        distinguishable from 'not attempted' (None) so the caller can send
+        a failure notice instead of silently falling back per-attachment."""
+        client = MagicMock()
+        client.download_video_url = AsyncMock(return_value="https://cdn/video.mp4")
+        client.download_file = AsyncMock(side_effect=[b"photo", b"video"])
+        sender = MagicMock()
+        sender.send_media_group = AsyncMock(return_value=None)
+        msg = MaxMessage(chat_id=-10, message_id="77")
+
+        grouped = await _try_send_media_group(
+            [
+                {"_type": "PHOTO", "baseUrl": "https://cdn/photo.jpg"},
+                {"_type": "VIDEO", "videoId": 123},
+            ],
+            client,
+            sender,
+            "header",
+            42,
+            msg,
+        )
+
+        assert grouped is False
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_a_download_fails(self):
+        """Not attempted at all — caller should fall back to sending each
+        attachment individually rather than showing a group failure."""
+        client = MagicMock()
+        client.download_video_url = AsyncMock(return_value=None)
+        client.download_file = AsyncMock(return_value=b"photo")
+        sender = MagicMock()
+        sender.send_media_group = AsyncMock()
+        msg = MaxMessage(chat_id=-10, message_id="77")
+
+        grouped = await _try_send_media_group(
+            [
+                {"_type": "PHOTO", "baseUrl": "https://cdn/photo.jpg"},
+                {"_type": "VIDEO", "videoId": 123},
+            ],
+            client,
+            sender,
+            "header",
+            42,
+            msg,
+        )
+
+        assert grouped is None
+        sender.send_media_group.assert_not_awaited()

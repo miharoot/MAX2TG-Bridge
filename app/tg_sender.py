@@ -321,11 +321,14 @@ class TelegramSender:
         caption: str = "",
         message_thread_id: int | None = None,
         chat_id: str | int | None = None,
-    ) -> bool:
-        """Send photos/videos or documents as Telegram albums, max 10 per group."""
+    ):
+        """Send photos/videos or documents as Telegram albums, max 10 per
+        group. Returns the last sent Message (so callers can track it for
+        read-receipt mirroring, same as plain text sends), or None if every
+        chunk failed to send."""
         caption = self._truncate_caption(caption)
         target = chat_id if chat_id is not None else self._default_chat_id
-        all_sent = True
+        last_message = None
         for offset in range(0, len(items), 10):
             chunk = items[offset:offset + 10]
 
@@ -352,5 +355,6 @@ class TelegramSender:
                     message_thread_id=message_thread_id,
                 )
             )
-            all_sent = all_sent and result is not None
-        return all_sent
+            if result:
+                last_message = result[-1]
+        return last_message

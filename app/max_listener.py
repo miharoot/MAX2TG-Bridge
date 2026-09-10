@@ -81,8 +81,17 @@ async def _try_send_media_group(
     thread_id: int | None,
     msg: MaxMessage,
     target_chat_id: str | int | None = None,
-) -> bool | None:
-    """Group compatible MAX attachments. None means fall back to single sends."""
+):
+    """Group compatible MAX attachments into one Telegram album.
+
+    Returns the sent Telegram ``Message`` on success (so callers can track
+    it the same way as any other forwarded message, for ✅ read-receipt
+    mirroring), ``False`` if we had everything downloaded but Telegram
+    itself failed to send the album, or ``None`` if grouping wasn't
+    attempted at all (fewer than 2 attaches, unsupported mix of types, or
+    a download failed) — callers fall back to sending attachments one by
+    one in that case.
+    """
     if len(attaches) < 2:
         return None
 
@@ -107,9 +116,10 @@ async def _try_send_media_group(
                 if not data:
                     return None
                 items.append(("video", data, f"{video_id}.mp4"))
-        return await sender.send_media_group(
+        sent = await sender.send_media_group(
             items, caption=caption, message_thread_id=thread_id, chat_id=target_chat_id
         )
+        return sent if sent is not None else False
 
     if types == {"FILE"}:
         items = []
@@ -124,9 +134,10 @@ async def _try_send_media_group(
             if not data:
                 return None
             items.append(("document", data, name))
-        return await sender.send_media_group(
+        sent = await sender.send_media_group(
             items, caption=caption, message_thread_id=thread_id, chat_id=target_chat_id
         )
+        return sent if sent is not None else False
 
     return None
 
@@ -359,14 +370,13 @@ async def _handle_linked_message(
         except Exception:
             log.exception("Failed to prepare linked attachment group")
             grouped = None
-        if grouped is True:
-            return
+        if grouped is not None and grouped is not False:
+            return grouped
         if grouped is False:
-            await sender.send(
+            return await sender.send(
                 f"{group_caption}\n<i>[группа вложений — не удалось загрузить]</i>",
                 message_thread_id=thread_id, chat_id=chat_id,
             )
-            return
 
         text_sent = False
         for i, attach in enumerate(fwd_meaningful):
@@ -668,14 +678,17 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             except Exception:
                 log.exception("Failed to prepare attachment group")
                 grouped = None
-            if grouped is True:
+            if grouped is not None and grouped is not False:
                 log.info("Forwarded %d attachments as media group", len(meaningful_attaches))
+                _last_tg_message[msg.chat_id] = (target_chat_id, grouped.message_id)
                 return
             if grouped is False:
-                await sender.send(
+                fail_msg = await sender.send(
                     f"{group_caption}\n<i>[группа вложений — не удалось загрузить]</i>",
                     message_thread_id=thread_id, chat_id=target_chat_id,
                 )
+                if fail_msg is not None:
+                    _last_tg_message[msg.chat_id] = (target_chat_id, fail_msg.message_id)
                 return
 
             text_sent = False
