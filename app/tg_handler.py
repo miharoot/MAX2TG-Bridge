@@ -496,6 +496,62 @@ async def _flush_media_group(key, context) -> None:
     )
 
 
+async def redeliver_tg_to_max_text(max_client, bot, payload: dict) -> bool:
+    """Retry entry point for a TG_TO_MAX_TEXT outbox row — called by the
+    background retry loop (app/outbox_retry.py), with no live Update
+    around. Same delivery + result-surfacing as _on_topic_message, just
+    fed from the stored payload instead of a fresh Message, and reporting
+    back into the topic instead of replying to a (long gone) message."""
+    max_chat_id = payload["max_chat_id"]
+    tg_chat_id = payload["tg_chat_id"]
+    thread_id = payload.get("thread_id")
+    tg_message_id = payload.get("tg_message_id")
+    text = payload["text"]
+    elements = payload.get("elements") or []
+
+    async def notify(text_: str) -> None:
+        try:
+            await bot.send_message(chat_id=tg_chat_id, message_thread_id=thread_id, text=text_)
+        except Exception:
+            log.exception("Outbox retry: failed to post status into chat %s", tg_chat_id)
+
+    try:
+        resp = await max_client.send_message(max_chat_id, text, elements=elements)
+    except Exception:
+        log.exception("Outbox retry: failed to send TG→MAX text to chat %s", max_chat_id)
+        return False
+
+    return await _surface_send_result(
+        resp, bot=bot, tg_chat_id=tg_chat_id, tg_message_id=tg_message_id,
+        notify=notify, max_client=max_client, max_chat_id=max_chat_id,
+    )
+
+
+async def redeliver_tg_to_max_media(max_client, bot, payload: dict, max_upload_bytes: int) -> bool:
+    """Retry entry point for a TG_TO_MAX_MEDIA outbox row — see
+    redeliver_tg_to_max_text. Re-downloads each attachment by its stored
+    Telegram file_id (file_ids stay valid indefinitely) and re-uploads to
+    MAX via the same _deliver_tg_media the live path uses."""
+    max_chat_id = payload["max_chat_id"]
+    tg_chat_id = payload["tg_chat_id"]
+    thread_id = payload.get("thread_id")
+    tg_message_id = payload.get("tg_message_id")
+    caption = payload.get("caption") or ""
+    elements = payload.get("elements") or []
+    specs = payload.get("media_specs") or []
+
+    async def notify(text_: str) -> None:
+        try:
+            await bot.send_message(chat_id=tg_chat_id, message_thread_id=thread_id, text=text_)
+        except Exception:
+            log.exception("Outbox retry: failed to post status into chat %s", tg_chat_id)
+
+    return await _deliver_tg_media(
+        bot, max_client, max_chat_id, max_upload_bytes, caption, elements, specs,
+        notify=notify, tg_chat_id=tg_chat_id, tg_message_id=tg_message_id,
+    )
+
+
 async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route a single medium or a complete Telegram album to one MAX message."""
     target = _resolve_topic_target(update, context)
