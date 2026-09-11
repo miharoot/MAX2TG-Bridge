@@ -234,9 +234,9 @@ class TelegramSender:
 
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
                          message_thread_id: int | None = None,
-                         chat_id: str | int | None = None) -> bool:
+                         chat_id: str | int | None = None):
         caption = self._truncate_caption(caption)
-        result = await self._retry(
+        return await self._retry(
             lambda: self._bot.send_photo(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 photo=InputFile(io.BytesIO(data), filename=filename),
@@ -245,13 +245,12 @@ class TelegramSender:
                 message_thread_id=message_thread_id,
             )
         )
-        return result is not None
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
                             message_thread_id: int | None = None,
-                            chat_id: str | int | None = None) -> bool:
+                            chat_id: str | int | None = None):
         caption = self._truncate_caption(caption)
-        result = await self._retry(
+        return await self._retry(
             lambda: self._bot.send_document(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 document=InputFile(io.BytesIO(data), filename=filename),
@@ -260,13 +259,12 @@ class TelegramSender:
                 message_thread_id=message_thread_id,
             )
         )
-        return result is not None
 
     async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4",
                          message_thread_id: int | None = None,
-                         chat_id: str | int | None = None) -> bool:
+                         chat_id: str | int | None = None):
         caption = self._truncate_caption(caption)
-        result = await self._retry(
+        return await self._retry(
             lambda: self._bot.send_video(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 video=InputFile(io.BytesIO(data), filename=filename),
@@ -275,11 +273,10 @@ class TelegramSender:
                 message_thread_id=message_thread_id,
             )
         )
-        return result is not None
 
     async def send_voice(self, data: bytes, caption: str = "",
                          message_thread_id: int | None = None,
-                         chat_id: str | int | None = None) -> bool:
+                         chat_id: str | int | None = None):
         caption = self._truncate_caption(caption)
         target = chat_id if chat_id is not None else self._default_chat_id
         result = await self._retry(
@@ -302,18 +299,17 @@ class TelegramSender:
                     message_thread_id=message_thread_id,
                 )
             )
-        return result is not None
+        return result
 
     async def send_sticker(self, data: bytes, message_thread_id: int | None = None,
-                           chat_id: str | int | None = None) -> bool:
-        result = await self._retry(
+                           chat_id: str | int | None = None):
+        return await self._retry(
             lambda: self._bot.send_sticker(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 sticker=InputFile(io.BytesIO(data), filename="sticker.webp"),
                 message_thread_id=message_thread_id,
             )
         )
-        return result is not None
 
     async def send_media_group(
         self,

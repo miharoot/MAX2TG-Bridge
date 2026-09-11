@@ -134,6 +134,30 @@ class TestReadEventForwarding:
 
         sender.set_reaction.assert_called_once_with("-100999", 77, "✅")
 
+    async def test_reacts_on_single_attachment_not_grouped_into_an_album(self):
+        """A single (non-groupable) attachment goes through the
+        per-attachment fallback path, not _try_send_media_group — must
+        still update the read-receipt tracking."""
+        client, sender = _make_client(my_id=1)
+        sender.set_reaction = AsyncMock()
+        await _forward_simple_text(client, sender, chat_id=-100, tg_chat_id="-100999", tg_message_id=1)
+
+        sent_file_message = MagicMock()
+        sent_file_message.message_id = 88
+        sender.send_document = AsyncMock(return_value=sent_file_message)
+        client.download_file = AsyncMock(return_value=b"file-bytes")
+        client.resolve_file_url = AsyncMock(return_value="https://cdn/file.bin")
+
+        msg = MaxMessage(
+            chat_id=-100, sender_id=2, message_id="file-mid",
+            attaches=[{"_type": "FILE", "name": "report.pdf", "fileId": 1}],
+        )
+        await client._on_message_cb(msg)
+
+        await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
+
+        sender.set_reaction.assert_called_once_with("-100999", 88, "✅")
+
 
 class TestReactionEventForwarding:
     """A MAX message-reaction change becomes a short status line in the

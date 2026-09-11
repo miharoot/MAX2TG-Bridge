@@ -191,9 +191,10 @@ async def _send_attach(
         if url:
             data = await client.download_file(url)
             if data:
-                if await sender.send_voice(data, caption=header_text,
-                                            message_thread_id=thread_id, chat_id=chat_id):
-                    return None
+                sent = await sender.send_voice(data, caption=header_text,
+                                                message_thread_id=thread_id, chat_id=chat_id)
+                if sent:
+                    return sent
         dur_s = f" ({duration // 1000}с)" if duration else ""
         return await sender.send(
             f"{header_text}\n🎙 <i>[голосовое сообщение{dur_s} — не удалось скачать]</i>",
@@ -210,8 +211,9 @@ async def _send_attach(
             )
         data = await client.download_file(url)
         if data:
-            if await sender.send_photo(data, caption=header_text, message_thread_id=thread_id, chat_id=chat_id):
-                return None
+            sent = await sender.send_photo(data, caption=header_text, message_thread_id=thread_id, chat_id=chat_id)
+            if sent:
+                return sent
         return await sender.send(f"{header_text}\n<i>[фото — не удалось загрузить]</i>", message_thread_id=thread_id, chat_id=chat_id)
 
     if atype == "VIDEO":
@@ -231,17 +233,19 @@ async def _send_attach(
         if video_url:
             data = await client.download_file(video_url)
             if data:
-                if await sender.send_video(data, caption=header_text, filename=f"{video_id}.mp4",
-                                            message_thread_id=thread_id, chat_id=chat_id):
-                    return None
+                sent = await sender.send_video(data, caption=header_text, filename=f"{video_id}.mp4",
+                                                message_thread_id=thread_id, chat_id=chat_id)
+                if sent:
+                    return sent
 
         thumb = attach.get("thumbnail")
         if thumb:
             data = await client.download_file(thumb)
             if data:
-                if await sender.send_photo(data, caption=f"{header_text}\n<i>[видео — превью, не удалось скачать полностью]</i>",
-                                            message_thread_id=thread_id, chat_id=chat_id):
-                    return None
+                sent = await sender.send_photo(data, caption=f"{header_text}\n<i>[видео — превью, не удалось скачать полностью]</i>",
+                                                message_thread_id=thread_id, chat_id=chat_id)
+                if sent:
+                    return sent
         return await sender.send(f"{header_text}\n<i>[видео — не удалось загрузить]</i>", message_thread_id=thread_id, chat_id=chat_id)
 
     if atype == "FILE":
@@ -260,7 +264,7 @@ async def _send_attach(
                 else:
                     sent = await sender.send_document(data, caption=header_text, filename=name, message_thread_id=thread_id, chat_id=chat_id)
                 if sent:
-                    return None
+                    return sent
         log.warning("FILE content unavailable; sending metadata only: fileId=%s name=%r", file_id, name)
         size_str = f" ({_human_size(size)})" if size else ""
         return await sender.send(
@@ -274,8 +278,9 @@ async def _send_attach(
         if url:
             data = await client.download_file(url)
             if data:
-                if await sender.send_voice(data, caption=header_text, message_thread_id=thread_id, chat_id=chat_id):
-                    return None
+                sent = await sender.send_voice(data, caption=header_text, message_thread_id=thread_id, chat_id=chat_id)
+                if sent:
+                    return sent
         return await sender.send(f"{header_text}\n{_attachment_failure(attach)}", message_thread_id=thread_id, chat_id=chat_id)
 
     if atype == "STICKER":
@@ -283,8 +288,9 @@ async def _send_attach(
         if url:
             data = await client.download_file(url)
             if data:
-                if await sender.send_sticker(data, message_thread_id=thread_id, chat_id=chat_id):
-                    return None
+                sent = await sender.send_sticker(data, message_thread_id=thread_id, chat_id=chat_id)
+                if sent:
+                    return sent
         return await sender.send(f"{header_text}\n{_attachment_failure(attach)}", message_thread_id=thread_id, chat_id=chat_id)
 
     if atype == "SHARE":

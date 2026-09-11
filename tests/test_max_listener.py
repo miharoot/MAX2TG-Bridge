@@ -230,7 +230,8 @@ class TestFileAttachment:
         client.resolve_file_url = AsyncMock(return_value="https://i.oneme.ru/file.bin")
         client.download_file = AsyncMock(return_value=b"file contents")
         sender = MagicMock()
-        sender.send_document = AsyncMock(return_value=True)
+        sent_message = MagicMock(message_id=999)
+        sender.send_document = AsyncMock(return_value=sent_message)
         sender.send = AsyncMock()
         msg = MaxMessage(chat_id=-78273486848085, message_id="message-1")
 
@@ -243,7 +244,9 @@ class TestFileAttachment:
             msg=msg,
         )
 
-        assert result is None  # success — no fallback text message sent
+        # Success returns the actual sent Message (for ✅ read-receipt
+        # tracking), not just a truthy bool.
+        assert result is sent_message
         client.resolve_file_url.assert_awaited_once_with(
             -78273486848085, "message-1", 12345
         )
@@ -264,7 +267,8 @@ class TestFileAttachment:
         client.download_file = AsyncMock(return_value=b"preview bytes")
         sender = MagicMock()
         sender.send_video = AsyncMock()
-        sender.send_photo = AsyncMock(return_value=True)
+        sent_message = MagicMock(message_id=999)
+        sender.send_photo = AsyncMock(return_value=sent_message)
         sender.send = AsyncMock()
         msg = MaxMessage(chat_id=-78273486848085, message_id="message-1")
 
@@ -277,7 +281,7 @@ class TestFileAttachment:
             msg=msg,
         )
 
-        assert result is None
+        assert result is sent_message
         sender.send_video.assert_not_awaited()
         sender.send_photo.assert_awaited_once_with(
             b"preview bytes",
