@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.config import Settings
-from app.pymax_client import PyMaxClient, _message_from_pymax
+from app.pymax_client import PyMaxClient, _message_from_pymax, _patch_api_error_not_ready_matching
+from pymax.exceptions import ApiError
 
 
 class FakeModel:
@@ -381,3 +382,78 @@ async def test_upload_wrappers_return_pymax_files(monkeypatch, adapter):
         "name": "voice.ogg",
         "duration": 4200,
     }
+
+
+# ---------------------------------------------------------------------------
+# ApiError "not.ready" matching workaround
+#
+# Regression coverage for a real bug hit in production: sending a voice
+# message failed with "⚠️ MAX: Key: errors.process.attachment.video.not.ready
+# [errors.process.attachment.video.not.ready]" — pymax's own built-in
+# wait-and-resend retry for this exact situation never fired, because it
+# only matches the exact literal "attachment.not.ready", not the more
+# specific code the server actually sends.
+# ---------------------------------------------------------------------------
+
+class TestApiErrorNotReadyPatch:
+    def test_video_not_ready_code_matches_after_patch(self):
+        _patch_api_error_not_ready_matching()
+        exc = ApiError(
+            opcode=64,
+            error="errors.process.attachment.video.not.ready",
+            message="Key: errors.process.attachment.video.not.ready",
+        )
+        assert exc.error == "attachment.not.ready"
+
+    def test_photo_not_ready_code_also_matches(self):
+        """Not specific to video/voice — any '....not.ready' suffix."""
+        _patch_api_error_not_ready_matching()
+        exc = ApiError(opcode=64, error="errors.process.attachment.photo.not.ready")
+        assert exc.error == "attachment.not.ready"
+
+    def test_exact_original_code_still_matches(self):
+        _patch_api_error_not_ready_matching()
+        exc = ApiError(opcode=64, error="attachment.not.ready")
+        assert exc.error == "attachment.not.ready"
+
+    def test_unrelated_error_codes_do_not_match(self):
+        _patch_api_error_not_ready_matching()
+        exc = ApiError(opcode=64, error="some.other.error")
+        assert exc.error != "attachment.not.ready"
+        assert not (exc.error == "attachment.not.ready")
+
+    def test_none_error_is_left_alone(self):
+        _patch_api_error_not_ready_matching()
+        exc = ApiError(opcode=64, error=None, message="generic failure")
+        assert exc.error is None
+
+    def test_exception_message_is_unaffected(self):
+        """The patch only changes equality comparisons on .error — the
+        human-readable exception text (what ends up in the ⚠️ Telegram
+        warning) must stay exactly what the server sent."""
+        _patch_api_error_not_ready_matching()
+        exc = ApiError(
+            opcode=64,
+            error="errors.process.attachment.video.not.ready",
+            message="Key: errors.process.attachment.video.not.ready",
+        )
+        assert str(exc) == (
+            "Key: errors.process.attachment.video.not.ready "
+            "[errors.process.attachment.video.not.ready]"
+        )
+
+    def test_patching_twice_is_a_no_op(self):
+        """PyMaxClient.__init__ calls this on every instantiation —
+        must not double-wrap or break on repeated calls."""
+        _patch_api_error_not_ready_matching()
+        _patch_api_error_not_ready_matching()
+        exc = ApiError(opcode=64, error="errors.process.attachment.video.not.ready")
+        assert exc.error == "attachment.not.ready"
+        assert str(exc.error) == "errors.process.attachment.video.not.ready"
+
+    def test_creating_a_pymax_client_applies_the_patch(self, adapter):
+        """End-to-end: instantiating PyMaxClient (via the adapter fixture)
+        must have already applied the patch, without the test calling
+        _patch_api_error_not_ready_matching() itself."""
+        exc = ApiError(opcode=64, error="errors.process.attachment.video.not.ready")
+        assert exc.error == "attachment.not.ready"

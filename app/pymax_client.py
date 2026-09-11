@@ -14,8 +14,68 @@ from yarl import URL
 
 from app.config import Settings
 from app.pymax_auth import build_pymax_client
+from pymax.exceptions import ApiError
 
 log = logging.getLogger(__name__)
+
+_PATCHED_API_ERROR = False
+
+
+class _LenientNotReadyCode(str):
+    """A string that also compares equal to the exact literal
+    ``"attachment.not.ready"``, as long as it itself ends in
+    ``".not.ready"``.
+
+    Works around a maxapi-python bug (present through at least 2.4.1, the
+    latest release on PyPI as of writing): right after uploading a voice
+    or video attachment, MAX's server can still be processing it and
+    rejects an immediate send with an ``attachment ... not.ready`` error.
+    pymax already has the *correct* handling for this — wait for the
+    server's "processing finished" signal for that same upload, then
+    resend without re-uploading (see ``MessagesService._process_attachment_error``
+    / ``send_message`` in ``pymax/api/messages/service.py``) — but it only
+    triggers on an *exact* match against the old short error code
+    ``"attachment.not.ready"``. The server now sends more specific codes
+    (observed: ``errors.process.attachment.video.not.ready``, used for
+    voice messages too, since pymax uploads them through the video
+    pipeline) that never match, so that correct retry path silently never
+    fires and the send just fails outright.
+
+    Patching ``ApiError.__init__`` to wrap ``error`` in this class lets
+    pymax's own comparison (``e.error == "attachment.not.ready"``) start
+    matching the new codes too, so its existing wait-and-resend logic
+    takes over exactly as designed — we don't reimplement or duplicate
+    any of it.
+    """
+
+    def __eq__(self, other):
+        if other == "attachment.not.ready":
+            return self.endswith(".not.ready")
+        return str.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return str.__hash__(self)
+
+
+def _patch_api_error_not_ready_matching() -> None:
+    """Idempotent — safe to call multiple times (e.g. once per PyMaxClient
+    instance); only patches ApiError.__init__ the first time."""
+    global _PATCHED_API_ERROR
+    if _PATCHED_API_ERROR:
+        return
+    original_init = ApiError.__init__
+
+    def patched_init(self, *, error=None, **kwargs):
+        if error is not None and not isinstance(error, _LenientNotReadyCode):
+            error = _LenientNotReadyCode(error)
+        original_init(self, error=error, **kwargs)
+
+    ApiError.__init__ = patched_init
+    _PATCHED_API_ERROR = True
+    log.debug("Patched pymax ApiError for attachment-not-ready code matching")
 
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
 _BROWSER_HEADERS = {"User-Agent": _USER_AGENT, "Accept-Encoding": "gzip, deflate"}
@@ -233,6 +293,7 @@ class PyMaxClient:
     MAX_CHAT_LIST_PAGES = 50   # safety cap on fetch_chats pagination at startup
 
     def __init__(self, settings: Settings):
+        _patch_api_error_not_ready_matching()
         self.settings = settings
         self.max_download_bytes = settings.max_download_mb * 1024 * 1024
         self.chat_ids: list[int] = []

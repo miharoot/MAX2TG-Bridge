@@ -48,6 +48,7 @@ Read-события (`on_message_read`) и реакции (`on_reaction_update`)
 - Phone/about могут отсутствовать в ответах MAX.
 - PyMax использует неофициальный внутренний API MAX и может ломаться при изменениях протокола.
 - Реакции MAX → TG не привязаны к конкретному сообщению (нет карты MAX message_id ↔ TG message_id) — идут отдельной строкой в топике.
+- `app/pymax_client.py` при создании клиента патчит `pymax.exceptions.ApiError.__init__` (`_patch_api_error_not_ready_matching`) — обходит баг библиотеки, из-за которого встроенный retry на `attachment.not.ready` не срабатывал для реальных кодов вида `errors.process.attachment.video.not.ready` (ловилось на отправке голосовых). Если апстрим это починит — патч безвреден (никогда не изменит поведение для уже совпадающих кодов), можно оставить или убрать.
 
 ## Git
 

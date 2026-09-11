@@ -9,8 +9,10 @@ from app.tg_handler import (
     MAX_CLIENT_KEY,
     TOPIC_STORE_KEY,
     _download_tg_file,
+    _media_spec_from_message,
     _on_topic_message,
     _send_topic_media_messages,
+    _upload_media_by_spec,
     build_tg_app,
 )
 
@@ -414,6 +416,116 @@ class TestMediaGrouping:
         max_client.send_message.assert_not_called()
         max_client.outbox.remove.assert_not_awaited()
         max_client.outbox.mark_failed.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Voice messages TG → MAX — end to end, without monkeypatching
+# _upload_media_by_spec (unlike the album tests above), to actually
+# exercise _media_spec_from_message + _upload_media_by_spec + the real
+# PyMaxClient.upload_audio wiring together.
+# ---------------------------------------------------------------------------
+
+class TestVoiceMessageUpload:
+    def test_media_spec_extracts_duration_in_milliseconds(self):
+        message = MagicMock()
+        message.photo = None
+        message.voice = MagicMock(duration=5, file_id="voice123")
+        message.audio = None
+        message.document = None
+        message.video = None
+
+        spec = _media_spec_from_message(message)
+
+        assert spec == {"kind": "voice", "file_id": "voice123", "duration_ms": 5000}
+
+    def test_media_spec_handles_timedelta_duration(self):
+        """Some PTB configurations report Voice.duration as a
+        datetime.timedelta instead of a plain int of seconds."""
+        from datetime import timedelta
+        message = MagicMock()
+        message.photo = None
+        message.voice = MagicMock(duration=timedelta(seconds=5), file_id="voice123")
+        message.audio = None
+        message.document = None
+        message.video = None
+
+        spec = _media_spec_from_message(message)
+
+        assert spec == {"kind": "voice", "file_id": "voice123", "duration_ms": 5000}
+
+    def test_media_spec_handles_missing_duration(self):
+        message = MagicMock()
+        message.photo = None
+        message.voice = MagicMock(duration=None, file_id="voice123")
+        message.audio = None
+        message.document = None
+        message.video = None
+
+        spec = _media_spec_from_message(message)
+
+        assert spec == {"kind": "voice", "file_id": "voice123", "duration_ms": None}
+
+    async def test_upload_media_by_spec_downloads_and_calls_upload_audio(self):
+        spec = {"kind": "voice", "file_id": "voice123", "duration_ms": 5000}
+
+        tg_file = MagicMock()
+        tg_file.file_size = 1000
+        tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"ogg-bytes"))
+        bot = AsyncMock()
+        bot.get_file = AsyncMock(return_value=tg_file)
+
+        max_client = MagicMock()
+        sent_voice_attach = MagicMock()
+        max_client.upload_audio = AsyncMock(return_value=sent_voice_attach)
+
+        attach = await _upload_media_by_spec(bot, spec, max_client, 42, 10 * 1024 * 1024)
+
+        bot.get_file.assert_awaited_once_with("voice123")
+        max_client.upload_audio.assert_awaited_once_with(
+            b"ogg-bytes", chat_id=42, filename="voice.ogg",
+            mimetype="audio/ogg", duration=5000,
+        )
+        assert attach is sent_voice_attach
+
+    async def test_full_voice_message_reaches_max_send_message(self):
+        """End-to-end: a Telegram voice message, through the real (not
+        monkeypatched) _media_spec_from_message + _upload_media_by_spec,
+        should end up as one attachment in max_client.send_message —
+        this is the exact path a real voice-note reply exercises."""
+        message = MagicMock()
+        message.photo = None
+        message.voice = MagicMock(duration=5, file_id="voice123")
+        message.audio = None
+        message.document = None
+        message.video = None
+        message.caption = None
+        message.caption_entities = []
+        message.reply_text = AsyncMock()
+        message.chat_id = -100999
+        message.message_thread_id = 10
+        message.message_id = 501
+
+        tg_file = MagicMock()
+        tg_file.file_size = 1000
+        tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"ogg-bytes"))
+        bot = AsyncMock()
+        bot.get_file = AsyncMock(return_value=tg_file)
+
+        sent_voice_attach = MagicMock()
+        max_client = _make_max_client(send_message_return={"ok": True})
+        max_client.upload_audio = AsyncMock(return_value=sent_voice_attach)
+
+        await _send_topic_media_messages([message], 42, max_client, 10 * 1024 * 1024, bot)
+
+        max_client.upload_audio.assert_awaited_once_with(
+            b"ogg-bytes", chat_id=42, filename="voice.ogg",
+            mimetype="audio/ogg", duration=5000,
+        )
+        max_client.send_message.assert_awaited_once_with(
+            42, text="", elements=[], attaches=[sent_voice_attach],
+        )
+        max_client.outbox.remove.assert_awaited_once()
+        message.reply_text.assert_not_called()  # no "не удалось" warning
 
 
 # ---------------------------------------------------------------------------
