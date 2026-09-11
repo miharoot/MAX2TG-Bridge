@@ -284,8 +284,26 @@ async def test_read_message_delegates_to_pymax(adapter):
 
     ok = await client.read_message(20, "77")
 
-    raw.read_message.assert_awaited_once_with("77", 20)
+    # message_id MUST reach pymax as an int, not the str our MaxMessage
+    # stores it as — pymax's ReadMessagesPayload accepts str | int, but a
+    # str value serializes as a JSON string and MAX's server rejects that
+    # with a validation error ("Expected number at ..."), which pymax
+    # treats as fatal and tears down the whole websocket connection.
+    raw.read_message.assert_awaited_once_with(77, 20)
     assert ok is True
+
+
+async def test_read_message_converts_string_message_id_to_int(adapter):
+    """Regression test for a real production bug: a numeric-looking str
+    message_id (what MaxMessage.message_id actually is) must not reach
+    pymax as a str."""
+    client, raw = adapter
+
+    await client.read_message(418124176, "117250688214045881")
+
+    args, kwargs = raw.read_message.call_args
+    assert args[0] == 117250688214045881
+    assert isinstance(args[0], int)
 
 
 async def test_read_message_returns_false_on_failure(adapter):
@@ -394,6 +412,41 @@ async def test_upload_wrappers_return_pymax_files(monkeypatch, adapter):
 # only matches the exact literal "attachment.not.ready", not the more
 # specific code the server actually sends.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# read_message message_id type — regression test against the real pymax
+# payload model, not just our own mock boundary
+# ---------------------------------------------------------------------------
+
+class TestReadMessagePayloadSerialization:
+    def test_str_message_id_serializes_as_json_string_not_number(self):
+        """Documents exactly why the int() conversion in
+        PyMaxClient.read_message is required: pymax's own
+        ReadMessagesPayload accepts a str for message_id (its type hint
+        is ``str | int``) and happily keeps it as a str — which then
+        serializes as a JSON string. MAX's server expects a JSON number
+        there and rejects a string with a validation error."""
+        from pymax.api.messages.enums import ReadAction
+        from pymax.api.messages.payloads import ReadMessagesPayload
+
+        payload = ReadMessagesPayload(
+            type=ReadAction.READ_MESSAGE, chat_id=418124176,
+            message_id="117250688214045881", mark=1234567890,
+        )
+        assert payload.to_payload()["messageId"] == "117250688214045881"
+        assert isinstance(payload.to_payload()["messageId"], str)
+
+    def test_int_message_id_serializes_as_json_number(self):
+        from pymax.api.messages.enums import ReadAction
+        from pymax.api.messages.payloads import ReadMessagesPayload
+
+        payload = ReadMessagesPayload(
+            type=ReadAction.READ_MESSAGE, chat_id=418124176,
+            message_id=117250688214045881, mark=1234567890,
+        )
+        assert payload.to_payload()["messageId"] == 117250688214045881
+        assert isinstance(payload.to_payload()["messageId"], int)
+
 
 class TestApiErrorNotReadyPatch:
     def test_video_not_ready_code_matches_after_patch(self):

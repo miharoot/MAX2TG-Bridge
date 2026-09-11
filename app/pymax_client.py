@@ -513,9 +513,21 @@ class PyMaxClient:
     async def read_message(self, chat_id, message_id) -> bool:
         """Mark the MAX chat as read up to (and including) message_id —
         triggers the same 'прочитано' state on the peer's side as opening
-        the chat manually in a real MAX client would."""
+        the chat manually in a real MAX client would.
+
+        message_id MUST be passed to pymax as an int, not a str. Our
+        MaxMessage.message_id is a str (see _message_from_pymax), and
+        pymax's ReadMessagesPayload.message_id is typed as ``str | int``
+        (with a comment noting the socket actually wants a number) — a
+        str value passes pydantic validation as-is and gets serialized
+        as a JSON string, which the MAX server rejects outright with a
+        generic "Ошибка валидации / Expected number at <n>" — and pymax
+        treats that as a fatal, non-retryable protocol error that tears
+        down and reconnects the whole websocket connection, not just a
+        failed read_message call.
+        """
         try:
-            await self._client.read_message(message_id, int(chat_id))
+            await self._client.read_message(int(message_id), int(chat_id))
         except Exception:
             log.exception(
                 "PyMax read_message failed for chat_id=%s message_id=%s",
