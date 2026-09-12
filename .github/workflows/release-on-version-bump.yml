@@ -11,6 +11,7 @@ on:
     branches: [main]
     paths:
       - VERSION
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -29,6 +30,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
           version="$(tr -d '[:space:]' < VERSION)"
           tag="v${version}"
