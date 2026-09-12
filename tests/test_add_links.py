@@ -450,3 +450,58 @@ class TestAddingSomeoneByPhone:
             client.open_dialog_by_phone("+79991234567"), timeout=5)
 
         assert "chatId" not in result
+
+
+class TestLeavingAChatInMax:
+    """Which call MAX needs depends on what the chat is — and a dialog is
+    deleted for us alone."""
+
+    def _client(self, chat_type):
+        client = _client_with({-42: {"id": -42, "type": chat_type,
+                                     "lastEventTime": 123}})
+        client.resolver.chat_types = {}
+        client._client.leave_group = AsyncMock()
+        client._client.leave_channel = AsyncMock()
+        client._client.delete_chat = AsyncMock()
+        return client
+
+    async def test_a_group_is_left(self):
+        client = self._client("CHAT")
+
+        result = await client.leave_or_delete_chat(-42)
+
+        client._client.leave_group.assert_awaited_once_with(-42)
+        assert "left" in result
+
+    async def test_a_channel_is_unsubscribed_from(self):
+        client = self._client("CHANNEL")
+
+        await client.leave_or_delete_chat(-42)
+
+        client._client.leave_channel.assert_awaited_once_with(-42)
+
+    async def test_a_dialog_is_deleted_for_us_only(self):
+        """pymax defaults delete_chat to for_all=True, which would erase
+        the conversation from the other person's account too."""
+        client = self._client("DIALOG")
+
+        await client.leave_or_delete_chat(-42)
+
+        kwargs = client._client.delete_chat.await_args.kwargs
+        assert kwargs["for_all"] is False
+        assert kwargs["last_event_time"] == 123
+
+    async def test_an_unknown_type_is_treated_as_a_group(self):
+        client = self._client("")
+
+        await client.leave_or_delete_chat(-42)
+
+        client._client.leave_group.assert_awaited_once()
+
+    async def test_a_refusal_comes_back_as_an_error_not_an_exception(self):
+        client = self._client("CHAT")
+        client._client.leave_group = AsyncMock(side_effect=RuntimeError("нельзя"))
+
+        result = await client.leave_or_delete_chat(-42)
+
+        assert "нельзя" in result["_max_error"]["message"]

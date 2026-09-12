@@ -369,3 +369,125 @@ class TestSavedMessages:
         body = bot.send_message.await_args.kwargs["text"]
         assert "Избранное" in body
         bot.pin_chat_message.assert_awaited_once()
+
+
+class TestDelMax:
+    """/del_max acts on MAX itself, where nothing can be undone — unlike
+    /del, which only unlinks a Telegram topic."""
+
+    def _ctx(self, chat_type="CHAT", in_main_group=True, leave_result=None):
+        ctx = _make_context(args=[])
+        ctx.bot_data[SUPERGROUP_KEY] = TG_CHAT_ID if in_main_group else -1
+        resolver = MagicMock()
+        resolver.chats_raw = {-42: {"id": -42, "type": chat_type}}
+        resolver.chat_types = {-42: chat_type}
+        resolver.chat_name = MagicMock(return_value="Рабочий чат")
+        resolver.is_saved_messages = MagicMock(return_value=False)
+        max_client = ctx.bot_data[MAX_CLIENT_KEY]
+        max_client.resolver = resolver
+        max_client.leave_or_delete_chat = AsyncMock(
+            return_value=leave_result or {"left": "вышел из чата"})
+        return ctx
+
+    def _callback_update(self, data):
+        update = MagicMock()
+        update.message = None
+        update.callback_query = MagicMock()
+        update.callback_query.data = data
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 777
+        return update
+
+    async def test_it_only_asks_first_and_changes_nothing_yet(self):
+        from app.tg_handler import _cmd_del_max
+
+        update = _make_update("/del_max -42")
+        ctx = self._ctx()
+        ctx.args = ["-42"]
+
+        await _cmd_del_max(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].leave_or_delete_chat.assert_not_awaited()
+        assert "Выйти" in _replies(update)[0]
+
+    async def test_outside_the_main_group_it_refuses(self):
+        from app.tg_handler import _cmd_del_max
+
+        update = _make_update("/del_max -42")
+        ctx = self._ctx(in_main_group=False)
+        ctx.args = ["-42"]
+
+        await _cmd_del_max(update, ctx)
+
+        assert "только в основной" in _replies(update)[0]
+
+    async def test_saved_messages_are_never_deleted(self):
+        from app.tg_handler import _cmd_del_max
+
+        update = _make_update("/del_max 0")
+        ctx = self._ctx()
+        ctx.args = ["0"]
+        ctx.bot_data[MAX_CLIENT_KEY].resolver.is_saved_messages = MagicMock(
+            return_value=True)
+
+        await _cmd_del_max(update, ctx)
+
+        assert "Избранное" in _replies(update)[0]
+        ctx.bot_data[MAX_CLIENT_KEY].leave_or_delete_chat.assert_not_awaited()
+
+    async def test_without_an_id_or_a_topic_it_explains_itself(self):
+        from app.tg_handler import _cmd_del_max
+
+        update = _make_update("/del_max")
+        ctx = self._ctx()
+        ctx.args = []
+        ctx.bot_data[TOPIC_STORE_KEY].chat_for_topic = MagicMock(return_value=None)
+
+        await _cmd_del_max(update, ctx)
+
+        assert "Использование" in _replies(update)[0]
+
+    async def test_confirming_leaves_the_chat_in_max(self):
+        from app.tg_handler import _on_del_max_callback
+
+        ctx = self._ctx()
+        update = self._callback_update("delmax:ok:-42")
+
+        await _on_del_max_callback(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].leave_or_delete_chat.assert_awaited_once_with(-42)
+        assert "Готово" in update.callback_query.edit_message_text.await_args.args[0]
+
+    async def test_cancelling_does_nothing_at_all(self):
+        from app.tg_handler import _on_del_max_callback
+
+        ctx = self._ctx()
+        update = self._callback_update("delmax:cancel")
+
+        await _on_del_max_callback(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].leave_or_delete_chat.assert_not_awaited()
+
+    async def test_a_refusal_from_max_is_reported(self):
+        from app.tg_handler import _on_del_max_callback
+
+        ctx = self._ctx(leave_result={"_max_error": {"message": "нельзя"}})
+        update = self._callback_update("delmax:ok:-42")
+
+        await _on_del_max_callback(update, ctx)
+
+        assert "нельзя" in update.callback_query.edit_message_text.await_args.args[0]
+
+    async def test_the_topic_is_left_alone(self):
+        """Two separate destructive acts stay separate: /del removes the
+        topic, /del_max acts in MAX."""
+        from app.tg_handler import _on_del_max_callback
+
+        ctx = self._ctx()
+        update = self._callback_update("delmax:ok:-42")
+
+        await _on_del_max_callback(update, ctx)
+
+        ctx.bot_data[TOPIC_STORE_KEY].remove.assert_not_called()

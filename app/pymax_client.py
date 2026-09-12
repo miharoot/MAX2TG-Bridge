@@ -1325,6 +1325,50 @@ class PyMaxClient:
                  _redact_url(link), user_id)
         return resolved
 
+    async def leave_or_delete_chat(self, chat_id: int) -> dict:
+        """Leave a group, unsubscribe from a channel, or delete a dialog.
+
+        Which of the three is decided by what the chat is, since MAX has a
+        separate call for each. Irreversible on MAX's side — the caller is
+        expected to have asked first.
+
+        A dialog is deleted **for us only**: pymax's delete_chat defaults
+        to for_all=True, which would erase the conversation from the other
+        person's account as well. Nobody asks for that by asking to leave
+        a chat, so it is pinned to False here and not exposed.
+
+        Returns {"left": <what was done>} or the usual _max_error shape.
+        """
+        resolver = self.resolver
+        chat = (resolver.chats_raw.get(chat_id) or {}) if resolver is not None else {}
+        chat_type = str(chat.get("type") or "").upper()
+        if not chat_type and resolver is not None:
+            chat_type = str(resolver.chat_types.get(chat_id) or "").upper()
+
+        try:
+            if chat_type == "CHANNEL":
+                await self._client.leave_channel(int(chat_id))
+                action = "отписался от канала"
+            elif chat_type == "DIALOG":
+                await self._client.delete_chat(
+                    chat_id=int(chat_id),
+                    last_event_time=chat.get("lastEventTime"),
+                    for_all=False,
+                )
+                action = "удалил диалог"
+            else:
+                # Unknown type included: a group is the common case, and
+                # MAX answers with an error rather than doing damage if
+                # this chat isn't one.
+                await self._client.leave_group(int(chat_id))
+                action = "вышел из чата"
+        except Exception as exc:
+            log.exception("Leaving MAX chat %s failed", chat_id)
+            return {"_max_error": {"message": str(exc)}}
+
+        log.info("MAX chat %s: %s", chat_id, action)
+        return {"left": action}
+
     async def open_dialog_by_phone(self, phone: str) -> dict:
         """Address the dialog with whoever owns this phone number.
 

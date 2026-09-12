@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import io
 import logging
 import re
@@ -1180,7 +1181,13 @@ HELP_TEXT = (
     "• <code>/intro</code> — перепостить и закрепить карточку профиля "
     "в текущем топике (полезно после смены аватара).\n"
     "• <code>/del</code> — удалить текущий топик и связь с MAX-чатом "
-    "(спросит подтверждение).\n"
+    "(спросит подтверждение). В самом MAX ничего не меняется.\n"
+    "• <code>/del_max &lt;chat_id&gt;</code> — только в основной группе: "
+    "выйти из чата в <b>самом MAX</b> — покинуть группу, отписаться от "
+    "канала или удалить диалог (только у себя, у собеседника переписка "
+    "останется). Спросит подтверждение; в MAX это необратимо. Топик "
+    "Telegram при этом остаётся — убрать его отдельно через "
+    "<code>/del</code>.\n"
     "• <code>/help</code> — эта справка.\n\n"
     "Просто пиши в любом привязанном топике — сообщение уйдёт в "
     "соответствующий чат MAX. Поддерживается жирный/курсив/зачёркнутый/"
@@ -1461,6 +1468,136 @@ async def _on_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # that's fine — the chat-level confirmation isn't critical.
 
 
+async def _cmd_del_max(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask to confirm leaving a chat on the MAX side.
+
+    Unlike /del, which only unlinks a Telegram topic, this acts on MAX
+    itself: leaves a group, unsubscribes from a channel, or deletes a
+    dialog (for us only). Irreversible there, so it is kept to the main
+    supergroup — the one place that already answers for the whole MAX
+    account (see /list) rather than for one routed chat — and asks first.
+
+    Usage: `/del_max <chat id>`, or plain `/del_max` inside a topic.
+    """
+    message = update.message
+    if message is None:
+        return
+    _log_command(update, "del_max")
+
+    supergroup_id = context.bot_data.get(SUPERGROUP_KEY)
+    target_chat_id = update.effective_chat.id if update.effective_chat else None
+    if supergroup_id is None or target_chat_id != supergroup_id:
+        log.info("/del_max rejected: invoked outside main supergroup (chat_id=%s)",
+                 target_chat_id)
+        await message.reply_text(
+            "Команда <code>/del_max</code> доступна только в основной "
+            "Telegram-группе (задана в <code>TG_CHAT_ID</code>).",
+            parse_mode="HTML",
+        )
+        return
+
+    allowed_user_ids = context.bot_data.get(ALLOWED_USER_KEY)
+    if allowed_user_ids and update.effective_user and update.effective_user.id not in allowed_user_ids:
+        log.warning("/del_max denied for user_id=%s (not in allowed list)",
+                    update.effective_user.id)
+        return
+
+    args = context.args or []
+    max_chat_id = _parse_max_chat_id(args[0]) if args else None
+    if max_chat_id is None:
+        target = _resolve_topic_target(update, context)
+        if target:
+            _, max_chat_id, _ = target
+    if max_chat_id is None:
+        await message.reply_text(
+            "Использование: <code>/del_max &lt;chat_id&gt;</code> — или "
+            "вызови без аргумента внутри топика. id чатов показывает "
+            "<code>/list</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    max_client: PyMaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
+    resolver = getattr(max_client, "resolver", None)
+    if resolver is not None and resolver.is_saved_messages(max_chat_id):
+        # Your own notes, and nobody asks to "leave" those by accident.
+        await message.reply_text(
+            "«Избранное» — это твои собственные заметки в MAX, "
+            "удалять его я не буду."
+        )
+        return
+
+    name = resolver.chat_name(max_chat_id) if resolver is not None else str(max_chat_id)
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🚪 Выйти в MAX",
+                                 callback_data=f"delmax:ok:{max_chat_id}"),
+            InlineKeyboardButton("Отмена", callback_data="delmax:cancel"),
+        ]
+    ])
+    await message.reply_text(
+        f"Выйти в <b>MAX</b> из чата <b>{escape(str(name))}</b> "
+        f"(<code>{max_chat_id}</code>)?\n\n"
+        "Группу я покину, от канала отпишусь, диалог удалю — только у себя, "
+        "у собеседника переписка останется. В MAX это необратимо.\n\n"
+        "Топик в Telegram останется на месте: чтобы убрать и его, вызови "
+        "<code>/del</code> внутри него.",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+async def _on_del_max_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    await query.answer()
+    user = update.effective_user
+    log.info("/del_max callback %r from user_id=%s (@%s)",
+             query.data, user.id if user else None, user.username if user else None)
+
+    allowed_user_ids = context.bot_data.get(ALLOWED_USER_KEY)
+    if allowed_user_ids and user and user.id not in allowed_user_ids:
+        log.warning("/del_max callback denied for user_id=%s (not in allowed list)",
+                    user.id)
+        return
+
+    parts = query.data.split(":")
+    if parts[:2] == ["delmax", "cancel"]:
+        with contextlib.suppress(Exception):
+            await query.edit_message_text("Отменено.")
+        return
+    if len(parts) != 3 or parts[:2] != ["delmax", "ok"]:
+        return
+    try:
+        max_chat_id = int(parts[2])
+    except ValueError:
+        return
+
+    max_client: PyMaxClient | None = context.bot_data.get(MAX_CLIENT_KEY)
+    if max_client is None:
+        with contextlib.suppress(Exception):
+            await query.edit_message_text("⚠️ Max клиент не подключён.")
+        return
+
+    resp = await max_client.leave_or_delete_chat(max_chat_id)
+    err = (resp or {}).get("_max_error")
+    if err:
+        desc = (err.get("localizedMessage") or err.get("message")
+                or "MAX отказал")
+        with contextlib.suppress(Exception):
+            await query.edit_message_text(f"⚠️ MAX: {desc}")
+        return
+
+    with contextlib.suppress(Exception):
+        await query.edit_message_text(
+            f"Готово: {resp.get('left', 'вышел')} <code>{max_chat_id}</code>. "
+            "Топик в Telegram остался — убрать его можно командой "
+            "<code>/del</code> внутри него.",
+            parse_mode="HTML",
+        )
+
+
 async def _cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Re-publish the pinned profile card in the current topic.
 
@@ -1673,8 +1810,10 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
     app.add_handler(CommandHandler("intro", _cmd_intro, filters=chat_filter))
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))
+    app.add_handler(CommandHandler("del_max", _cmd_del_max, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(_on_del_callback, pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(_on_del_max_callback, pattern=r"^delmax:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, _on_topic_message)
     )
