@@ -14,8 +14,10 @@ import pytest
 from app.tg_handler import (
     ALLOWED_USER_KEY,
     MAX_CLIENT_KEY,
+    SUPERGROUP_KEY,
     TOPIC_STORE_KEY,
     _cmd_bind,
+    _cmd_list,
 )
 
 TG_CHAT_ID = -100999
@@ -153,3 +155,58 @@ class TestEveryCommandAnswersSomething:
         await handler(update, ctx)
 
         assert _replies(update), f"/{name} replied nothing at all"
+
+
+class TestCmdList:
+    """What /list prints per chat: everything copyable is monospace and on
+    its own line, and the invite link MAX already sent us is shown as-is."""
+
+    def _list_context(self, chats_raw, chat_types=None, topics=None):
+        ctx = _make_context(args=[])
+        ctx.bot_data[SUPERGROUP_KEY] = TG_CHAT_ID
+
+        resolver = MagicMock()
+        resolver.chats_raw = chats_raw
+        resolver.chat_types = chat_types or {}
+        resolver.is_dm = MagicMock(return_value=False)
+        resolver.chat_name = MagicMock(side_effect=lambda cid: str(cid))
+        ctx.bot_data[MAX_CLIENT_KEY].resolver = resolver
+
+        topics = topics or {}
+        ctx.bot_data[TOPIC_STORE_KEY].get_topic = MagicMock(
+            side_effect=lambda cid: topics.get(cid))
+        return ctx
+
+    async def test_ids_and_links_are_monospace_on_their_own_lines(self):
+        update = _make_update("/list")
+        ctx = self._list_context({-42: {"title": "Рабочий чат", "type": "CHAT"}})
+
+        await _cmd_list(update, ctx)
+
+        body = "\n".join(_replies(update))
+        assert "<code>-42</code>" in body
+        assert "<code>https://web.max.ru/-42</code>" in body
+        assert "<a href" not in body      # never a titled link again
+
+    async def test_the_invite_link_from_max_is_shown_when_there_is_one(self):
+        """MAX ships a group's invite link in the snapshot, so /list can
+        show it without asking for anything."""
+        update = _make_update("/list")
+        ctx = self._list_context({
+            -42: {"title": "Рабочий чат", "type": "CHAT",
+                  "link": "https://max.ru/join/abcdef"},
+        })
+
+        await _cmd_list(update, ctx)
+
+        assert "<code>https://max.ru/join/abcdef</code>" in "\n".join(_replies(update))
+
+    async def test_a_chat_without_an_invite_link_simply_has_none(self):
+        """Conjuring one would mean rework_invite_link, which revokes the
+        chat's current link — listing chats must never do that."""
+        update = _make_update("/list")
+        ctx = self._list_context({-42: {"title": "Рабочий чат", "type": "CHAT"}})
+
+        await _cmd_list(update, ctx)
+
+        assert "max.ru/join" not in "\n".join(_replies(update))

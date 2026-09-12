@@ -1156,7 +1156,12 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             title = resolver.chat_name(chat_id)
             if title == str(chat_id):
                 title = chat.get("title") or "(без названия)"
-        entries.append((title, chat_id, chat_type))
+        # MAX ships a group's own invite link in the snapshot (used by
+        # /profile and the topic card already), so showing it costs no
+        # request. Absent for DMs and for groups without one — the only
+        # way to conjure one is rework_invite_link, which *revokes* the
+        # current link, so listing chats must never do that.
+        entries.append((title, chat_id, chat_type, chat.get("link") or ""))
 
     if not entries:
         await message.reply_text("В MAX пока нет чатов.")
@@ -1175,9 +1180,9 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
     by_type: dict[str, list] = {key: [] for key, _ in SECTIONS}
     other: list = []
-    for title, chat_id, chat_type in entries:
-        bucket = by_type.get(str(chat_type))
-        (bucket if bucket is not None else other).append((title, chat_id, chat_type))
+    for entry in entries:
+        bucket = by_type.get(str(entry[2]))
+        (bucket if bucket is not None else other).append(entry)
 
     counts = ", ".join(
         f"{label.split(' ', 1)[1].lower()}: {len(by_type[key])}"
@@ -1187,7 +1192,8 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         f"<b>Чаты MAX</b> — всего {len(entries)} ({counts})" if counts
         else f"<b>Чаты MAX</b> — всего {len(entries)}",
-        "Скопируй <code>chat_id</code> в <code>/bind</code>, чтобы привязать к топику.",
+        "Скопируй <code>chat_id</code> в <code>/bind</code>, чтобы привязать к топику. "
+        "Вторая ссылка (если есть) — приглашение в чат от самого MAX.",
     ]
 
     def _add_section(title: str, chats: list) -> None:
@@ -1195,18 +1201,21 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         chats = sorted(chats, key=lambda e: e[0].lower())
         lines.append(f"\n<b>{title}</b>")
-        for chat_title, chat_id, _chat_type in chats:
+        for chat_title, chat_id, _chat_type, join_link in chats:
             bound_thread = topic_store.get_topic(chat_id)
             status = f"🔗 топик #{bound_thread}" if bound_thread is not None else "◌ не привязан"
-            # The URL goes in as plain text rather than a titled <a> link:
-            # it has to be selectable and copyable straight out of the
-            # message (into /bind, a browser, a note), which a word that
-            # merely carries a href is not.
-            lines.append(
-                f"• <b>{escape(chat_title)}</b>\n"
-                f"  <code>{chat_id}</code> · {status}\n"
-                f"  <code>https://web.max.ru/{chat_id}</code>"
-            )
+            # Ids and links go in monospace, each on its own line: they
+            # exist to be copied out of the message — into /bind, a
+            # browser, a note — which a word merely carrying a href is
+            # not, and which a run-on line makes fiddly to select.
+            entry_lines = [
+                f"• <b>{escape(chat_title)}</b>",
+                f"  <code>{chat_id}</code> · {status}",
+                f"  <code>https://web.max.ru/{chat_id}</code>",
+            ]
+            if join_link:
+                entry_lines.append(f"  <code>{escape(str(join_link))}</code>")
+            lines.append("\n".join(entry_lines))
 
     for key, label in SECTIONS:
         _add_section(label, by_type[key])
