@@ -77,6 +77,80 @@ def _patch_api_error_not_ready_matching() -> None:
     _PATCHED_API_ERROR = True
     log.debug("Patched pymax ApiError for attachment-not-ready code matching")
 
+
+_PATCHED_VOICE_READY_RESOLUTION = False
+
+
+def _fixed_resolve_attach(frame):
+    """Replacement for pymax's dispatch.resolvers.resolve_attach.
+
+    Works around a second maxapi-python bug (present alongside the
+    ApiError one above, same root cause: voice messages are uploaded
+    through MAX's video pipeline). The server's "upload ready"
+    notification for a voice message includes *both* a ``videoId`` and
+    an ``audioId`` field — since ``VoiceAttachPayload`` extends
+    ``VideoAttachPayload`` and keeps the same underlying id — but
+    pymax's own resolver checks ``VideoUploadSignal`` (which only
+    requires ``video_id`` and, thanks to ``CamelModel``'s
+    ``extra="allow"``, validates successfully against that payload too)
+    *before* ``AudioUploadSignal``. Every voice-ready notification
+    therefore gets classified as ``VIDEO_READY`` instead of
+    ``VOICE_READY``, so ``on_video_attach`` resolves the wrong waiter
+    dict (``video_upload_waiters`` instead of ``voice_upload_waiters``)
+    — the real wait in ``_process_attachment_error`` (see the ApiError
+    patch above, which is what makes that wait actually get reached at
+    all) then always times out after 60s with "Timed out waiting for
+    video processing", and the voice message never sends.
+
+    Checking ``AudioUploadSignal`` first fixes the ordering: a genuine
+    video-ready payload only carries ``videoId`` (confirmed against
+    pymax's own ``VideoUploadSignal``/``AudioUploadSignal`` models,
+    which have no optional fields to fall back on), so it correctly
+    fails ``AudioUploadSignal`` validation (missing required
+    ``audio_id``) and falls through to ``VideoUploadSignal`` unchanged.
+    """
+    from pydantic import ValidationError
+    from pymax.dispatch.enums import EventType
+    from pymax.types import AudioUploadSignal
+    from pymax.types.events import FileUploadSignal, VideoUploadSignal
+
+    try:
+        FileUploadSignal.model_validate(frame.payload)
+        return EventType.FILE_READY
+    except ValidationError:
+        pass
+
+    try:
+        AudioUploadSignal.model_validate(frame.payload)
+        return EventType.VOICE_READY
+    except ValidationError:
+        pass
+
+    try:
+        VideoUploadSignal.model_validate(frame.payload)
+        return EventType.VIDEO_READY
+    except ValidationError:
+        pass
+
+    return None
+
+
+def _patch_voice_ready_resolution() -> None:
+    """Idempotent — safe to call multiple times."""
+    global _PATCHED_VOICE_READY_RESOLUTION
+    if _PATCHED_VOICE_READY_RESOLUTION:
+        return
+    from pymax.dispatch import mapping
+    from pymax.protocol import Opcode
+
+    # EVENT_MAP is looked up fresh on every dispatched frame (see
+    # EventResolver.resolve), so mutating this module-level dict in
+    # place takes effect immediately — no need to patch anything that
+    # might have already captured the old function by reference.
+    mapping.EVENT_MAP[Opcode.NOTIF_ATTACH] = _fixed_resolve_attach
+    _PATCHED_VOICE_READY_RESOLUTION = True
+    log.debug("Patched pymax attach-ready event resolution for voice messages")
+
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
 _BROWSER_HEADERS = {"User-Agent": _USER_AGENT, "Accept-Encoding": "gzip, deflate"}
 _HTTP_HEADERS = {**_BROWSER_HEADERS, "Origin": "https://web.max.ru", "Referer": "https://web.max.ru/", "Accept": "*/*"}
@@ -294,6 +368,7 @@ class PyMaxClient:
 
     def __init__(self, settings: Settings):
         _patch_api_error_not_ready_matching()
+        _patch_voice_ready_resolution()
         self.settings = settings
         self.max_download_bytes = settings.max_download_mb * 1024 * 1024
         self.chat_ids: list[int] = []

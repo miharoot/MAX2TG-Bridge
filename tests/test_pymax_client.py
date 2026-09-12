@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.config import Settings
-from app.pymax_client import PyMaxClient, _message_from_pymax, _patch_api_error_not_ready_matching
+from app.pymax_client import (
+    PyMaxClient,
+    _fixed_resolve_attach,
+    _message_from_pymax,
+    _patch_api_error_not_ready_matching,
+    _patch_voice_ready_resolution,
+)
 from pymax.exceptions import ApiError
 
 
@@ -446,6 +452,84 @@ class TestReadMessagePayloadSerialization:
         )
         assert payload.to_payload()["messageId"] == 117250688214045881
         assert isinstance(payload.to_payload()["messageId"], int)
+
+
+# ---------------------------------------------------------------------------
+# Voice-ready vs video-ready event misclassification workaround
+#
+# Regression coverage for the second half of the real production bug: after
+# the ApiError patch above made pymax's built-in "attachment not ready"
+# retry actually fire, voice sends still failed — this time timing out
+# after 60s with "Timed out waiting for video processing" — because pymax
+# resolves the server's upload-ready notification as VIDEO_READY even for
+# voice messages, so the wait registered under voice_upload_waiters is
+# never resolved.
+# ---------------------------------------------------------------------------
+
+class TestVoiceReadyResolutionPatch:
+    def test_voice_ready_payload_classified_as_voice_not_video(self):
+        """The exact payload shape a voice upload-ready notification has
+        in production: both videoId and audioId present, since
+        VoiceAttachPayload shares the video-upload id family."""
+        from types import SimpleNamespace
+        from pymax.dispatch.enums import EventType
+
+        _patch_voice_ready_resolution()
+        frame = SimpleNamespace(payload={"videoId": 4279754096696, "audioId": 4279754096696})
+
+        assert _fixed_resolve_attach(frame) == EventType.VOICE_READY
+
+    def test_genuine_video_ready_payload_still_classified_as_video(self):
+        """Must not break real (non-voice) video uploads — a genuine
+        video-ready payload only ever carries videoId."""
+        from types import SimpleNamespace
+        from pymax.dispatch.enums import EventType
+
+        _patch_voice_ready_resolution()
+        frame = SimpleNamespace(payload={"videoId": 999})
+
+        assert _fixed_resolve_attach(frame) == EventType.VIDEO_READY
+
+    def test_file_ready_payload_still_classified_as_file(self):
+        from types import SimpleNamespace
+        from pymax.dispatch.enums import EventType
+
+        _patch_voice_ready_resolution()
+        frame = SimpleNamespace(payload={"fileId": 12345})
+
+        assert _fixed_resolve_attach(frame) == EventType.FILE_READY
+
+    def test_unrecognized_payload_returns_none(self):
+        from types import SimpleNamespace
+
+        _patch_voice_ready_resolution()
+        frame = SimpleNamespace(payload={"somethingElse": 1})
+
+        assert _fixed_resolve_attach(frame) is None
+
+    def test_patches_the_live_event_map_in_place(self):
+        """The actual mechanism that matters: pymax's dispatcher looks
+        EVENT_MAP up fresh on every frame, so mutating it in place must
+        make the real dispatch path use our fixed resolver."""
+        from pymax.dispatch import mapping
+        from pymax.protocol import Opcode
+
+        _patch_voice_ready_resolution()
+
+        assert mapping.EVENT_MAP[Opcode.NOTIF_ATTACH] is _fixed_resolve_attach
+
+    def test_patching_twice_is_a_no_op(self):
+        _patch_voice_ready_resolution()
+        _patch_voice_ready_resolution()
+
+        from pymax.dispatch import mapping
+        from pymax.protocol import Opcode
+        assert mapping.EVENT_MAP[Opcode.NOTIF_ATTACH] is _fixed_resolve_attach
+
+    def test_creating_a_pymax_client_applies_this_patch_too(self, adapter):
+        from pymax.dispatch import mapping
+        from pymax.protocol import Opcode
+        assert mapping.EVENT_MAP[Opcode.NOTIF_ATTACH] is _fixed_resolve_attach
 
 
 class TestApiErrorNotReadyPatch:
