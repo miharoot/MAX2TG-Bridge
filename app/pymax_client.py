@@ -7,14 +7,14 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from yarl import URL
 
 from app.config import Settings
 from app.pymax_auth import build_pymax_client
-from pymax.exceptions import ApiError
+from pymax.exceptions import ApiError, UploadError
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +150,213 @@ def _patch_voice_ready_resolution() -> None:
     mapping.EVENT_MAP[Opcode.NOTIF_ATTACH] = _fixed_resolve_attach
     _PATCHED_VOICE_READY_RESOLUTION = True
     log.debug("Patched pymax attach-ready event resolution for voice messages")
+
+
+_PATCHED_ATTACHMENT_WAIT_TIMEOUT = False
+_ATTACHMENT_READY_WAIT_SECONDS = 8
+_ATTACHMENT_READY_MAX_ATTEMPTS = 5
+
+
+async def _short_wait_for_upload_signal(self, waiters, video_id) -> None:
+    """Replacement for pymax's ``MessageService._wait_for_upload_signal``.
+
+    Third bug in the same voice-upload chain as the two patches above,
+    but this one is on MAX's server side rather than pymax's: production
+    debug logs (checked across several independent captures) show the
+    "attachment ready" push notification (``NOTIF_ATTACH``, opcode 136)
+    is simply never sent for these voice uploads — the wait always runs
+    the full default 60 seconds and times out with "Timed out waiting
+    for video processing notification", never resolved by an actual
+    event. The two patches above make pymax *capable* of reacting
+    correctly to that notification; they can't make MAX's server send
+    one that never arrives.
+
+    Waiting a full minute per attempt for a signal that structurally
+    never comes just wastes time — shortened here to a few seconds so
+    that ``PyMaxClient.send_message``'s own retry loop (see
+    ``_ATTACHMENT_READY_MAX_ATTEMPTS``) gets several fresh attempts
+    (each a full re-upload + resend, since the token from a "not ready"
+    attempt cannot be reused) within roughly the same overall time
+    budget the old single 60s wait used to spend on one doomed attempt.
+    """
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    waiters[video_id] = future
+    try:
+        await asyncio.wait_for(future, timeout=_ATTACHMENT_READY_WAIT_SECONDS)
+    except TimeoutError:
+        log.warning(
+            "Timed out waiting for attachment processing notification "
+            "video_id=%s (shortened %ss wait — MAX never sent a ready "
+            "signal for this upload)",
+            video_id, _ATTACHMENT_READY_WAIT_SECONDS,
+        )
+        raise UploadError(f"Timed out waiting for video processing video_id={video_id}")
+    finally:
+        waiters.pop(video_id, None)
+
+
+def _patch_attachment_wait_timeout() -> None:
+    """Idempotent — safe to call multiple times."""
+    global _PATCHED_ATTACHMENT_WAIT_TIMEOUT
+    if _PATCHED_ATTACHMENT_WAIT_TIMEOUT:
+        return
+    from pymax.api.messages.service import MessageService
+
+    MessageService._wait_for_upload_signal = _short_wait_for_upload_signal
+    _PATCHED_ATTACHMENT_WAIT_TIMEOUT = True
+    log.debug(
+        "Patched pymax attachment-ready wait timeout to %ss",
+        _ATTACHMENT_READY_WAIT_SECONDS,
+    )
+
+
+_PATCHED_VOICE_UPLOAD_USER_AGENT = False
+
+
+async def _upload_voice_without_mangled_user_agent(self, voice):
+    """Replacement for pymax's ``UploadService.upload_voice``.
+
+    Root cause (not a workaround like the two patches above): identified
+    from a maintainer-filed upstream bug report — MaxApiTeam/PyMax#103
+    ("2.4.1: голосовое загружается, но сервер не доводит обработку до
+    конца — video.not.ready"). That report shows the exact same symptom
+    we see in production (upload HTTP 200s, MAX's server never sends the
+    NOTIF_ATTACH ready signal, waiting up to 30s+ before giving up does
+    not help) and pins it on the ``User-Agent`` header pymax sends with
+    the voice upload HTTP request: it runs the header value through
+    ``urllib.parse.quote()`` before sending, producing a mangled value
+    like ``OKMessages/26.27.1%20%28Android%2013%3B%20...`` (percent-
+    escaped spaces/parens/semicolons) — a header value is not a URL
+    component and was never meant to be quoted. pymax's own
+    ``upload_video``/``upload_file`` send no ``User-Agent`` header at
+    all, only ``upload_voice`` does this, which lines up with why only
+    voice uploads get stuck "not ready" forever.
+
+    This is a full copy of pymax's ``upload_voice`` (down to log
+    messages and error handling) with that one line fixed — sending the
+    header value as-is, unquoted. Kept in sync with pymax 2.4.1
+    (maxapi-python); if pymax fixes this upstream, this patch becomes a
+    no-op duplicate and can be removed.
+    """
+    from http import HTTPStatus
+
+    from pydantic import ValidationError
+
+    from pymax.api.uploads.models import VideoUploadResponse
+    from pymax.api.uploads.payloads import UploadPayload, VoiceAttachPayload
+    from pymax.protocol import Opcode
+
+    logger = log
+
+    logger.info("Uploading voice")
+
+    payload = UploadPayload(type=2, uploader_type=1).to_payload()
+
+    try:
+        data = await self.app.invoke(Opcode.VIDEO_UPLOAD, payload=payload)
+    except Exception as e:
+        logger.exception("Failed to request voice upload URL")
+        raise UploadError("Failed to request voice upload URL") from e
+
+    try:
+        response = VideoUploadResponse.model_validate(data.payload)
+    except ValidationError as e:
+        logger.exception("Invalid voice upload response model")
+        raise UploadError("Invalid voice upload response model") from e
+    except Exception as e:
+        logger.exception("Failed to parse voice upload response")
+        raise UploadError("Failed to parse voice upload response") from e
+
+    try:
+        upload_info = response.info[0]
+    except IndexError as e:
+        logger.error("voice upload response info is empty")
+        raise UploadError("voice upload response info is empty") from e
+    except Exception as e:
+        logger.exception("Failed to get voice upload info")
+        raise UploadError("Failed to get voice upload info") from e
+
+    try:
+        file_size = await voice.size()
+    except Exception as e:
+        logger.exception("Failed to get voice size")
+        raise UploadError("Failed to get voice size") from e
+
+    user_agent = (
+        f"OKMessages/{self.app.config.app_version}"
+        + f" ({self.app.config.device.user_agent.os_version};"
+        + f" {self.app.config.device.user_agent.device_name};"
+        + f" {self.app.config.device.user_agent.screen})"
+    )
+
+    headers = {
+        "Content-Disposition": f"attachment; filename={quote(voice.name)}",
+        "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
+        "Content-Length": str(file_size),
+        "Connection": "keep-alive",
+        "Content-Type": "application/octet-stream",
+        # The one-line fix: pymax's own version wraps this in quote(),
+        # percent-escaping the header value as if it were a URL — see
+        # this function's docstring.
+        "User-Agent": user_agent,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=self.app.config.upload_timeout, sock_read=60)
+    video_id = upload_info.video_id
+    token = upload_info.token
+
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout, proxy=self.app.config.proxy
+        ) as session:
+            async with session.post(
+                url=upload_info.url,
+                headers=headers,
+                data=voice.iter_chunks(1024 * 1024),
+            ) as resp:
+                if resp.status != HTTPStatus.OK:
+                    logger.error(
+                        "Voice upload failed with status %s video_id=%s",
+                        resp.status, video_id,
+                    )
+                    raise UploadError(
+                        f"Voice upload failed with status {resp.status} video_id={video_id}"
+                    )
+
+                logger.debug("Voice upload complete voice_id=%s", video_id)
+                return VoiceAttachPayload(
+                    video_id=video_id,
+                    token=token,
+                    duration=await voice.get_duration(),
+                    wave=b"\x00" * 80,
+                )
+
+    except UploadError:
+        raise
+    except aiohttp.ClientError as e:
+        logger.exception("HTTP error during voice upload voice_id=%s", video_id)
+        raise UploadError(f"HTTP error during voice upload voice_id={video_id}") from e
+    except TimeoutError as e:
+        logger.exception("Timed out during voice upload voice_id=%s", video_id)
+        raise UploadError(f"Timed out during voice upload voice_id={video_id}") from e
+    except Exception as e:
+        logger.exception("Unexpected error during voice upload voice_id=%s", video_id)
+        raise UploadError(f"Unexpected error during voice upload voice_id={video_id}") from e
+
+
+def _patch_voice_upload_user_agent() -> None:
+    """Idempotent — safe to call multiple times."""
+    global _PATCHED_VOICE_UPLOAD_USER_AGENT
+    if _PATCHED_VOICE_UPLOAD_USER_AGENT:
+        return
+    from pymax.api.uploads.service import UploadService
+
+    UploadService.upload_voice = _upload_voice_without_mangled_user_agent
+    _PATCHED_VOICE_UPLOAD_USER_AGENT = True
+    log.debug("Patched pymax voice upload to stop mangling the User-Agent header")
 
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
 _BROWSER_HEADERS = {"User-Agent": _USER_AGENT, "Accept-Encoding": "gzip, deflate"}
@@ -369,6 +576,8 @@ class PyMaxClient:
     def __init__(self, settings: Settings):
         _patch_api_error_not_ready_matching()
         _patch_voice_ready_resolution()
+        _patch_attachment_wait_timeout()
+        _patch_voice_upload_user_agent()
         self.settings = settings
         self.max_download_bytes = settings.max_download_mb * 1024 * 1024
         self.chat_ids: list[int] = []
@@ -570,16 +779,40 @@ class PyMaxClient:
         elements=None,
         attaches=None,
     ) -> dict:
-        try:
-            message = await self._client.send_message(
-                int(chat_id),
-                text=text or None,
-                attachments=attaches or None,
-                notify=True,
+        # A voice/video attachment can raise UploadError("Timed out
+        # waiting for video processing ...") — MAX's own "attachment
+        # ready" notification structurally never arrives for these
+        # (see _patch_attachment_wait_timeout), so each attempt is a
+        # fresh re-upload with only a short wait. Retry a few times
+        # before giving up; anything else fails immediately as before.
+        last_exc: Exception | None = None
+        for attempt in range(1, _ATTACHMENT_READY_MAX_ATTEMPTS + 1):
+            try:
+                message = await self._client.send_message(
+                    int(chat_id),
+                    text=text or None,
+                    attachments=attaches or None,
+                    notify=True,
+                )
+            except UploadError as exc:
+                last_exc = exc
+                log.warning(
+                    "MAX attachment still not ready for chat %s (attempt %d/%d): %s",
+                    chat_id, attempt, _ATTACHMENT_READY_MAX_ATTEMPTS, exc,
+                )
+                continue
+            except Exception as exc:
+                log.exception("PyMax send_message failed for chat %s", chat_id)
+                return {"_max_error": {"message": str(exc)}}
+            else:
+                break
+        else:
+            log.error(
+                "PyMax send_message: MAX attachment never became ready for "
+                "chat %s after %d attempts",
+                chat_id, _ATTACHMENT_READY_MAX_ATTEMPTS,
             )
-        except Exception as exc:
-            log.exception("PyMax send_message failed for chat %s", chat_id)
-            return {"_max_error": {"message": str(exc)}}
+            return {"_max_error": {"message": str(last_exc)}}
         sent_cid = getattr(message, "cid", None)
         if sent_cid is not None:
             self._mark_outbound_cid(chat_id, sent_cid)

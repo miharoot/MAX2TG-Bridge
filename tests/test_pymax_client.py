@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 from types import SimpleNamespace
@@ -7,13 +8,16 @@ import pytest
 
 from app.config import Settings
 from app.pymax_client import (
+    _ATTACHMENT_READY_MAX_ATTEMPTS,
     PyMaxClient,
     _fixed_resolve_attach,
     _message_from_pymax,
     _patch_api_error_not_ready_matching,
+    _patch_attachment_wait_timeout,
     _patch_voice_ready_resolution,
+    _patch_voice_upload_user_agent,
 )
-from pymax.exceptions import ApiError
+from pymax.exceptions import ApiError, UploadError
 
 
 class FakeModel:
@@ -594,3 +598,190 @@ class TestApiErrorNotReadyPatch:
         _patch_api_error_not_ready_matching() itself."""
         exc = ApiError(opcode=64, error="errors.process.attachment.video.not.ready")
         assert exc.error == "attachment.not.ready"
+
+
+class TestAttachmentWaitTimeoutPatch:
+    async def test_wait_raises_upload_error_on_timeout(self, monkeypatch):
+        """MAX never actually sends the ready notification for these
+        uploads in production (confirmed across several debug-log
+        captures) — the shortened wait must still surface the same
+        UploadError pymax's own (60s) version raises, just faster."""
+        monkeypatch.setattr("app.pymax_client._ATTACHMENT_READY_WAIT_SECONDS", 0.01)
+        _patch_attachment_wait_timeout()
+        from pymax.api.messages.service import MessageService
+
+        waiters: dict = {}
+        with pytest.raises(UploadError, match="video_id=42"):
+            await MessageService._wait_for_upload_signal(None, waiters, 42)
+        assert 42 not in waiters  # cleaned up even on timeout
+
+    async def test_wait_resolves_early_if_signal_arrives(self):
+        _patch_attachment_wait_timeout()
+        from pymax.api.messages.service import MessageService
+
+        waiters: dict = {}
+
+        async def resolve_soon():
+            await asyncio.sleep(0)
+            waiters[42].set_result("ready")
+
+        task = asyncio.ensure_future(resolve_soon())
+        await MessageService._wait_for_upload_signal(None, waiters, 42)
+        await task
+        assert 42 not in waiters
+
+    def test_patching_twice_is_a_no_op(self):
+        _patch_attachment_wait_timeout()
+        _patch_attachment_wait_timeout()
+        from pymax.api.messages.service import MessageService
+        assert MessageService._wait_for_upload_signal is not None
+
+
+class TestVoiceUploadUserAgentPatch:
+    """MaxApiTeam/PyMax#103: pymax's own upload_voice() runs the
+    User-Agent header value through urllib.parse.quote(), producing a
+    mangled percent-escaped value MAX's server never finishes processing
+    (upload_video/upload_file send no User-Agent at all). Patched
+    version must send it unquoted and otherwise behave identically."""
+
+    class _FakeVoice:
+        name = "voice.ogg"
+
+        async def size(self):
+            return 5
+
+        async def get_duration(self):
+            return 1000
+
+        def iter_chunks(self, chunk_size):
+            async def _gen():
+                yield b"12345"
+            return _gen()
+
+    class _FakeResponse:
+        def __init__(self, status=200):
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _FakeSession:
+        last_headers = None
+        last_url = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def post(self, url, headers=None, data=None):
+            type(self).last_headers = headers
+            type(self).last_url = url
+            return TestVoiceUploadUserAgentPatch._FakeResponse(200)
+
+    def _fake_upload_service(self):
+        from types import SimpleNamespace
+
+        response_payload = {
+            "info": [{"url": "https://au.oneme.ru/x", "videoId": 42, "token": "tok123"}]
+        }
+        app = SimpleNamespace(
+            invoke=AsyncMock(return_value=SimpleNamespace(payload=response_payload)),
+            config=SimpleNamespace(
+                upload_timeout=30,
+                proxy=None,
+                app_version="26.8.4",
+                device=SimpleNamespace(
+                    user_agent=SimpleNamespace(
+                        os_version="Linux", device_name="Chrome", screen="1080x1920 1.0x",
+                    )
+                ),
+            ),
+        )
+        return SimpleNamespace(app=app)
+
+    async def test_sends_unquoted_user_agent_header(self, monkeypatch):
+        _patch_voice_upload_user_agent()
+        monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
+
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        result = await UploadService.upload_voice(service, self._FakeVoice())
+
+        sent_ua = self._FakeSession.last_headers["User-Agent"]
+        assert sent_ua == "OKMessages/26.8.4 (Linux; Chrome; 1080x1920 1.0x)"
+        assert "%20" not in sent_ua and "%28" not in sent_ua
+        assert result.token == "tok123"
+
+    async def test_patching_twice_is_a_no_op(self):
+        _patch_voice_upload_user_agent()
+        _patch_voice_upload_user_agent()
+        from pymax.api.uploads.service import UploadService
+        assert UploadService.upload_voice is not None
+
+    async def test_upload_http_error_still_raises_upload_error(self, monkeypatch):
+        _patch_voice_upload_user_agent()
+
+        class _FailingSession(self._FakeSession):
+            def post(self, url, headers=None, data=None):
+                return TestVoiceUploadUserAgentPatch._FakeResponse(500)
+
+        monkeypatch.setattr("aiohttp.ClientSession", _FailingSession)
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        with pytest.raises(UploadError, match="status 500"):
+            await UploadService.upload_voice(service, self._FakeVoice())
+
+
+class TestSendMessageAttachmentRetry:
+    async def test_succeeds_immediately_without_upload_error(self, adapter):
+        client, raw = adapter
+        resp = await client.send_message(20, "hello")
+        raw.send_message.assert_awaited_once()
+        assert resp["id"] == 123
+
+    async def test_retries_on_upload_error_then_succeeds(self, adapter):
+        client, raw = adapter
+        raw.send_message = AsyncMock(
+            side_effect=[
+                UploadError("Timed out waiting for video processing video_id=1"),
+                UploadError("Timed out waiting for video processing video_id=2"),
+                FakeModel(id=999, chatId=20),
+            ]
+        )
+
+        resp = await client.send_message(20, attaches=[object()])
+
+        assert raw.send_message.await_count == 3
+        assert resp["id"] == 999
+
+    async def test_gives_up_after_max_attempts(self, adapter):
+        client, raw = adapter
+        raw.send_message = AsyncMock(
+            side_effect=UploadError("Timed out waiting for video processing video_id=1")
+        )
+
+        resp = await client.send_message(20, attaches=[object()])
+
+        assert raw.send_message.await_count == _ATTACHMENT_READY_MAX_ATTEMPTS
+        assert "_max_error" in resp
+        assert "Timed out" in resp["_max_error"]["message"]
+
+    async def test_non_upload_error_fails_immediately_without_retry(self, adapter):
+        client, raw = adapter
+        raw.send_message = AsyncMock(side_effect=RuntimeError("connection lost"))
+
+        resp = await client.send_message(20, "hello")
+
+        raw.send_message.assert_awaited_once()
+        assert "_max_error" in resp
+        assert "connection lost" in resp["_max_error"]["message"]
