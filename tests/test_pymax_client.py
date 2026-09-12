@@ -690,7 +690,7 @@ class TestVoiceUploadUserAgentPatch:
             type(self).last_url = url
             return TestVoiceUploadUserAgentPatch._FakeResponse(200)
 
-    def _fake_upload_service(self):
+    def _fake_upload_service(self, header_user_agent=None, app_version=None):
         from types import SimpleNamespace
 
         response_payload = {
@@ -701,29 +701,56 @@ class TestVoiceUploadUserAgentPatch:
             config=SimpleNamespace(
                 upload_timeout=30,
                 proxy=None,
-                app_version="26.8.4",
+                # None on a web session — this is the Android client's field
+                app_version=app_version,
                 device=SimpleNamespace(
                     user_agent=SimpleNamespace(
-                        os_version="Linux", device_name="Chrome", screen="1080x1920 1.0x",
+                        os_version="Linux",
+                        device_name="Chrome",
+                        screen="1080x1920 1.0x",
+                        app_version="26.8.4",
+                        header_user_agent=header_user_agent,
                     )
                 ),
             ),
         )
         return SimpleNamespace(app=app)
 
-    async def test_sends_unquoted_user_agent_header(self, monkeypatch):
+    async def test_sends_the_sessions_own_browser_user_agent(self, monkeypatch):
+        """On a web session the browser User-Agent from the handshake is
+        the honest one to send; pymax instead sent its Android client's
+        OKMessages/{app_version}, where app_version is unset on web — so
+        the header went out as literal 'OKMessages/None' and MAX replied
+        BAD_REQUEST."""
+        browser_ua = "Mozilla/5.0 (X11; Linux x86_64) Chrome/147.0.0.0 Safari/537.36"
         _patch_voice_upload_user_agent()
         monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
 
-        service = self._fake_upload_service()
+        service = self._fake_upload_service(header_user_agent=browser_ua)
         from pymax.api.uploads.service import UploadService
 
         result = await UploadService.upload_voice(service, self._FakeVoice())
 
         sent_ua = self._FakeSession.last_headers["User-Agent"]
-        assert sent_ua == "OKMessages/26.8.4 (Linux; Chrome; 1080x1920 1.0x)"
+        assert sent_ua == browser_ua
+        assert "None" not in sent_ua
         assert "%20" not in sent_ua and "%28" not in sent_ua
         assert result.video_id == 42
+
+    async def test_falls_back_to_okmessages_with_a_real_version(self, monkeypatch):
+        """Without a browser User-Agent (mobile session) keep pymax's
+        OKMessages shape — but never emit 'None' as the version."""
+        _patch_voice_upload_user_agent()
+        monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
+
+        service = self._fake_upload_service(header_user_agent=None)
+        from pymax.api.uploads.service import UploadService
+
+        await UploadService.upload_voice(service, self._FakeVoice())
+
+        sent_ua = self._FakeSession.last_headers["User-Agent"]
+        assert sent_ua == "OKMessages/26.8.4 (Linux; Chrome; 1080x1920 1.0x)"
+        assert "None" not in sent_ua
 
     async def test_declares_an_audio_content_type(self, monkeypatch):
         """pymax sends application/octet-stream, leaving MAX's audio

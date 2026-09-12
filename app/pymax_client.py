@@ -231,6 +231,42 @@ def _audio_content_type(name: str) -> str:
     return _AUDIO_CONTENT_TYPES.get(f".{suffix}", "application/octet-stream")
 
 
+def _upload_user_agent(config) -> str:
+    """The ``User-Agent`` to send with an upload HTTP request.
+
+    pymax builds this as ``OKMessages/{config.app_version} (...)`` — the
+    shape its *Android* client uses. On a web session (which is what this
+    bridge runs) that is wrong twice over: ``config.app_version`` is the
+    Android-client field and is ``None`` there, so the header literally
+    went out as ``OKMessages/None (Linux; Chrome; ...)``, and a real web
+    client would send its browser User-Agent anyway. MAX answered such an
+    upload with ``{"error_code":"4","error_data":"BAD_REQUEST"}``.
+
+    So: send the same ``headerUserAgent`` the session already introduced
+    itself with during the handshake when there is one (web), and fall
+    back to the OKMessages form otherwise — with a version that actually
+    exists, preferring the user-agent payload's own ``app_version`` over
+    the possibly-unset client-level one.
+    """
+    user_agent = getattr(getattr(config, "device", None), "user_agent", None)
+
+    header_ua = getattr(user_agent, "header_user_agent", None)
+    if header_ua:
+        return header_ua
+
+    version = (
+        getattr(user_agent, "app_version", None)
+        or getattr(config, "app_version", None)
+        or ""
+    )
+    return (
+        f"OKMessages/{version}"
+        f" ({getattr(user_agent, 'os_version', '')};"
+        f" {getattr(user_agent, 'device_name', '')};"
+        f" {getattr(user_agent, 'screen', '')})"
+    )
+
+
 class VoiceRejectedByMax(UploadError):
     """MAX's server rejected the uploaded audio *itself* — as opposed to
     it merely not having finished processing yet.
@@ -283,12 +319,16 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
        a TODO saying as much). MAX does accept Opus, and a Telegram
        voice note already is Opus in an OGG container, so the codec was
        never the problem — only that nothing said so.
-    3. The ``User-Agent`` header is sent as-is instead of being run
+    3. **The ``User-Agent`` identifies this session honestly.** pymax
+       sends ``OKMessages/{config.app_version} (...)`` — its *Android*
+       client's shape — and on a web session that field is unset, so the
+       header went out as ``OKMessages/None (Linux; Chrome; ...)``, to
+       which MAX replied ``{"error_code":"4","error_data":"BAD_REQUEST"}``.
+       See ``_upload_user_agent``. It is also sent as-is rather than
        through ``urllib.parse.quote()``, which percent-escaped the
        spaces/parens/semicolons in it (a header value is not a URL
-       component). ``upload_video``/``upload_file`` send no such header
-       at all. This alone did not fix sending, but a mangled header is
-       still wrong to send.
+       component); ``upload_video``/``upload_file`` send no such header
+       at all.
 
     Otherwise a faithful copy of pymax 2.4.1's ``upload_voice``
     (maxapi-python), down to log messages and error handling. The upload
@@ -340,12 +380,7 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
         logger.exception("Failed to get voice size")
         raise UploadError("Failed to get voice size") from e
 
-    user_agent = (
-        f"OKMessages/{self.app.config.app_version}"
-        + f" ({self.app.config.device.user_agent.os_version};"
-        + f" {self.app.config.device.user_agent.device_name};"
-        + f" {self.app.config.device.user_agent.screen})"
-    )
+    user_agent = _upload_user_agent(self.app.config)
 
     headers = {
         "Content-Disposition": f"attachment; filename={quote(voice.name)}",
