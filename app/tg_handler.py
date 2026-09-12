@@ -820,6 +820,9 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("/bind denied for user_id=%s (not in allowed list)",
                     update.effective_user.id)
         return
+
+    args = context.args or []
+    if not args:
         await message.reply_text(
             "Использование: <code>/bind &lt;chat_id или https://web.max.ru/-...&gt; "
             "[название]</code>",
