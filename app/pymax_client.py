@@ -267,17 +267,37 @@ def _upload_user_agent(config) -> str:
     )
 
 
+# How the multipart file part is labelled, tried in this order. MAX's
+# audio endpoint is undocumented, so these are the plausible spellings
+# of the same Opus-in-OGG payload; see _voice_upload_variants.
+_VOICE_MULTIPART_LABELS = (
+    # field name, filename override, content-type override
+    # (None = take it from the recording itself)
+    ("file", None, None),
+    ("file", None, "audio/ogg; codecs=opus"),
+    ("file", "voice.opus", None),
+    ("file", "voice.oga", None),
+    ("audio", None, None),
+    ("voice", None, None),
+)
+
+
 def _voice_upload_variants():
     """The shapes to try when POSTing a voice recording to MAX, in order.
 
-    MAX's audio endpoint is undocumented and pymax's guess at it
-    (``Content-Range: bytes 0-N/M`` + raw body, copied from its video
-    upload) is rejected with ``{"error_code":"4","error_data":
-    "BAD_REQUEST"}`` — while the *file* upload, which works, sends the
-    range **without** the ``bytes `` prefix, and the *photo* upload uses
-    a multipart form instead. Rather than burn one deploy-and-check
-    round per guess, try the plausible shapes in one go and log which
-    one MAX accepts, so it can be settled on afterwards.
+    MAX's audio endpoint is undocumented, and a sweep in production
+    settled how the request must be framed: pymax posts the raw body
+    with a ``Content-Range`` (copied from its video upload), and MAX
+    answers every spelling of that with ``{"error_code":"4",
+    "error_data":"BAD_REQUEST"}`` — while a **multipart form** (how
+    pymax's working *photo* upload posts) instead gets
+    ``{"error_code":"1","error_data":"AUDIO_VALIDATION_FAILED"}``. A
+    different error means that request was understood and got as far as
+    inspecting the audio, so multipart is the right envelope.
+
+    What is left is how the part inside it is labelled, which is the
+    same guessing game one deploy at a time — so try the plausible
+    labels in one run and log which one MAX accepts.
 
     Yields ``(variant_name, build)``, where ``build(name, body, size,
     content_type, user_agent)`` returns the ``(headers, data)`` to post.
@@ -285,42 +305,21 @@ def _voice_upload_variants():
     replayed across requests.
     """
 
-    def _base(name, size, content_type, user_agent):
-        return {
-            "Content-Disposition": f"attachment; filename={quote(name)}",
-            "Content-Length": str(size),
-            "Connection": "keep-alive",
-            "Content-Type": content_type,
-            "User-Agent": user_agent,
-        }
+    def _make(field_name, filename_override, content_type_override):
+        def _build(name, body, size, content_type, user_agent):
+            filename = filename_override or name
+            ct = content_type_override or content_type
+            form = aiohttp.FormData()
+            form.add_field(name=field_name, value=body, filename=filename, content_type=ct)
+            return {"User-Agent": user_agent}, form
 
-    # How pymax's *file* upload (which works) formats the range.
-    def _file_style(name, body, size, content_type, user_agent):
-        headers = _base(name, size, content_type, user_agent)
-        headers["Content-Range"] = f"0-{size - 1}/{size}"
-        return headers, body
+        return _build
 
-    # A plain single-shot upload, no range at all.
-    def _no_range(name, body, size, content_type, user_agent):
-        return _base(name, size, content_type, user_agent), body
-
-    # What pymax currently sends for voice (copied from its video
-    # upload) — production logs show MAX rejecting it.
-    def _video_style(name, body, size, content_type, user_agent):
-        headers = _base(name, size, content_type, user_agent)
-        headers["Content-Range"] = f"bytes 0-{size - 1}/{size}"
-        return headers, body
-
-    # How pymax's *photo* upload (which works) sends its payload.
-    def _multipart(name, body, size, content_type, user_agent):
-        form = aiohttp.FormData()
-        form.add_field(name="file", value=body, filename=name, content_type=content_type)
-        return {"User-Agent": user_agent}, form
-
-    yield "range-without-bytes-prefix", _file_style
-    yield "no-content-range", _no_range
-    yield "range-with-bytes-prefix", _video_style
-    yield "multipart-form", _multipart
+    for field_name, filename_override, content_type_override in _VOICE_MULTIPART_LABELS:
+        label = f"{field_name}/{filename_override or '<name>'}/{content_type_override or '<type>'}"
+        yield f"multipart:{label}", _make(
+            field_name, filename_override, content_type_override
+        )
 
 
 async def _request_voice_upload_slot(app):

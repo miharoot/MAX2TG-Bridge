@@ -699,10 +699,13 @@ class TestVoiceUploadUserAgentPatch:
         async def __aexit__(self, *exc):
             return False
 
+        all_data: list = []
+
         def post(self, url, headers=None, data=None):
             type(self).last_headers = headers
             type(self).last_url = url
             type(self).all_headers = type(self).all_headers + [headers]
+            type(self).all_data = type(self).all_data + [data]
             return TestVoiceUploadUserAgentPatch._FakeResponse(200)
 
     def _fake_upload_service(self, header_user_agent=None, app_version=None):
@@ -767,12 +770,19 @@ class TestVoiceUploadUserAgentPatch:
         assert sent_ua == "OKMessages/26.8.4 (Linux; Chrome; 1080x1920 1.0x)"
         assert "None" not in sent_ua
 
+    @staticmethod
+    def _part_of(form):
+        """(field name, filename, content type) of a FormData's one part."""
+        options, headers, _value = form._fields[0]
+        return options["name"], options.get("filename"), headers.get("Content-Type")
+
     async def test_declares_an_audio_content_type(self, monkeypatch):
         """pymax sends application/octet-stream, leaving MAX's audio
-        validator nothing to identify the payload by — it then rejects
-        the upload outright (AUDIO_VALIDATION_FAILED). A Telegram voice
-        note is Opus in an OGG container, which MAX accepts."""
+        validator nothing to identify the payload by. A Telegram voice
+        note is Opus in an OGG container, which MAX accepts — so the
+        part is labelled from the recording itself."""
         _patch_voice_upload_user_agent()
+        self._FakeSession.all_data = []
         monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
 
         service = self._fake_upload_service()
@@ -780,7 +790,10 @@ class TestVoiceUploadUserAgentPatch:
 
         await UploadService.upload_voice(service, self._FakeVoice())
 
-        assert self._FakeSession.last_headers["Content-Type"] == "audio/ogg"
+        field, filename, content_type = self._part_of(self._FakeSession.all_data[0])
+        assert field == "file"
+        assert filename == "voice.ogg"
+        assert content_type == "audio/ogg"
 
     def test_audio_content_type_by_extension(self):
         from app.pymax_client import _audio_content_type
@@ -845,13 +858,16 @@ class TestVoiceUploadUserAgentPatch:
         assert calls["n"] == accepted_on_call
         assert result.video_id == 42
 
-    async def test_first_variant_matches_the_working_file_upload_shape(
-        self, monkeypatch
-    ):
-        """pymax's file upload works and formats the range without the
-        'bytes ' prefix; its voice upload copies the video shape (with
-        the prefix), which MAX rejects — so try the file shape first."""
+    async def test_posts_a_multipart_form_not_a_raw_body(self, monkeypatch):
+        """Settled in production: MAX answers every raw-body spelling
+        with BAD_REQUEST, and a multipart form (how pymax's working
+        photo upload posts) with AUDIO_VALIDATION_FAILED instead — a
+        different error means that request got understood and as far as
+        inspecting the audio, so multipart is the right envelope."""
+        import aiohttp as _aiohttp
+
         _patch_voice_upload_user_agent()
+        self._FakeSession.all_data = []
         self._FakeSession.all_headers = []
         monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
         service = self._fake_upload_service()
@@ -859,7 +875,36 @@ class TestVoiceUploadUserAgentPatch:
 
         await UploadService.upload_voice(service, self._FakeVoice())
 
-        assert self._FakeSession.all_headers[0]["Content-Range"] == "0-4/5"
+        assert isinstance(self._FakeSession.all_data[0], _aiohttp.FormData)
+        # a Content-Range on a multipart post is what MAX rejected
+        assert "Content-Range" not in self._FakeSession.all_headers[0]
+
+    async def test_variants_differ_in_how_the_part_is_labelled(self, monkeypatch):
+        """With the envelope settled, the remaining unknown is how MAX
+        wants the part labelled — so every variant must actually differ
+        in field name / filename / content type."""
+        class _RejectingSession(self._FakeSession):
+            def post(self, url, headers=None, data=None):
+                type(self).all_data = type(self).all_data + [data]
+                rejecting = TestVoiceUploadUserAgentPatch._FakeResponse(200)
+                rejecting.text = _AsyncReturn(
+                    '{"error_code":"1","error_data":"AUDIO_VALIDATION_FAILED"}'
+                )
+                return rejecting
+
+        _patch_voice_upload_user_agent()
+        _RejectingSession.all_data = []
+        monkeypatch.setattr("aiohttp.ClientSession", _RejectingSession)
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        with pytest.raises(UploadError):
+            await UploadService.upload_voice(service, self._FakeVoice())
+
+        labels = [self._part_of(form) for form in _RejectingSession.all_data]
+        assert len(labels) == len(set(labels))  # no duplicate attempts
+        assert ("file", "voice.opus", "audio/ogg") in labels
+        assert ("audio", "voice.ogg", "audio/ogg") in labels
 
     async def test_each_variant_gets_a_fresh_upload_slot(self, monkeypatch):
         """MAX burns the upload cid on a rejected POST, so replaying the
@@ -882,7 +927,8 @@ class TestVoiceUploadUserAgentPatch:
             await UploadService.upload_voice(service, self._FakeVoice())
 
         # one VIDEO_UPLOAD request per variant tried
-        assert service.app.invoke.await_count == 4
+        from app.pymax_client import _VOICE_MULTIPART_LABELS
+        assert service.app.invoke.await_count == len(_VOICE_MULTIPART_LABELS)
 
     async def test_a_dropped_connection_does_not_abandon_the_other_variants(
         self, monkeypatch
