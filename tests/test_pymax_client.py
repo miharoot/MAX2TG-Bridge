@@ -921,10 +921,39 @@ class TestVoiceUploadUserAgentPatch:
         # the untouched Telegram recording last, as the fallback
         assert labels[-1] == ("file", "voice.ogg", "audio/ogg")
 
+    def test_prefers_a_system_ffmpeg_over_the_bundled_wheel(self, monkeypatch):
+        """The imageio-ffmpeg wheel is glibc-linked and will not run on
+        the musl-based Docker image, where ffmpeg comes from apk."""
+        from app import pymax_client
+
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        assert pymax_client._ffmpeg_executable() == "/usr/bin/ffmpeg"
+
+    def test_falls_back_to_the_bundled_ffmpeg_wheel(self, monkeypatch):
+        """On a plain host install the wheel is what supplies ffmpeg."""
+        from app import pymax_client
+
+        fake_module = types.SimpleNamespace(
+            get_ffmpeg_exe=lambda: "/wheels/imageio_ffmpeg/ffmpeg-linux64"
+        )
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        monkeypatch.setitem(sys.modules, "imageio_ffmpeg", fake_module)
+
+        assert pymax_client._ffmpeg_executable() == "/wheels/imageio_ffmpeg/ffmpeg-linux64"
+
+    def test_reports_no_ffmpeg_when_neither_is_available(self, monkeypatch):
+        from app import pymax_client
+
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        monkeypatch.setitem(sys.modules, "imageio_ffmpeg", None)
+
+        assert pymax_client._ffmpeg_executable() is None
+
     async def test_without_ffmpeg_it_still_sends_the_original(self, monkeypatch):
         """A deployment without ffmpeg must not break outright — it just
         falls back to the untouched Telegram recording."""
         _patch_voice_upload_user_agent()
+        monkeypatch.setattr("app.pymax_client._ffmpeg_executable", lambda: None)
         self._FakeSession.all_data = []
         monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
         service = self._fake_upload_service()

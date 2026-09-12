@@ -308,6 +308,29 @@ _VOICE_UPLOAD_FORMATS = (
 )
 
 
+def _ffmpeg_executable() -> str | None:
+    """Path to an ffmpeg binary, or ``None`` if there isn't one.
+
+    Prefers a system ffmpeg: the ``imageio-ffmpeg`` wheel's binary is
+    glibc-linked and will not run on the musl-based Docker image, which
+    installs ffmpeg through apk instead. On a plain host install (no
+    container) the wheel is what supplies it.
+    """
+    import shutil
+
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        log.debug("imageio-ffmpeg could not provide an ffmpeg binary: %s", e)
+        return None
+
+
 async def _transcode_audio(body: bytes, args: list[str]) -> bytes | None:
     """Re-package audio with ffmpeg, or ``None`` if that isn't possible.
 
@@ -317,16 +340,21 @@ async def _transcode_audio(body: bytes, args: list[str]) -> bytes | None:
     """
     import asyncio
 
+    executable = _ffmpeg_executable()
+    if executable is None:
+        log.warning("ffmpeg is not available, sending the recording as-is")
+        return None
+
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            executable, "-hide_banner", "-loglevel", "error",
             "-i", "pipe:0", *args, "pipe:1",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except (FileNotFoundError, OSError) as e:
-        log.warning("ffmpeg is not available, sending the recording as-is: %s", e)
+        log.warning("ffmpeg could not be started, sending the recording as-is: %s", e)
         return None
 
     try:
