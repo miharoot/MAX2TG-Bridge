@@ -612,6 +612,31 @@ async def redeliver_tg_to_max_media(max_client, bot, payload: dict, max_upload_b
     )
 
 
+async def _on_unsupported_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Say so when an attachment type isn't routed to MAX.
+
+    Safety net for the failure mode that hid missing video_note support:
+    an attachment outside the media handler's filter never reached any
+    handler, so it vanished with no upload, no error and nothing in the
+    topic. Whatever is unsupported now (stickers, polls, dice, ...) at
+    least says so instead of disappearing.
+    """
+    target = _resolve_topic_target(update, context)
+    if not target:
+        return
+    message, max_chat_id, _max_client = target
+
+    attachment = message.effective_attachment
+    kind = type(attachment).__name__ if attachment is not None else "unknown"
+    log.warning(
+        "Unsupported Telegram attachment (%s) in topic for MAX chat %s — not forwarded",
+        kind, max_chat_id,
+    )
+    await message.reply_text(
+        "⚠️ Этот тип вложения мост пока не умеет отправлять в MAX."
+    )
+
+
 async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route a single medium or a complete Telegram album to one MAX message."""
     target = _resolve_topic_target(update, context)
@@ -1509,6 +1534,15 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
     )
     app.add_handler(
         MessageHandler(media_filter & chat_filter, _on_topic_media)
+    )
+    # Registered after the media handler, so anything it already covers
+    # never gets here — this only catches attachment types the bridge
+    # has no route for, which would otherwise vanish silently.
+    app.add_handler(
+        MessageHandler(
+            filters.ATTACHMENT & ~media_filter & chat_filter,
+            _on_unsupported_attachment,
+        )
     )
 
     return app

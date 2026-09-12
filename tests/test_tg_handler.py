@@ -540,6 +540,41 @@ class TestVoiceMessageUpload:
 
         assert media_handler.check_update(update)
 
+    async def test_unsupported_attachment_says_so_instead_of_vanishing(self):
+        """The safety net for the failure mode that hid missing
+        video_note support: no route must ever mean silence."""
+        from app.tg_handler import (
+            ALLOWED_USER_KEY,
+            MAX_CLIENT_KEY,
+            TOPIC_STORE_KEY,
+            _on_unsupported_attachment,
+        )
+
+        message = MagicMock()
+        message.chat_id = -100999
+        message.message_thread_id = 10
+        message.is_topic_message = True
+        message.reply_text = AsyncMock()
+        message.effective_attachment = MagicMock()
+        update = MagicMock()
+        update.message = message
+        update.effective_chat = MagicMock(id=-100999)
+        update.effective_user = MagicMock(id=1)
+
+        topic_store = MagicMock()
+        topic_store.chat_for_topic = MagicMock(return_value=42)
+        context = MagicMock()
+        context.bot_data = {
+            MAX_CLIENT_KEY: MagicMock(),
+            TOPIC_STORE_KEY: topic_store,
+            ALLOWED_USER_KEY: set(),
+        }
+
+        await _on_unsupported_attachment(update, context)
+
+        message.reply_text.assert_awaited_once()
+        assert "не умеет" in message.reply_text.await_args.args[0]
+
     async def test_upload_media_by_spec_sends_a_video_note_as_a_video_note(self):
         """MAX has its own round-video type, so these should not be
         flattened into a plain video."""
@@ -624,6 +659,70 @@ class TestVoiceMessageUpload:
         )
         max_client.outbox.remove.assert_awaited_once()
         message.reply_text.assert_not_called()  # no "не удалось" warning
+
+    async def test_full_document_reaches_max_send_message(self):
+        """Same end-to-end path for a plain file: spec -> download ->
+        upload_file -> one attachment in send_message. Telegram also sets
+        `document` for GIFs, so this is the route animations take too."""
+        message = MagicMock()
+        message.photo = None
+        message.voice = None
+        message.audio = None
+        message.document = MagicMock(
+            file_id="doc123", file_name="report.pdf", mime_type="application/pdf",
+        )
+        message.video = None
+        message.video_note = None
+        message.caption = "смотри"
+        message.caption_entities = []
+        message.reply_text = AsyncMock()
+        message.chat_id = -100999
+        message.message_thread_id = 10
+        message.message_id = 502
+
+        tg_file = MagicMock()
+        tg_file.file_size = 2000
+        tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"pdf-bytes"))
+        bot = AsyncMock()
+        bot.get_file = AsyncMock(return_value=tg_file)
+
+        sent_file_attach = MagicMock()
+        max_client = _make_max_client(send_message_return={"ok": True})
+        max_client.upload_file = AsyncMock(return_value=sent_file_attach)
+
+        await _send_topic_media_messages([message], 42, max_client, 10 * 1024 * 1024, bot)
+
+        max_client.upload_file.assert_awaited_once_with(
+            b"pdf-bytes", chat_id=42, filename="report.pdf",
+            mimetype="application/pdf",
+        )
+        max_client.send_message.assert_awaited_once_with(
+            42, text="смотри", elements=[], attaches=[sent_file_attach],
+        )
+        max_client.outbox.remove.assert_awaited_once()
+        message.reply_text.assert_not_called()
+
+    async def test_document_without_a_filename_still_uploads(self):
+        """Telegram omits file_name for some documents; the upload must
+        not break on it."""
+        spec = {"kind": "document", "file_id": "doc123",
+                "filename": None, "mimetype": None}
+
+        tg_file = MagicMock()
+        tg_file.file_size = 10
+        tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"x"))
+        bot = AsyncMock()
+        bot.get_file = AsyncMock(return_value=tg_file)
+
+        max_client = MagicMock()
+        max_client.upload_file = AsyncMock(return_value=MagicMock())
+
+        await _upload_media_by_spec(bot, spec, max_client, 42, 10 * 1024 * 1024)
+
+        max_client.upload_file.assert_awaited_once_with(
+            b"x", chat_id=42, filename="file",
+            mimetype="application/octet-stream",
+        )
 
 
 # ---------------------------------------------------------------------------
