@@ -1246,34 +1246,48 @@ class PyMaxClient:
             return {"_max_error": {
                 "message": "MAX ещё не сообщил мой собственный id — попробуйте позже",
             }}
-        # Bounded, and best-effort on purpose. MAX can simply never answer
-        # a lookup for someone who isn't a contact — observed against a
-        # live server: the request goes out ("fetching users count=1") and
-        # nothing comes back, which left /add waiting forever with the
-        # user staring at silence. The chat id needs no server at all, so
-        # a lookup that fails costs only the name.
+        # The name MAX already told us costs nothing to reuse: contacts and
+        # everyone sharing a chat with us are resolved at startup, so for
+        # most people this is the whole answer and no request is made.
+        title = ""
+        if self.resolver is not None:
+            cached = self.resolver.users.get(int(user_id))
+            if cached and cached != str(user_id):
+                title = cached
+
+        # Otherwise ask — bounded, and best-effort on purpose. MAX can
+        # simply never answer a lookup for a stranger: observed against a
+        # live server, the request goes out ("fetching users count=1") and
+        # nothing ever comes back, which left /add waiting forever with the
+        # user staring at silence. The chat id needs no server at all, so a
+        # lookup that fails costs only the name — and only until the first
+        # message arrives, when the topic is renamed to match MAX (see
+        # TelegramSender.ensure_topic, which treats a numeric title as a
+        # placeholder).
         user = None
-        try:
-            user = await asyncio.wait_for(
-                self._client.get_user(int(user_id)), timeout=USER_LOOKUP_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            log.warning("MAX did not answer a lookup for user %s in %ss; "
-                        "binding the dialog anyway", user_id, USER_LOOKUP_TIMEOUT)
-        except Exception:
-            log.exception("PyMax get_user failed for %s; binding the dialog anyway",
-                          user_id)
-        if user is None:
-            log.info("No profile came back for user %s — the dialog is still "
-                     "addressable, its topic just starts out named by id", user_id)
+        if not title:
+            try:
+                user = await asyncio.wait_for(
+                    self._client.get_user(int(user_id)), timeout=USER_LOOKUP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.warning("MAX did not answer a lookup for user %s in %ss; "
+                            "binding the dialog anyway", user_id, USER_LOOKUP_TIMEOUT)
+            except Exception:
+                log.exception("PyMax get_user failed for %s; binding the dialog anyway",
+                              user_id)
+            if user is None:
+                log.warning("MAX gave no name for user %s — the topic starts out "
+                            "named by id and is renamed on the first message",
+                            user_id)
 
         chat_id = self._client.get_chat_id(int(self._my_id), int(user_id))
         # The resolver already knows how MAX shapes a name ("names" array,
         # firstName/lastName, friendly, ...); ask the instance we're
         # holding rather than importing it or re-deriving the rules here.
-        title = str(user_id)
-        if user is not None and self.resolver is not None:
-            title = self.resolver._extract_name_from_contact(_user_to_dict(user)) or title
+        if not title and user is not None and self.resolver is not None:
+            title = self.resolver._extract_name_from_contact(_user_to_dict(user))
+        title = title or str(user_id)
         log.info("Resolved MAX profile link: user_id=%s (%r) → dialog chat_id=%s",
                  user_id, title, chat_id)
 
@@ -1292,14 +1306,25 @@ class PyMaxClient:
             },
         }
 
+    def _is_participant(self, chat: dict) -> bool:
+        """Whether we're already in this chat, per MAX's own participant list."""
+        participants = chat.get("participants") or {}
+        return any(str(key) == str(self._my_id) for key in participants)
+
     async def _resolve_link_via_max(self, link: str, join_error: Exception) -> dict:
         """Last resort for a link pymax itself can't classify: ask MAX.
 
         LINK_INFO is the opcode pymax uses behind resolve_group_by_link,
         but that method rejects anything without a ``join/`` token before
-        it ever reaches the wire, so the call is made directly here. If
-        MAX doesn't answer with a chat either, the *join* error is what
-        gets reported — it describes what the user actually typed.
+        it ever reaches the wire, so the call is made directly here.
+
+        Resolving is not joining, and /add exists to join — so the answer
+        is only accepted when MAX lists us among the chat's participants,
+        i.e. we're in it already and the refused join was redundant.
+        Binding a chat we never entered would hand back a topic that can
+        never receive a message, which is worse than the error. If MAX
+        answers with nothing, or with a chat we're not in, the *join*
+        error is reported: it describes what the user actually typed.
         """
         from pymax.api.chats.payloads import LinkInfoPayload
         from pymax.protocol import Opcode
@@ -1318,6 +1343,13 @@ class PyMaxClient:
             log.warning("LINK_INFO gave no chat for %s: %s",
                         _redact_url(link), str(payload)[:300])
             return {"_max_error": {"message": str(join_error)}}
+        if not self._is_participant(chat):
+            log.warning("LINK_INFO resolved %s to chat %s, but we are not in it — "
+                        "reporting the join failure instead of binding it",
+                        _redact_url(link), chat.get("id"))
+            return {"_max_error": {"message": str(join_error)}}
+        log.info("Already a member of chat %s; binding it despite the refused join",
+                 chat.get("id"))
         return {"chatId": chat["id"], "chat": chat}
 
     async def download_audio_url(

@@ -162,15 +162,31 @@ class TestJoinRefusedByMax:
         client._client._app.invoke = AsyncMock(return_value=response)
         return client
 
-    async def test_link_info_resolves_what_the_join_could_not(self):
+    async def test_a_chat_we_are_already_in_is_bound_despite_the_refused_join(self):
+        """MAX answers not.found for a chat you're already a member of.
+        Nothing needs joining there — the bind is what /add was after."""
         client = self._client_that_cannot_join(
-            link_info_chat={"id": -68192506787240, "type": "CHAT", "title": "Сотрудники"},
+            link_info_chat={"id": -68192506787240, "type": "CHAT",
+                            "title": "Сотрудники", "participants": {"100": 0}},
         )
 
         result = await client.open_by_link("https://max.ru/join/sometoken")
 
         assert result["chatId"] == -68192506787240
         client._client._app.invoke.assert_awaited_once()
+
+    async def test_a_chat_we_are_not_in_is_never_bound_without_joining(self):
+        """/add joins; resolving is not joining. A topic bound to a chat
+        we never entered could never receive a message, so the join
+        failure is reported instead."""
+        client = self._client_that_cannot_join(
+            link_info_chat={"id": -68192506787240, "type": "CHAT",
+                            "title": "Чужой чат", "participants": {"999": 0}},
+        )
+
+        result = await client.open_by_link("https://max.ru/join/sometoken")
+
+        assert "not.found" in result["_max_error"]["message"]
 
     async def test_the_join_error_is_what_gets_reported_when_that_fails_too(self):
         """It describes what the user actually typed; a LINK_INFO miss
@@ -180,3 +196,32 @@ class TestJoinRefusedByMax:
         result = await client.open_by_link("https://max.ru/join/sometoken")
 
         assert "not.found" in result["_max_error"]["message"]
+
+
+class TestTopicNameComesFromMax:
+    """The topic has to be called what the chat is called in MAX."""
+
+    async def test_a_name_max_already_gave_us_needs_no_lookup(self):
+        """Contacts and everyone sharing a chat with us are resolved at
+        startup — asking again would only risk the lookup that hangs."""
+        client = _client_with(my_id=100)
+        client.resolver = MagicMock()
+        client.resolver.users = {42: "Наринэ Ермилова"}
+
+        result = await client.open_dialog_with_user(42)
+
+        assert result["chat"]["title"] == "Наринэ Ермилова"
+        client._client.get_user.assert_not_awaited()
+
+    async def test_a_stranger_is_looked_up(self):
+        user = MagicMock()
+        client = _client_with(my_id=100, user=user)
+        client.resolver = MagicMock()
+        client.resolver.users = {}
+        client.resolver._extract_name_from_contact = MagicMock(return_value="Олег")
+
+        result = await client.open_dialog_with_user(42)
+
+        client._client.get_user.assert_awaited_once()
+        assert result["chat"]["title"] == "Олег"
+        assert client.resolver.users[42] == "Олег"
