@@ -921,12 +921,14 @@ def _extract_chat_id_from_open(resp: dict) -> int | None:
 
 
 async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Open a max.ru link (profile or chat invite) and bind it to a new topic.
+    """Join a MAX chat by link if we aren't in it, then bind it to a topic.
 
-    Usage: `/add https://max.ru/join/<token>` for a group/channel, or
-    `/add https://max.ru/id<digits>` for a person — the latter binds the
-    one-to-one chat with them (see PyMaxClient.open_by_link for how each
-    shape is resolved).
+    Usage: `/add https://max.ru/join/<token>` for an invitation, or
+    `/add https://max.ru/id<digits>_gos` for a public group/channel
+    handle — which binds straight away when we're subscribed already.
+    See PyMaxClient.open_by_link for how each is resolved. A one-to-one
+    chat has no link of its own: bind it by id with /bind (/list shows
+    them).
     """
     message = update.message
     if message is None:
@@ -953,8 +955,9 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not link.startswith(("http://", "https://")) or "max.ru/" not in link:
         await message.reply_text(
             "Использование: <code>/add https://max.ru/join/...</code> "
-            "(чат) или <code>/add https://max.ru/id123456789</code> "
-            "(личный чат с человеком)",
+            "(приглашение) или <code>/add https://max.ru/id..._gos</code> "
+            "(публичная ссылка группы/канала). Личные чаты привязываются "
+            "по id через <code>/bind</code> — см. <code>/list</code>.",
             parse_mode="HTML",
         )
         return
