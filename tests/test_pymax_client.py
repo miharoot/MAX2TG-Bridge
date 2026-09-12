@@ -637,6 +637,16 @@ class TestAttachmentWaitTimeoutPatch:
         assert MessageService._wait_for_upload_signal is not None
 
 
+class _AsyncReturn:
+    """Stand-in for an async method that just returns a fixed value."""
+
+    def __init__(self, value):
+        self._value = value
+
+    async def __call__(self):
+        return self._value
+
+
 class TestVoiceUploadUserAgentPatch:
     """pymax's upload_voice() hands MSG_SEND a video-pipeline token for
     an AUDIO attach, so MAX answers errors.process.attachment.video.
@@ -650,6 +660,9 @@ class TestVoiceUploadUserAgentPatch:
 
         async def size(self):
             return 5
+
+        async def read(self):
+            return b"12345"
 
         async def get_duration(self):
             return 1000
@@ -675,6 +688,7 @@ class TestVoiceUploadUserAgentPatch:
     class _FakeSession:
         last_headers = None
         last_url = None
+        all_headers: list = []
 
         def __init__(self, *args, **kwargs):
             pass
@@ -688,6 +702,7 @@ class TestVoiceUploadUserAgentPatch:
         def post(self, url, headers=None, data=None):
             type(self).last_headers = headers
             type(self).last_url = url
+            type(self).all_headers = type(self).all_headers + [headers]
             return TestVoiceUploadUserAgentPatch._FakeResponse(200)
 
     def _fake_upload_service(self, header_user_agent=None, app_version=None):
@@ -801,6 +816,51 @@ class TestVoiceUploadUserAgentPatch:
         from pymax.api.uploads.service import UploadService
         assert UploadService.upload_voice is not None
 
+    async def test_tries_upload_variants_until_one_is_accepted(self, monkeypatch):
+        """MAX's audio endpoint is undocumented and rejects pymax's guess
+        at it (BAD_REQUEST). Try the shapes its working file/photo
+        uploads use, in one run, rather than one deploy per guess."""
+        accepted_on_call = 2  # first variant rejected, second accepted
+        calls = {"n": 0}
+
+        class _PickySession(self._FakeSession):
+            def post(self, url, headers=None, data=None):
+                calls["n"] += 1
+                type(self).last_headers = headers
+                if calls["n"] < accepted_on_call:
+                    rejecting = TestVoiceUploadUserAgentPatch._FakeResponse(200)
+                    rejecting.text = _AsyncReturn(
+                        '{"error_code":"4","error_data":"BAD_REQUEST"}'
+                    )
+                    return rejecting
+                return TestVoiceUploadUserAgentPatch._FakeResponse(200)
+
+        _patch_voice_upload_user_agent()
+        monkeypatch.setattr("aiohttp.ClientSession", _PickySession)
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        result = await UploadService.upload_voice(service, self._FakeVoice())
+
+        assert calls["n"] == accepted_on_call
+        assert result.video_id == 42
+
+    async def test_first_variant_matches_the_working_file_upload_shape(
+        self, monkeypatch
+    ):
+        """pymax's file upload works and formats the range without the
+        'bytes ' prefix; its voice upload copies the video shape (with
+        the prefix), which MAX rejects — so try the file shape first."""
+        _patch_voice_upload_user_agent()
+        self._FakeSession.all_headers = []
+        monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        await UploadService.upload_voice(service, self._FakeVoice())
+
+        assert self._FakeSession.all_headers[0]["Content-Range"] == "0-4/5"
+
     async def test_rejected_audio_raises_immediately_not_as_a_timing_error(
         self, monkeypatch
     ):
@@ -837,8 +897,13 @@ class TestVoiceUploadUserAgentPatch:
         service = self._fake_upload_service()
         from pymax.api.uploads.service import UploadService
 
-        with pytest.raises(UploadError, match="status 500"):
+        from app.pymax_client import VoiceRejectedByMax
+
+        # A 5xx is transport trouble, not MAX's verdict on the recording,
+        # so it must stay a plain (retryable) UploadError.
+        with pytest.raises(UploadError, match="HTTP 500") as excinfo:
             await UploadService.upload_voice(service, self._FakeVoice())
+        assert not isinstance(excinfo.value, VoiceRejectedByMax)
 
 
 class TestSendMessageAttachmentRetry:

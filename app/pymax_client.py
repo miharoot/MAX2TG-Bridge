@@ -267,6 +267,48 @@ def _upload_user_agent(config) -> str:
     )
 
 
+def _voice_upload_attempts(name, body, size, content_type, user_agent):
+    """The shapes to try when POSTing a voice recording to MAX, in order.
+
+    MAX's audio endpoint is undocumented and pymax's guess at it
+    (``Content-Range: bytes 0-N/M`` + raw body, copied from its video
+    upload) is rejected with ``{"error_code":"4","error_data":
+    "BAD_REQUEST"}`` — while the *file* upload, which works, sends the
+    range **without** the ``bytes `` prefix, and the *photo* upload uses
+    a multipart form instead. Rather than burn one deploy-and-check
+    round per guess, try the plausible shapes in one go and log which
+    one MAX accepts, so it can be settled on afterwards.
+
+    Yields ``(variant_name, headers, data)``.
+    """
+    base = {
+        "Content-Disposition": f"attachment; filename={quote(name)}",
+        "Content-Length": str(size),
+        "Connection": "keep-alive",
+        "Content-Type": content_type,
+        "User-Agent": user_agent,
+    }
+
+    # How pymax's *file* upload (which works) formats the range.
+    yield "range-without-bytes-prefix", {
+        **base, "Content-Range": f"0-{size - 1}/{size}",
+    }, body
+
+    # A plain single-shot upload, no range at all.
+    yield "no-content-range", dict(base), body
+
+    # What pymax currently sends for voice (copied from video upload) —
+    # last, since production logs show MAX rejecting it.
+    yield "range-with-bytes-prefix", {
+        **base, "Content-Range": f"bytes 0-{size - 1}/{size}",
+    }, body
+
+    # How pymax's *photo* upload (which works) sends its payload.
+    form = aiohttp.FormData()
+    form.add_field(name="file", value=body, filename=name, content_type=content_type)
+    yield "multipart-form", {"User-Agent": user_agent}, form
+
+
 class VoiceRejectedByMax(UploadError):
     """MAX's server rejected the uploaded audio *itself* — as opposed to
     it merely not having finished processing yet.
@@ -381,76 +423,68 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
         raise UploadError("Failed to get voice size") from e
 
     user_agent = _upload_user_agent(self.app.config)
-
-    headers = {
-        "Content-Disposition": f"attachment; filename={quote(voice.name)}",
-        "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
-        "Content-Length": str(file_size),
-        "Connection": "keep-alive",
-        # pymax hardcodes application/octet-stream here, leaving MAX's
-        # audio validator nothing to go on — see this function's
-        # docstring. Telegram voice notes are Opus in an OGG container
-        # (a .oga file is just OGG), which MAX does accept, so name it.
-        "Content-Type": _audio_content_type(voice.name),
-        # pymax's own version wraps this in quote(), percent-escaping
-        # the header value as if it were a URL.
-        "User-Agent": user_agent,
-    }
-
-    logger.debug("Voice upload headers=%r url=%s", headers, _redact_url(upload_info.url))
-
+    content_type = _audio_content_type(voice.name)
     timeout = aiohttp.ClientTimeout(total=self.app.config.upload_timeout, sock_read=60)
     video_id = upload_info.video_id
+
+    try:
+        body_bytes = await voice.read()
+    except Exception as e:
+        logger.exception("Failed to read voice bytes")
+        raise UploadError("Failed to read voice bytes") from e
+
+    failures: list[str] = []
+    # A 200 whose body carries an error_code is MAX's verdict on the
+    # recording; anything else (5xx, a dropped connection) is transport
+    # trouble that may well succeed on a later attempt.
+    verdict_from_max = False
 
     try:
         async with aiohttp.ClientSession(
             timeout=timeout, proxy=self.app.config.proxy
         ) as session:
-            async with session.post(
-                url=upload_info.url,
-                headers=headers,
-                data=voice.iter_chunks(1024 * 1024),
-            ) as resp:
-                if resp.status != HTTPStatus.OK:
-                    logger.error(
-                        "Voice upload failed with status %s video_id=%s",
-                        resp.status, video_id,
-                    )
-                    raise UploadError(
-                        f"Voice upload failed with status {resp.status} video_id={video_id}"
-                    )
-
-                # MAX reports upload errors with an HTTP 200, so this
-                # body is the only place such a failure surfaces.
-                try:
-                    body = (await resp.text())[:500]
-                except Exception:
-                    body = "<unreadable>"
-
-                if "error_code" in body:
-                    logger.error(
-                        "MAX rejected the uploaded audio voice_id=%s response_body=%r",
-                        video_id, body,
-                    )
-                    raise VoiceRejectedByMax(
-                        f"MAX rejected the audio itself ({body}) — the recording never "
-                        f"becomes sendable, so retrying cannot help voice_id={video_id}"
-                    )
-
+            for name, headers, data in _voice_upload_attempts(
+                voice.name, body_bytes, file_size, content_type, user_agent
+            ):
                 logger.debug(
-                    "Voice upload complete voice_id=%s response_body=%r", video_id, body,
+                    "Voice upload attempt variant=%s headers=%r url=%s",
+                    name, headers, _redact_url(upload_info.url),
                 )
+                async with session.post(
+                    url=upload_info.url, headers=headers, data=data
+                ) as resp:
+                    # MAX reports upload errors with an HTTP 200, so the
+                    # body is the only place such a failure surfaces.
+                    try:
+                        body = (await resp.text())[:500]
+                    except Exception:
+                        body = "<unreadable>"
 
-                # Empty token on purpose — that is what makes pymax
-                # serialize this attach as {_type: AUDIO, audioId: ...}
-                # instead of naming a video-pipeline token MAX can never
-                # resolve. See this function's docstring.
-                return VoiceAttachPayload(
-                    video_id=video_id,
-                    token="",
-                    duration=await voice.get_duration(),
-                    wave=b"\x00" * 80,
-                )
+                    if resp.status != HTTPStatus.OK or "error_code" in body:
+                        logger.warning(
+                            "Voice upload variant=%s rejected: HTTP %s %r",
+                            name, resp.status, body,
+                        )
+                        failures.append(f"{name}: HTTP {resp.status} {body}")
+                        if resp.status == HTTPStatus.OK:
+                            verdict_from_max = True
+                        continue
+
+                    logger.info(
+                        "Voice upload accepted by MAX using variant=%s voice_id=%s",
+                        name, video_id,
+                    )
+
+                    # Empty token on purpose — that is what makes pymax
+                    # serialize this attach as {_type: AUDIO, audioId: ...}
+                    # instead of naming a video-pipeline token MAX can
+                    # never resolve. See this function's docstring.
+                    return VoiceAttachPayload(
+                        video_id=video_id,
+                        token="",
+                        duration=await voice.get_duration(),
+                        wave=b"\x00" * 80,
+                    )
 
     except UploadError:
         raise
@@ -463,6 +497,21 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
     except Exception as e:
         logger.exception("Unexpected error during voice upload voice_id=%s", video_id)
         raise UploadError(f"Unexpected error during voice upload voice_id={video_id}") from e
+
+    detail = "; ".join(failures)
+    logger.error(
+        "Voice upload failed in every variant voice_id=%s: %s", video_id, detail,
+    )
+    if verdict_from_max:
+        raise VoiceRejectedByMax(
+            f"MAX rejected the audio upload in all {len(failures)} variants "
+            f"({detail}) voice_id={video_id}"
+        )
+    # Never got a verdict out of MAX — transport trouble, worth retrying.
+    raise UploadError(
+        f"Voice upload failed in all {len(failures)} variants ({detail}) "
+        f"voice_id={video_id}"
+    )
 
 
 def _patch_voice_upload_user_agent() -> None:
