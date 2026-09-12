@@ -24,7 +24,7 @@
 
 Переменные: `MAX_PYMAX_AUTH=qr|sms`, `MAX_PHONE` для SMS, опциональные `MAX_2FA_PASSWORD`, `MAX_PYMAX_WORK_DIR`, `MAX_PYMAX_SESSION_NAME`. Сессия находится в `state/pymax` и должна сохраняться между рестартами.
 
-Используются нативные `Photo`, `Video`, `Voice` и `File`. Telegram-альбом собирается по `media_group_id` и отправляется одним сообщением MAX. MAX-вложения группируются в Telegram media group до 10 элементов. Чаты из `MAX_CHAT_IDS`, отсутствующие в incremental sync, догружаются через PyMax.
+Используются нативные `Photo`, `Video`, `Voice` и `File`. Голосовые TG → MAX перед загрузкой перекодируются через ffmpeg (`imageio-ffmpeg` в зависимостях) — см. патч `upload_voice` в «Известных ограничениях». Telegram-альбом собирается по `media_group_id` и отправляется одним сообщением MAX. MAX-вложения группируются в Telegram media group до 10 элементов. Чаты из `MAX_CHAT_IDS`, отсутствующие в incremental sync, догружаются через PyMax.
 
 Read-события (`on_message_read`) и реакции (`on_reaction_update`) из PyMax смэплены на `MaxReadEvent`/`MaxReactionEvent` в `app/pymax_client.py` — отметки «прочитано» ставятся ✅-реакцией на последнее пересланное сообщение, реакции идут отдельной строкой в топике.
 
@@ -48,7 +48,12 @@ Read-события (`on_message_read`) и реакции (`on_reaction_update`)
 - Phone/about могут отсутствовать в ответах MAX.
 - PyMax использует неофициальный внутренний API MAX и может ломаться при изменениях протокола.
 - Реакции MAX → TG не привязаны к конкретному сообщению (нет карты MAX message_id ↔ TG message_id) — идут отдельной строкой в топике.
-- `app/pymax_client.py` при создании клиента патчит две вещи в `pymax`, обе связаны с тем, что голосовые грузятся через video-пайплайн:
+- `app/pymax_client.py` при создании клиента патчит `upload_voice` целиком (`_patch_voice_upload_user_agent`) — апстримная версия отправляет голосовые так, что MAX их молча отвергает (см. [PyMax#103](https://github.com/MaxApiTeam/PyMax/issues/103)). Установлено перебором против живого сервера, все три части обязательны:
+  - **multipart-форма**, а не сырое тело с `Content-Range` (скопировано апстримом с video-загрузки) — на любое сырое тело MAX отвечает `BAD_REQUEST`;
+  - **`audioId`**, а не token из video-пайплайна: `VoiceAttachPayload` с пустым token сериализуется в `{_type: AUDIO, audioId: ...}` (в апстриме эта ветка — мёртвый код, т.к. token проставляется всегда), иначе MAX резолвит токен как видео и отвечает `errors.process.attachment.video.not.ready` навсегда;
+  - **перекодирование через ffmpeg** в Opus 48 кГц моно (`_VOICE_UPLOAD_FORMATS`): телеграмовский файл — уже Opus в OGG, но MAX бракует его с `AUDIO_VALIDATION_FAILED` (и WebM-ремукс тоже); дело не в контейнере, а в параметрах записи. ffmpeg берётся системный, иначе из пакета `imageio-ffmpeg`; без него отправляется оригинал.
+  Ошибки загрузки MAX отдаёт **с HTTP 200** в теле ответа — апстрим его не читает, из-за чего отказ годами выглядел как таймаут обработки. Тело логируется.
+- Ещё два патча связаны с тем, что голосовые грузятся через video-пайплайн:
   - `pymax.exceptions.ApiError.__init__` (`_patch_api_error_not_ready_matching`) — обходит баг, из-за которого встроенный retry на `attachment.not.ready` не срабатывал для реальных кодов вида `errors.process.attachment.video.not.ready`.
   - `pymax.dispatch.mapping.EVENT_MAP[Opcode.NOTIF_ATTACH]` (`_patch_voice_ready_resolution`) — обходит баг классификации: уведомление о готовности голосового содержит и `videoId`, и `audioId`, но резолвер проверяет video-сигнал первым и всегда ошибочно принимает голосовое за видео, из-за чего wait в `_process_attachment_error` никогда не резолвится и падает по таймауту (60с).
   Оба патча идемпотентны и безвредны, если апстрим это когда-нибудь починит — можно оставить или убрать.

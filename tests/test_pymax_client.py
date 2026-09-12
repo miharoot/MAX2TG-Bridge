@@ -889,10 +889,10 @@ class TestVoiceUploadUserAgentPatch:
         assert "Content-Range" not in self._FakeSession.all_headers[0]
 
     async def test_variants_repackage_the_recording(self, monkeypatch):
-        """Labelling is ruled out (every spelling got the same
-        AUDIO_VALIDATION_FAILED), so what varies now is the container —
-        starting with a WebM/Opus remux, which is what MAX's own web
-        client records and costs no re-encoding."""
+        """MAX refuses Telegram's own recording however it is framed or
+        labelled, and refuses a WebM remux too, but accepts the same
+        audio re-encoded to 48 kHz mono Opus — so that is the normal
+        path, with the untouched file kept as the no-ffmpeg fallback."""
         class _RejectingSession(self._FakeSession):
             def post(self, url, headers=None, data=None):
                 type(self).all_data = type(self).all_data + [data]
@@ -914,12 +914,14 @@ class TestVoiceUploadUserAgentPatch:
 
         from app.pymax_client import _VOICE_UPLOAD_FORMATS
 
+        bodies = [form._fields[0][2] for form in _RejectingSession.all_data]
         labels = [self._part_of(form) for form in _RejectingSession.all_data]
         assert len(labels) == len(_VOICE_UPLOAD_FORMATS)
-        # remux first — same Opus, just MAX's container, no quality loss
-        assert labels[0] == ("file", "voice.webm", "audio/webm")
-        # the untouched Telegram recording last, as the fallback
-        assert labels[-1] == ("file", "voice.ogg", "audio/ogg")
+        # the re-encode MAX accepts goes first...
+        assert labels[0] == ("file", "voice.ogg", "audio/ogg")
+        assert bodies[0].startswith(b"transcoded:")
+        # ...and the untouched Telegram recording is only the fallback
+        assert bodies[-1] == b"12345"
 
     def test_prefers_a_system_ffmpeg_over_the_bundled_wheel(self, monkeypatch):
         """The imageio-ffmpeg wheel is glibc-linked and will not run on

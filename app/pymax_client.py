@@ -275,34 +275,20 @@ def _upload_user_agent(config) -> str:
 # (variant name, ffmpeg arguments, filename, content type); ffmpeg args
 # of None means "send the Telegram file untouched".
 #
-# Telegram voice notes are Opus in an OGG container, which MAX rejects
-# with AUDIO_VALIDATION_FAILED however the upload is labelled (settled
-# by an earlier sweep over field names, filenames and content types).
-# MAX's own web client records voice through MediaRecorder, which in
-# Chrome produces WebM/Opus — the same Opus stream in a different
-# container, so remuxing costs nothing and is tried first.
+# Settled against the live MAX server. Telegram voice notes are already
+# Opus in an OGG container, yet MAX answers AUDIO_VALIDATION_FAILED for
+# them however the upload is framed or labelled — and equally for a
+# WebM/Opus remux or re-encode. What it does accept is the same audio
+# re-encoded to plain 48 kHz mono Opus, so the container was never the
+# problem: MAX objects to something about how Telegram encodes its
+# recordings. Re-encoding is therefore the normal path, with the
+# untouched file left as the fallback for hosts with no ffmpeg.
 _VOICE_UPLOAD_FORMATS = (
-    ("webm-opus-remux", ["-c:a", "copy", "-f", "webm"], "voice.webm", "audio/webm"),
-    (
-        "webm-opus-reencode",
-        ["-c:a", "libopus", "-b:a", "32k", "-ar", "48000", "-ac", "1", "-f", "webm"],
-        "voice.webm",
-        "audio/webm",
-    ),
     (
         "ogg-opus-reencode",
         ["-c:a", "libopus", "-b:a", "32k", "-ar", "48000", "-ac", "1", "-f", "ogg"],
         "voice.ogg",
         "audio/ogg",
-    ),
-    (
-        "m4a-aac",
-        [
-            "-c:a", "aac", "-b:a", "64k", "-ar", "44100", "-ac", "1",
-            "-movflags", "frag_keyframe+empty_moov", "-f", "mp4",
-        ],
-        "voice.m4a",
-        "audio/mp4",
     ),
     ("original-ogg", None, None, None),
 )
@@ -389,11 +375,10 @@ async def _voice_upload_variants(name, body, content_type):
 
     The *labelling* is ruled out too: every field name / filename /
     content-type spelling of the multipart part gets the same
-    AUDIO_VALIDATION_FAILED. So what MAX objects to is the recording
-    itself — Telegram sends Opus in an OGG container, while MAX's own
-    web client records through MediaRecorder, which in Chrome produces
-    WebM/Opus. Same codec, different container, so try a remux first
-    (no re-encoding, no quality loss) before anything lossy.
+    AUDIO_VALIDATION_FAILED. What MAX objects to is the recording
+    itself — and not its container either, since a WebM/Opus remux and
+    re-encode are refused just the same while plain 48 kHz mono Opus
+    back in OGG is accepted. See ``_VOICE_UPLOAD_FORMATS``.
 
     Yields ``(variant_name, form)``. Yielding is lazy on purpose: each
     variant may have to shell out to ffmpeg, and there is no point
