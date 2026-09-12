@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import re
 import logging
 import time
 from collections import OrderedDict
@@ -632,6 +633,21 @@ def _is_allowed_download_url(url: str) -> bool:
     )
 
 
+# Some max.ru links carry digits that *may* be a user id
+# (https://max.ru/id123456789). May, not do: a public group or channel
+# handle looks exactly the same — https://max.ru/id6633015816_gos is a
+# channel — so this is a hint to check with MAX, never a conclusion. What
+# settles it is whether MAX knows a user by that id; see
+# PyMaxClient.open_dialog_with_user, which refuses to bind without that.
+_PROFILE_LINK_RE = re.compile(r"^https?://(?:web\.)?max\.ru/id(\d+)\w*/?$", re.IGNORECASE)
+
+
+def _user_id_in_link(link: str) -> int | None:
+    """The digits a max.ru/id… link carries, if it has that shape."""
+    match = _PROFILE_LINK_RE.match((link or "").strip())
+    return int(match.group(1)) if match else None
+
+
 def _normalized_link(link: str) -> str:
     """A max.ru link reduced to what identifies it, for comparison."""
     text = (link or "").strip().lower().rstrip("/")
@@ -1212,6 +1228,11 @@ class PyMaxClient:
            it looks for that literal ``join/`` and refuses anything else.
         3. **Anything left** is put to MAX itself via LINK_INFO, which is
            how a client resolves a link it can't read on its own.
+        4. **A person, finally.** If the link carries digits that could be
+           a user id and MAX confirms a user by that id, the one-to-one
+           chat with them is bound — derived, not joined. Last, because
+           the same shape is also how public chats are addressed, and
+           only on MAX's confirmation, which is what tells the two apart.
         """
         known = self._known_chat_by_link(link)
         if known is not None:
@@ -1227,7 +1248,7 @@ class PyMaxClient:
             except Exception as exc:
                 log.warning("PyMax join failed for %s: %s — asking MAX to resolve it",
                             _redact_url(link), exc)
-                return await self._resolve_link_via_max(link, exc)
+                return await self._unjoinable(link, exc)
         except Exception as exc:
             # MAX itself refused the join — "not.found" being the common
             # one, which it also answers for a chat you are already in.
@@ -1235,8 +1256,101 @@ class PyMaxClient:
             # exactly what /add wants: a chat id to bind, not membership.
             log.warning("PyMax join rejected for %s: %s — asking MAX to resolve it",
                         _redact_url(link), exc)
-            return await self._resolve_link_via_max(link, exc)
+            return await self._unjoinable(link, exc)
         return {"chatId": getattr(chat, "id", None), "chat": _chat_to_dict(chat)}
+
+    async def _unjoinable(self, link: str, join_error: Exception) -> dict:
+        """A link we couldn't join: ask MAX about the chat, then the person.
+
+        Order matters. A chat is the common case and LINK_INFO answers
+        for it directly; only if that finds nothing do the digits in the
+        link get their chance, and then only if MAX confirms a user.
+        """
+        resolved = await self._resolve_link_via_max(link, join_error)
+        if "_max_error" not in resolved:
+            return resolved
+
+        user_id = _user_id_in_link(link)
+        if user_id is None:
+            return resolved
+        dialog = await self.open_dialog_with_user(user_id)
+        if "_max_error" not in dialog:
+            return dialog
+        log.info("Link %s looked like a profile, but MAX knows no user %s",
+                 _redact_url(link), user_id)
+        return resolved
+
+    async def open_dialog_with_user(self, user_id: int) -> dict:
+        """Address the one-to-one chat with a MAX user by their id.
+
+        A DM is not joined, it is derived: MAX's id for the chat between
+        two people is the XOR of their user ids, computed locally by
+        pymax's ``get_chat_id`` with no request at all — checked against
+        live dialogs, it holds exactly.
+
+        So the one thing worth asking the server is whether the person
+        exists, and that answer is required, not decorative: the digits
+        in a link are just as likely to belong to a public channel
+        (max.ru/id6633015816_gos is one), and MAX answers a lookup for
+        those with an empty list. Binding on a guess produced a topic
+        wired to a chat that could never receive anything.
+
+        Returns the same shape as open_by_link, so callers need no
+        special case.
+        """
+        if self._my_id is None:
+            return {"_max_error": {
+                "message": "MAX ещё не сообщил мой собственный id — попробуйте позже",
+            }}
+
+        # A name MAX already gave us is itself proof the person exists,
+        # and costs nothing: contacts and everyone sharing a chat with us
+        # are resolved at startup.
+        title = ""
+        if self.resolver is not None:
+            cached = self.resolver.users.get(int(user_id))
+            if cached and cached != str(user_id):
+                title = cached
+
+        user = None
+        if not title:
+            # Bounded: MAX can leave a lookup unanswered indefinitely.
+            try:
+                user = await asyncio.wait_for(
+                    self._client.get_user(int(user_id)), timeout=USER_LOOKUP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.warning("MAX did not answer a lookup for user %s in %ss",
+                            user_id, USER_LOOKUP_TIMEOUT)
+            except Exception:
+                log.exception("PyMax get_user failed for %s", user_id)
+            if user is None:
+                return {"_max_error": {
+                    "message": f"MAX не знает пользователя {user_id}",
+                }}
+            if self.resolver is not None:
+                # The resolver already knows how MAX shapes a name (the
+                # "names" array, firstName/lastName, friendly, ...).
+                title = self.resolver._extract_name_from_contact(_user_to_dict(user))
+
+        chat_id = self._client.get_chat_id(int(self._my_id), int(user_id))
+        log.info("MAX user %s (%r) → dialog chat_id=%s",
+                 user_id, title or "no name yet", chat_id)
+
+        if title and self.resolver is not None:
+            self.resolver.users[int(user_id)] = title
+
+        chat = {
+            "id": chat_id,
+            "type": "DIALOG",
+            "participants": {str(self._my_id): 0, str(user_id): 0},
+        }
+        # Only a real name goes in. A stand-in id would look like a title
+        # downstream and suppress the naming others would do — /add's own
+        # peer lookup, and ensure_topic's rename once MAX says who this is.
+        if title:
+            chat["title"] = title
+        return {"chatId": chat_id, "chat": chat}
 
     def _known_chat_by_link(self, link: str) -> dict | None:
         """A chat from our own list whose invite link is this one.

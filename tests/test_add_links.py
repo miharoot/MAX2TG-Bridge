@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.pymax_client import PyMaxClient, _normalized_link
+from app.pymax_client import PyMaxClient, _normalized_link, _user_id_in_link
 
 
 class TestLinkNormalisation:
@@ -203,3 +203,123 @@ class TestContactLookupIsBounded:
         result = await client.fetch_contacts([42])
 
         assert len(result["contacts"]) == 1
+
+
+class TestOpeningADialogWithAPerson:
+    """A dialog is derived, not joined: MAX's id for the chat between two
+    people is the XOR of their user ids — checked against live dialogs,
+    it holds exactly. What must come from the server is whether the
+    person exists at all."""
+
+    def _client_for_dialog(self, user=None, cached_name=None):
+        client = _client_with()
+        client._client.get_user = AsyncMock(return_value=user)
+        client._client.get_chat_id = MagicMock(side_effect=lambda a, b: a ^ b)
+        client.resolver.users = {42: cached_name} if cached_name else {}
+        client.resolver._extract_name_from_contact = MagicMock(return_value="Олег")
+        return client
+
+    async def test_the_dialog_id_is_derived_from_both_participants(self):
+        client = self._client_for_dialog(user=MagicMock())
+
+        result = await client.open_dialog_with_user(42)
+
+        assert result["chatId"] == 100 ^ 42
+        assert result["chat"]["type"] == "DIALOG"
+        assert result["chat"]["title"] == "Олег"
+
+    async def test_a_user_max_does_not_know_is_refused(self):
+        """The check that tells a person from a public channel handle:
+        MAX answers a lookup for channel digits with an empty list, and
+        binding on the guess produced a topic wired to nothing."""
+        client = self._client_for_dialog(user=None)
+
+        result = await client.open_dialog_with_user(6633015816)
+
+        assert "chatId" not in result
+        assert "6633015816" in result["_max_error"]["message"]
+
+    async def test_a_name_we_already_have_is_proof_enough(self):
+        client = self._client_for_dialog(cached_name="Наринэ Ермилова")
+
+        result = await client.open_dialog_with_user(42)
+
+        assert result["chat"]["title"] == "Наринэ Ермилова"
+        client._client.get_user.assert_not_awaited()
+
+    async def test_it_waits_until_max_has_told_us_who_we_are(self):
+        client = self._client_for_dialog(user=MagicMock())
+        client._my_id = None
+
+        result = await client.open_dialog_with_user(42)
+
+        assert "chatId" not in result
+        client._client.get_user.assert_not_awaited()
+
+    async def test_a_lookup_that_never_answers_refuses_rather_than_hangs(self, monkeypatch):
+        monkeypatch.setattr("app.pymax_client.USER_LOOKUP_TIMEOUT", 0.01)
+        client = self._client_for_dialog()
+
+        async def _never_answers(_user_id):
+            await asyncio.sleep(3600)
+
+        client._client.get_user = _never_answers
+
+        result = await asyncio.wait_for(client.open_dialog_with_user(42), timeout=5)
+
+        assert "chatId" not in result
+
+
+class TestAProfileLinkIsOnlyAHint:
+    @pytest.mark.parametrize("link,expected", [
+        ("https://max.ru/id42", 42),
+        ("https://max.ru/id6633015816_gos", 6633015816),
+        ("https://web.max.ru/id42/", 42),
+        ("https://max.ru/join/abc", None),
+        ("https://max.ru/username", None),
+        ("", None),
+    ])
+    def test_it_reads_the_digits_without_concluding_anything(self, link, expected):
+        assert _user_id_in_link(link) == expected
+
+    async def test_a_person_is_tried_only_after_the_chat_paths_fail(self):
+        """The channel handle that started this: both link and dialog
+        shapes match it, and only the chat reading is right."""
+        client = _client_with({-69369957050939: CHANNEL})
+        client._client.get_user = AsyncMock(return_value=MagicMock())
+        client._client.get_chat_id = MagicMock(side_effect=lambda a, b: a ^ b)
+
+        result = await client.open_by_link("https://max.ru/id6633015816_gos")
+
+        assert result["chatId"] == -69369957050939   # the channel, not a dialog
+        client._client.get_user.assert_not_awaited()
+
+    async def test_an_unknown_link_falls_through_to_the_person(self):
+        client = _client_with()
+        client._client.join_group = AsyncMock(side_effect=RuntimeError("не найдено"))
+        response = MagicMock()
+        response.payload = {}
+        client._client._app = MagicMock()
+        client._client._app.invoke = AsyncMock(return_value=response)
+        client._client.get_user = AsyncMock(return_value=MagicMock())
+        client._client.get_chat_id = MagicMock(side_effect=lambda a, b: a ^ b)
+        client.resolver.users = {}
+        client.resolver._extract_name_from_contact = MagicMock(return_value="Олег")
+
+        result = await client.open_by_link("https://max.ru/id42")
+
+        assert result["chatId"] == 100 ^ 42
+
+    async def test_when_max_knows_neither_the_join_error_is_reported(self):
+        client = _client_with()
+        client._client.join_group = AsyncMock(side_effect=RuntimeError("не найдено"))
+        response = MagicMock()
+        response.payload = {}
+        client._client._app = MagicMock()
+        client._client._app.invoke = AsyncMock(return_value=response)
+        client._client.get_user = AsyncMock(return_value=None)
+        client.resolver.users = {}
+
+        result = await client.open_by_link("https://max.ru/id6633015816_gos")
+
+        assert "не найдено" in result["_max_error"]["message"]

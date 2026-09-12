@@ -927,8 +927,8 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     `/add https://max.ru/id<digits>_gos` for a public group/channel
     handle — which binds straight away when we're subscribed already.
     See PyMaxClient.open_by_link for how each is resolved. A one-to-one
-    chat has no link of its own: bind it by id with /bind (/list shows
-    them).
+    chat has no link to paste, so `/add <user id>` takes the person's id
+    instead and derives their dialog.
     """
     message = update.message
     if message is None:
@@ -943,8 +943,9 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("/add denied for user_id=%s (not in allowed list)",
                     update.effective_user.id)
         return
-    # Primary source: the command argument itself (`/add <link>`).
-    link = context.args[0] if context.args else ""
+    # Primary source: the command argument itself (`/add <link-or-id>`).
+    args = context.args or []
+    link = args[0] if args else ""
     # Try to extract a max.ru link from anywhere in the message text too,
     # so `/add` works if the link was just pasted alongside the command.
     if not link.startswith(("http://", "https://")) and message.text:
@@ -952,20 +953,34 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if m:
             link = m.group(0)
 
-    if not link.startswith(("http://", "https://")) or "max.ru/" not in link:
+    # A bare positive number is a user id: the dialog with that person
+    # has no link of its own to paste, and its chat id is derived from
+    # the two participants rather than looked up (see
+    # PyMaxClient.open_dialog_with_user). Negative numbers are group and
+    # channel ids, which /bind takes.
+    user_id = None
+    if not link and args and args[0].isdigit():
+        user_id = int(args[0])
+
+    if user_id is None and (not link.startswith(("http://", "https://"))
+                            or "max.ru/" not in link):
         await message.reply_text(
             "Использование: <code>/add https://max.ru/join/...</code> "
-            "(приглашение) или <code>/add https://max.ru/id..._gos</code> "
-            "(публичная ссылка группы/канала). Личные чаты привязываются "
-            "по id через <code>/bind</code> — см. <code>/list</code>.",
+            "(приглашение), <code>/add https://max.ru/id..._gos</code> "
+            "(публичная ссылка группы/канала) или <code>/add &lt;id "
+            "пользователя&gt;</code> (личный чат с человеком).",
             parse_mode="HTML",
         )
         return
 
     max_client: PyMaxClient = context.bot_data[MAX_CLIENT_KEY]
-    log.info("/add: opening link %s", link)
     try:
-        resp = await max_client.open_by_link(link)
+        if user_id is not None:
+            log.info("/add: opening dialog with MAX user %s", user_id)
+            resp = await max_client.open_dialog_with_user(user_id)
+        else:
+            log.info("/add: opening link %s", link)
+            resp = await max_client.open_by_link(link)
     except Exception as exc:
         log.exception("open_by_link failed")
         await message.reply_text(f"⚠️ Ошибка при обращении к MAX: {exc}")
