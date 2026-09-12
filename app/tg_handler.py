@@ -920,6 +920,20 @@ def _extract_chat_id_from_open(resp: dict) -> int | None:
     return None
 
 
+def _chat_is_known(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    """Whether MAX has already told us about this chat.
+
+    Decides what a positive number means in /add: a dialog's chat id is
+    positive and so is a user id, so a number we hold as a chat is that
+    chat, and anything else is taken for a person.
+    """
+    max_client = context.bot_data.get(MAX_CLIENT_KEY)
+    resolver = getattr(max_client, "resolver", None)
+    if resolver is None:
+        return False
+    return chat_id in (resolver.chats_raw or {})
+
+
 async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Join a MAX chat by link if we aren't in it, then bind it to a topic.
 
@@ -929,7 +943,8 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     See PyMaxClient.open_by_link for how each is resolved. A one-to-one
     chat has no link to paste, so `/add +79991234567` (MAX resolves the
     number) or `/add <user id>` takes the person instead and derives
-    their dialog.
+    their dialog. `/add <chat id>` binds a chat straight off, like /bind:
+    there is nothing to join by id.
     """
     message = update.message
     if message is None:
@@ -945,46 +960,71 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     update.effective_user.id)
         return
     # Primary source: the command argument itself (`/add <link-or-id>`).
+    # Only an actual URL counts as the link — the argument is just as
+    # often an id or a phone number, and taking those for a link left
+    # their branches below unreachable.
     args = context.args or []
-    link = args[0] if args else ""
+    first = args[0] if args else ""
+    link = first if first.startswith(("http://", "https://")) else ""
     # Try to extract a max.ru link from anywhere in the message text too,
     # so `/add` works if the link was just pasted alongside the command.
-    if not link.startswith(("http://", "https://")) and message.text:
+    if not link and message.text:
         m = _MAX_LINK_RE.search(message.text)
         if m:
             link = m.group(0)
 
-    # A bare positive number is a user id: the dialog with that person
-    # has no link of its own to paste, and its chat id is derived from
-    # the two participants rather than looked up (see
-    # PyMaxClient.open_dialog_with_user). Negative numbers are group and
-    # channel ids, which /bind takes.
+    # Numbers, and what they mean. A leading + is a phone — the only
+    # thing separating one from an id, both being digits otherwise.
+    # A negative number is a group or channel: MAX numbers those below
+    # zero, and there's nothing to join by id anyway, so it binds exactly
+    # as /bind would. A positive number is a user id and the dialog with
+    # them is derived from the pair (PyMaxClient.open_dialog_with_user) —
+    # unless it names a chat we already know, since a dialog's own id is
+    # positive too and the chat we have beats the person we'd infer.
     user_id = None
     phone = None
+    known_chat_id = None
     if not link and args:
         argument = " ".join(args).strip()
         if _normalized_phone(argument) is not None:
-            # A leading + is the only thing separating a phone from a user
-            # id — both are otherwise just digits.
             phone = argument
-        elif args[0].isdigit():
-            user_id = int(args[0])
+        else:
+            parsed = _parse_max_chat_id(args[0])
+            if parsed is not None and parsed < 0:
+                known_chat_id = parsed
+            elif parsed is not None and _chat_is_known(context, parsed):
+                known_chat_id = parsed
+            elif parsed is not None:
+                user_id = parsed
 
-    if user_id is None and phone is None and (
-        not link.startswith(("http://", "https://")) or "max.ru/" not in link
-    ):
+    if (user_id is None and phone is None and known_chat_id is None
+            and (not link.startswith(("http://", "https://"))
+                 or "max.ru/" not in link)):
         await message.reply_text(
             "Использование: <code>/add https://max.ru/join/...</code> "
             "(приглашение), <code>/add https://max.ru/id..._gos</code> "
             "(публичная ссылка группы/канала), <code>/add +79991234567</code> "
-            "(по номеру телефона) или <code>/add &lt;id пользователя&gt;</code>.",
+            "(по номеру телефона), <code>/add &lt;id пользователя&gt;</code> "
+            "или <code>/add &lt;id чата&gt;</code>.",
             parse_mode="HTML",
         )
         return
 
     max_client: PyMaxClient = context.bot_data[MAX_CLIENT_KEY]
     try:
-        if phone is not None:
+        if known_chat_id is not None:
+            # Nothing to open: we have the id, and joining by id isn't a
+            # thing in MAX. Hand the rest of this function the same shape
+            # open_by_link would have returned, so binding, the title and
+            # the intro card all happen exactly as they do for a link.
+            log.info("/add: binding known MAX chat %s", known_chat_id)
+            resolver_now = getattr(max_client, "resolver", None)
+            chat_obj = None
+            if resolver_now is not None:
+                chat_obj = (resolver_now.chats_raw or {}).get(known_chat_id)
+            resp = {"chatId": known_chat_id,
+                    "chat": chat_obj if isinstance(chat_obj, dict) else {"id": known_chat_id}}
+        elif phone is not None:
             log.info("/add: looking up a MAX user by phone")
             resp = await max_client.open_dialog_by_phone(phone)
         elif user_id is not None:

@@ -16,6 +16,7 @@ from app.tg_handler import (
     MAX_CLIENT_KEY,
     SUPERGROUP_KEY,
     TOPIC_STORE_KEY,
+    _cmd_add,
     _cmd_bind,
     _cmd_list,
 )
@@ -210,3 +211,101 @@ class TestCmdList:
         await _cmd_list(update, ctx)
 
         assert "max.ru/join" not in "\n".join(_replies(update))
+
+
+class TestCmdAddWithAnId:
+    """/add takes what you have. A chat id has nothing to join — MAX joins
+    by link only — so it binds exactly as /bind would, while a positive
+    number nobody knows as a chat is read as a person."""
+
+    def _add_context(self, chats_raw=None, dialog_result=None):
+        ctx = _make_context(args=[])
+        max_client = ctx.bot_data[MAX_CLIENT_KEY]
+        resolver = MagicMock()
+        resolver.chats_raw = chats_raw or {}
+        resolver.chat_types = {}
+        # Faithful to the real resolver: chat_name reads .chats, which
+        # /add fills from the chat data before picking a title.
+        resolver.chats = {cid: chat.get("title") for cid, chat in (chats_raw or {}).items()
+                          if chat.get("title")}
+        resolver.is_dm = MagicMock(return_value=False)
+        resolver.chat_name = MagicMock(
+            side_effect=lambda cid: resolver.chats.get(cid, str(cid)))
+        max_client.resolver = resolver
+        max_client.open_by_link = AsyncMock(return_value={})
+        max_client.open_dialog_with_user = AsyncMock(
+            return_value=dialog_result or {"chatId": 6746666032, "chat": {"id": 6746666032}})
+        max_client.open_dialog_by_phone = AsyncMock(
+            return_value={"chatId": 7, "chat": {"id": 7}})
+        return ctx
+
+    async def _run(self, ctx, update):
+        await _cmd_add(update, ctx)
+
+    async def test_a_channel_id_is_bound_without_asking_max_anything(self):
+        update = _make_update("/add -69369957050939")
+        ctx = self._add_context(chats_raw={
+            -69369957050939: {"id": -69369957050939, "type": "CHANNEL", "title": "Малыш"},
+        })
+        ctx.args = ["-69369957050939"]
+
+        await self._run(ctx, update)
+
+        ctx.bot.create_forum_topic.assert_awaited_once_with(
+            chat_id=TG_CHAT_ID, name="Малыш")
+        ctx.bot_data[MAX_CLIENT_KEY].open_by_link.assert_not_awaited()
+
+    async def test_an_unknown_negative_id_still_binds(self):
+        """Same as /bind: a chat missing from the snapshot is bindable."""
+        update = _make_update("/add -42")
+        ctx = self._add_context()
+        ctx.args = ["-42"]
+
+        await self._run(ctx, update)
+
+        ctx.bot.create_forum_topic.assert_awaited_once()
+        ctx.bot_data[TOPIC_STORE_KEY].set_topic.assert_called_once()
+
+    async def test_a_known_positive_chat_id_binds_that_chat(self):
+        """A dialog's own id is positive too — the chat we hold wins over
+        the person we would otherwise infer from the same digits."""
+        update = _make_update("/add 418124176")
+        ctx = self._add_context(chats_raw={
+            418124176: {"id": 418124176, "type": "DIALOG", "title": "Наринэ"},
+        })
+        ctx.args = ["418124176"]
+
+        await self._run(ctx, update)
+
+        ctx.bot_data[MAX_CLIENT_KEY].open_dialog_with_user.assert_not_awaited()
+        ctx.bot_data[TOPIC_STORE_KEY].set_topic.assert_called_once_with(
+            418124176, TG_CHAT_ID, 10, "Наринэ")
+
+    async def test_an_unknown_positive_number_is_taken_for_a_person(self):
+        update = _make_update("/add 6633015816")
+        ctx = self._add_context()
+        ctx.args = ["6633015816"]
+
+        await self._run(ctx, update)
+
+        ctx.bot_data[MAX_CLIENT_KEY].open_dialog_with_user.assert_awaited_once_with(
+            6633015816)
+
+    async def test_a_phone_still_goes_to_the_phone_lookup(self):
+        update = _make_update("/add +7 999 123-45-67")
+        ctx = self._add_context()
+        ctx.args = ["+7", "999", "123-45-67"]
+
+        await self._run(ctx, update)
+
+        ctx.bot_data[MAX_CLIENT_KEY].open_dialog_by_phone.assert_awaited_once()
+        ctx.bot_data[MAX_CLIENT_KEY].open_dialog_with_user.assert_not_awaited()
+
+    async def test_nonsense_still_explains_the_usage(self):
+        update = _make_update("/add ерунда")
+        ctx = self._add_context()
+        ctx.args = ["ерунда"]
+
+        await self._run(ctx, update)
+
+        assert "Использование" in _replies(update)[0]
