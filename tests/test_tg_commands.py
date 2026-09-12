@@ -491,3 +491,78 @@ class TestDelMax:
         await _on_del_max_callback(update, ctx)
 
         ctx.bot_data[TOPIC_STORE_KEY].remove.assert_not_called()
+
+
+class TestDelByTopicId:
+    """/del <id> reaches a topic without entering it — the case being a
+    topic bound to a chat you're no longer in, which /list no longer
+    shows and which you'd otherwise have to hunt for."""
+
+    def _ctx(self, topics=None, bindings=None):
+        ctx = _make_context(args=[])
+        store = ctx.bot_data[TOPIC_STORE_KEY]
+        topics = topics or {}
+        bindings = bindings or {}
+        store.chat_for_topic = MagicMock(
+            side_effect=lambda cid, tid: topics.get((cid, tid)))
+        store.get_topic = MagicMock(side_effect=lambda mid: bindings.get(mid))
+        return ctx
+
+    async def test_a_topic_id_names_the_topic_to_delete(self):
+        from app.tg_handler import _cmd_del
+
+        update = _make_update("/del 144")
+        ctx = self._ctx(topics={(TG_CHAT_ID, 144): -69369957050939})
+        ctx.args = ["144"]
+
+        await _cmd_del(update, ctx)
+
+        text = _replies(update)[0]
+        assert "144" in text and "-69369957050939" in text
+
+    async def test_a_max_chat_id_works_too(self):
+        """What /list prints most prominently is the MAX id, so accept it."""
+        from app.tg_handler import _cmd_del
+
+        update = _make_update("/del -69369957050939")
+        ctx = self._ctx(bindings={-69369957050939: 144})
+        ctx.args = ["-69369957050939"]
+
+        await _cmd_del(update, ctx)
+
+        assert "-69369957050939" in _replies(update)[0]
+
+    async def test_an_id_of_no_topic_here_is_reported(self):
+        from app.tg_handler import _cmd_del
+
+        update = _make_update("/del 999")
+        ctx = self._ctx()
+        ctx.args = ["999"]
+
+        await _cmd_del(update, ctx)
+
+        assert "нет топика" in _replies(update)[0]
+
+    async def test_nothing_is_deleted_before_the_button_is_pressed(self):
+        from app.tg_handler import _cmd_del
+
+        update = _make_update("/del 144")
+        ctx = self._ctx(topics={(TG_CHAT_ID, 144): -42})
+        ctx.args = ["144"]
+
+        await _cmd_del(update, ctx)
+
+        ctx.bot_data[TOPIC_STORE_KEY].remove.assert_not_called()
+        ctx.bot.delete_forum_topic.assert_not_called()
+
+    async def test_outside_a_topic_and_without_an_id_it_says_how(self):
+        from app.tg_handler import _cmd_del
+
+        update = _make_update("/del")
+        update.message.message_thread_id = None
+        ctx = self._ctx()
+        ctx.args = []
+
+        await _cmd_del(update, ctx)
+
+        assert "/del 144" in _replies(update)[0]

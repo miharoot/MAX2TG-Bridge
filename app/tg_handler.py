@@ -1181,7 +1181,9 @@ HELP_TEXT = (
     "• <code>/intro</code> — перепостить и закрепить карточку профиля "
     "в текущем топике (полезно после смены аватара).\n"
     "• <code>/del</code> — удалить текущий топик и связь с MAX-чатом "
-    "(спросит подтверждение). В самом MAX ничего не меняется.\n"
+    "(спросит подтверждение). В самом MAX ничего не меняется. Можно и не "
+    "заходя в топик: <code>/del 144</code> — по номеру топика или по id "
+    "чата MAX.\n"
     "• <code>/del_max &lt;chat_id&gt;</code> — только в основной группе: "
     "выйти из чата в <b>самом MAX</b> — покинуть группу, отписаться от "
     "канала или удалить диалог (только у себя, у собеседника переписка "
@@ -1366,9 +1368,9 @@ async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ask the user to confirm deletion of the current topic. The actual
-    deletion happens in ``_on_del_callback`` when the inline button is
-    pressed."""
+    """Ask the user to confirm deletion of a topic — the current one, or
+    the one named by `/del <id>`. The actual deletion happens in
+    ``_on_del_callback`` when the inline button is pressed."""
     message = update.message
     if message is None:
         return
@@ -1380,15 +1382,49 @@ async def _cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     update.effective_user.id)
         return
 
-    target = _resolve_topic_target(update, context)
-    if not target:
-        await message.reply_text(
-            "Команда работает только внутри топика, связанного с MAX-чатом."
-        )
+    tg_chat_id = update.effective_chat.id if update.effective_chat else None
+    if tg_chat_id is None:
         return
-    _, max_chat_id, _ = target
-    thread_id = message.message_thread_id
-    tg_chat_id = update.effective_chat.id
+    topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
+
+    # `/del <id>` deletes a topic of this group without going into it —
+    # useful when the topic is bound to a chat you've since left, or when
+    # you're already in the main group looking at /list. The id is read as
+    # a thread id first (that's what /list and the bot's own replies
+    # print) and as a MAX chat id only if no topic of this group carries
+    # it, since the two can't collide in practice: thread ids are small.
+    args = context.args or []
+    max_chat_id = None
+    thread_id = None
+    if args:
+        try:
+            given = int(args[0])
+        except ValueError:
+            given = None
+        if given is not None:
+            found = topic_store.chat_for_topic(tg_chat_id, given)
+            if found is not None:
+                max_chat_id, thread_id = found, given
+            elif topic_store.get_topic(given) is not None:
+                max_chat_id, thread_id = given, topic_store.get_topic(given)
+        if max_chat_id is None:
+            await message.reply_text(
+                f"В этой группе нет топика <code>{escape(args[0])}</code> — "
+                "ни по thread_id, ни по id чата MAX. Список: <code>/list</code>.",
+                parse_mode="HTML",
+            )
+            return
+    else:
+        target = _resolve_topic_target(update, context)
+        if not target:
+            await message.reply_text(
+                "Команда работает внутри топика, связанного с MAX-чатом, "
+                "или с номером топика: <code>/del 144</code>.",
+                parse_mode="HTML",
+            )
+            return
+        _, max_chat_id, _ = target
+        thread_id = message.message_thread_id
 
     kb = InlineKeyboardMarkup([
         [
@@ -1397,8 +1433,9 @@ async def _cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("Отмена", callback_data="del:cancel"),
         ]
     ])
+    which = "этот топик" if not args else f"топик <code>{thread_id}</code>"
     await message.reply_text(
-        "Удалить этот топик вместе со всеми сообщениями и снять связь "
+        f"Удалить {which} вместе со всеми сообщениями и снять связь "
         f"с MAX-чатом <code>{max_chat_id}</code>?\n\n"
         "Восстановить нельзя. Новый топик создастся, если собеседник снова "
         "тебе напишет.",
