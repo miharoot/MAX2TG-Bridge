@@ -19,6 +19,7 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 from app import outbox
+from app.outbox import PermanentDeliveryFailure
 from app.pymax_client import PyMaxClient
 from app.topics import TopicStore
 
@@ -221,6 +222,14 @@ async def _surface_send_result(resp, *, bot, tg_chat_id, tg_message_id, notify,
     if err:
         desc = (err.get("localizedMessage") or err.get("message")
                 or err.get("error") or "не удалось отправить сообщение")
+        if err.get("permanent"):
+            # MAX refused the content itself, not the moment — say so
+            # plainly and let the caller drop it instead of re-uploading
+            # the same rejected bytes on every sweep, forever.
+            await notify(
+                f"⚠️ MAX отклонил это сообщение, повторять не буду: {desc}"
+            )
+            raise PermanentDeliveryFailure(desc)
         await notify(f"⚠️ MAX: {desc}")
         return False
     if not resp:
@@ -528,11 +537,21 @@ async def _send_topic_media_messages(messages, max_chat_id, max_client, max_uplo
     # while this one is still in progress.
     max_client.outbox.try_start(item_id)
     try:
-        ok = await _deliver_tg_media(
-            bot, max_client, max_chat_id, max_upload_bytes, caption, elements, specs,
-            notify=caption_message.reply_text,
-            tg_chat_id=tg_chat_id, tg_message_id=caption_message.message_id,
-        )
+        try:
+            ok = await _deliver_tg_media(
+                bot, max_client, max_chat_id, max_upload_bytes, caption, elements, specs,
+                notify=caption_message.reply_text,
+                tg_chat_id=tg_chat_id, tg_message_id=caption_message.message_id,
+            )
+        except PermanentDeliveryFailure as exc:
+            # Already reported into the topic; queueing it would only
+            # re-upload the same refused content until the end of time.
+            log.warning(
+                "MAX permanently refused a message for chat %s, dropping it: %s",
+                max_chat_id, exc,
+            )
+            await max_client.outbox.remove(item_id)
+            return
         if ok:
             await max_client.outbox.remove(item_id)
         else:

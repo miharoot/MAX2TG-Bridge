@@ -1052,9 +1052,10 @@ class PyMaxClient:
                 )
             except VoiceRejectedByMax as exc:
                 # Not a timing problem — re-uploading the same rejected
-                # recording would fail identically every time.
+                # recording would fail identically every time, so mark it
+                # as permanent and spare the outbox retrying it forever.
                 log.error("MAX rejected the audio for chat %s: %s", chat_id, exc)
-                return {"_max_error": {"message": str(exc)}}
+                return {"_max_error": {"message": str(exc), "permanent": True}}
             except UploadError as exc:
                 last_exc = exc
                 log.warning(

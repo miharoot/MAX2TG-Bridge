@@ -18,10 +18,13 @@ from app.tg_sender import TelegramSender
 log = logging.getLogger(__name__)
 
 SWEEP_INTERVAL = 20  # seconds between checks for pending outbox items
-MAX_BACKOFF = 600    # cap retry spacing at 10 minutes per item, however
-                      # many times it's failed — never give up entirely,
-                      # per the "keep retrying, don't drop it" requirement,
-                      # but don't hammer a permanently-broken target either.
+MAX_BACKOFF = 3600   # cap retry spacing at an hour per item, however many
+                      # times it's failed — never give up entirely, per the
+                      # "keep retrying, don't drop it" requirement, but a
+                      # target that has been refusing for hours is not worth
+                      # re-downloading and re-uploading to more often than
+                      # that. Delivery that *can* succeed usually does so
+                      # long before the interval grows this far.
 
 
 def _backoff_seconds(attempts: int) -> float:
@@ -86,6 +89,16 @@ async def _retry_one(client, sender, max_upload_bytes, item: "outbox.OutboxItem"
                      item.direction, item.id)
             await client.outbox.remove(item.id)
             return
+    except outbox.PermanentDeliveryFailure as exc:
+        # The target refused the message itself, so another attempt can
+        # only get the same answer. The reason has already been posted
+        # into the topic, so dropping it here is visible, not silent.
+        log.warning(
+            "Outbox: item id=%s (%s) permanently refused, dropping it: %s",
+            item.id, item.direction, exc,
+        )
+        await client.outbox.remove(item.id)
+        return
     except Exception as exc:
         log.exception("Outbox retry failed for item id=%s (direction=%s)",
                       item.id, item.direction)

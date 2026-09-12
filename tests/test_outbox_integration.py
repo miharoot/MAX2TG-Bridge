@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.outbox import TG_TO_MAX_MEDIA, TG_TO_MAX_TEXT, Outbox
+from app.outbox import (
+    TG_TO_MAX_MEDIA,
+    TG_TO_MAX_TEXT,
+    Outbox,
+    PermanentDeliveryFailure,
+)
 from app.outbox_retry import _retry_one, run_outbox_retry_loop
 
 
@@ -208,3 +213,52 @@ class TestSweepLoop:
 
         remaining = await store.pending()
         assert [r.payload["text"] for r in remaining] == ["first"]
+
+
+class TestPermanentRefusalIsNotRetriedForever:
+    """MAX refusing the content itself (a voice recording it will never
+    accept) is different from MAX being unreachable: re-uploading the same
+    bytes can only earn the same refusal, so the row goes away instead of
+    riding the queue forever. Everything else stays queued."""
+
+    async def test_a_permanent_refusal_drops_the_row(self, store):
+        await store.add(TG_TO_MAX_MEDIA, {
+            "max_chat_id": 42, "tg_chat_id": -100, "thread_id": 10,
+            "tg_message_id": 7, "caption": "", "elements": [],
+            "media_specs": [{"kind": "voice", "file_id": "abc"}],
+        })
+        item = (await store.pending())[0]
+
+        redeliver = AsyncMock(
+            side_effect=PermanentDeliveryFailure("AUDIO_VALIDATION_FAILED"))
+        await _retry_one(_client(store), _sender(), 1024, item, AsyncMock(), redeliver)
+
+        assert await store.pending() == []
+
+    async def test_an_ordinary_failure_still_stays_queued(self, store):
+        """The other side of the same decision — only an outright refusal
+        drops a message; a plain error keeps its place."""
+        await store.add(TG_TO_MAX_TEXT, TEXT_PAYLOAD)
+        item = (await store.pending())[0]
+
+        redeliver = AsyncMock(side_effect=TimeoutError("MAX did not answer"))
+        await _retry_one(_client(store), _sender(), 1024, item, redeliver, AsyncMock())
+
+        assert len(await store.pending()) == 1
+
+
+class TestCorruptRows:
+    async def test_an_unreadable_payload_is_dropped_not_skipped_forever(self, store):
+        """Nothing can be delivered from a payload that won't parse, so it
+        is removed rather than re-read and re-logged on every sweep."""
+        good_id = await store.add(TG_TO_MAX_TEXT, TEXT_PAYLOAD)
+        bad_id = await store.add(TG_TO_MAX_TEXT, TEXT_PAYLOAD)
+
+        conn = await store._get_conn()
+        await conn.execute(
+            "UPDATE outbox SET payload = ? WHERE id = ?", ("{not json", bad_id))
+        await conn.commit()
+
+        items = await store.pending()
+        assert [i.id for i in items] == [good_id]
+        assert await store.count() == 1  # the bad row is gone, not just skipped

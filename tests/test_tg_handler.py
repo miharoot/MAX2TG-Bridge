@@ -434,6 +434,56 @@ class TestMediaGrouping:
         max_client.outbox.mark_failed.assert_awaited_once()
 
 
+class TestPermanentRefusalFromMax:
+    """MAX refusing the content itself is not a delivery hiccup: retrying
+    would re-upload the same rejected bytes on every sweep, forever. Say
+    so in the topic once and drop the row."""
+
+    async def test_warns_in_the_topic_and_drops_the_item(self, monkeypatch):
+        message = MagicMock()
+        message.caption = "Caption"
+        message.caption_entities = []
+        message.reply_text = AsyncMock()
+        message.chat_id = -100999
+        message.message_thread_id = 10
+        message.message_id = 501
+
+        monkeypatch.setattr(
+            "app.tg_handler._upload_media_by_spec", AsyncMock(return_value="attach-1"))
+        max_client = _make_max_client(send_message_return={
+            "_max_error": {"message": "AUDIO_VALIDATION_FAILED", "permanent": True},
+        })
+
+        await _send_topic_media_messages([message], 42, max_client, 1024, AsyncMock())
+
+        warning = message.reply_text.await_args.args[0]
+        assert "повторять не буду" in warning
+        assert "AUDIO_VALIDATION_FAILED" in warning
+        max_client.outbox.remove.assert_awaited_once()
+        max_client.outbox.mark_failed.assert_not_awaited()
+
+    async def test_an_ordinary_max_error_stays_queued(self, monkeypatch):
+        """The other side of the same decision: anything that might yet
+        succeed keeps its place in the queue."""
+        message = MagicMock()
+        message.caption = "Caption"
+        message.caption_entities = []
+        message.reply_text = AsyncMock()
+        message.chat_id = -100999
+        message.message_thread_id = 10
+        message.message_id = 501
+
+        monkeypatch.setattr(
+            "app.tg_handler._upload_media_by_spec", AsyncMock(return_value="attach-1"))
+        max_client = _make_max_client(
+            send_message_return={"_max_error": {"message": "rate limited"}})
+
+        await _send_topic_media_messages([message], 42, max_client, 1024, AsyncMock())
+
+        max_client.outbox.remove.assert_not_awaited()
+        max_client.outbox.mark_failed.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Voice messages TG → MAX — end to end, without monkeypatching
 # _upload_media_by_spec (unlike the album tests above), to actually

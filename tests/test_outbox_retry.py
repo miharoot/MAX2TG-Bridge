@@ -31,6 +31,12 @@ class TestBackoffSeconds:
         assert _backoff_seconds(20) == MAX_BACKOFF
         assert _backoff_seconds(1000) == MAX_BACKOFF
 
+    def test_the_cap_is_an_hour(self):
+        # A target that has been refusing for hours isn't worth
+        # re-downloading and re-uploading to more often than that; the
+        # item is still never dropped, just throttled.
+        assert MAX_BACKOFF == 3600
+
 
 def _make_item(direction, payload, item_id=1, attempts=0) -> OutboxItem:
     return OutboxItem(

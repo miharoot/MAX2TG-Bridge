@@ -34,6 +34,21 @@ TG_TO_MAX_TEXT = "tg_to_max_text"
 TG_TO_MAX_MEDIA = "tg_to_max_media"
 
 
+class PermanentDeliveryFailure(Exception):
+    """The target refused this message itself, not the attempt.
+
+    Retrying can only produce the same answer — MAX rejecting an audio
+    recording outright is the case this exists for — so the row is
+    dropped rather than re-delivered forever. Everything else (network
+    trouble, timeouts, MAX being down, an unrecognised error) stays a
+    plain failure and keeps its place in the queue: misjudging that
+    direction costs a wasted retry, misjudging this one loses a message.
+
+    Raised only after the reason has been reported into the topic, so a
+    dropped message is visible rather than silently gone.
+    """
+
+
 @dataclass
 class OutboxItem:
     id: int
@@ -149,17 +164,24 @@ class Outbox:
             "last_error FROM outbox ORDER BY id"
         )
         items = []
+        corrupt: list[int] = []
         for r in rows:
             try:
                 payload = json.loads(r["payload"])
             except (TypeError, ValueError):
-                log.error("Outbox: corrupt payload for item id=%s, skipping", r["id"])
+                # Nothing can ever be delivered from an unreadable payload,
+                # so keeping the row only grows the file and re-logs this
+                # on every sweep. Drop it instead of skipping it forever.
+                log.error("Outbox: corrupt payload for item id=%s, dropping", r["id"])
+                corrupt.append(r["id"])
                 continue
             items.append(OutboxItem(
                 id=r["id"], direction=r["direction"], payload=payload,
                 attempts=r["attempts"], created_at=r["created_at"],
                 last_attempt_at=r["last_attempt_at"], last_error=r["last_error"],
             ))
+        for item_id in corrupt:
+            await self.remove(item_id)
         return items
 
     async def count(self) -> int:
