@@ -2,6 +2,7 @@ import asyncio
 import io
 import logging
 import re
+import socket
 from html import escape
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
@@ -38,6 +39,28 @@ MEDIA_GROUP_DELAY = 0.8
 TG_FILE_RETRIES = 3
 TG_CONNECT_TIMEOUT = 20.0
 TG_FILE_TIMEOUT = 180.0
+
+# TCP keepalive for both HTTPXRequest connections below (regular bot-API
+# calls and, more importantly, long-polling get_updates). When TG_PROXY is
+# a mandatory SOCKS5 hop (Telegram blocked directly, so there's no way
+# around it), the proxy or an intermediate NAT/firewall can silently drop
+# an idle TCP connection without telling either side — httpx/httpcore only
+# discover this the next time they try to use it, surfacing as
+# "Server disconnected without sending a response" (RemoteProtocolError)
+# mid-poll. python-telegram-bot's own Updater.start_polling already
+# retries this automatically (it's a NetworkError), so the bot keeps
+# running either way — but enabling TCP keepalive lets the OS proactively
+# probe the connection and notice it's dead sooner, which reduces (though
+# can't fully eliminate, since it depends on the proxy's own behavior) how
+# often this happens: probe after 30s idle, every 10s, give up after 3
+# missed probes (~60s worst case to detect).
+_TG_TCP_KEEPALIVE_OPTIONS = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+for _opt_name, _value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+    _opt = getattr(socket, _opt_name, None)
+    if _opt is not None:
+        _TG_TCP_KEEPALIVE_OPTIONS.append((socket.IPPROTO_TCP, _opt, _value))
+    else:
+        log.debug("socket.%s not available on this platform, skipping", _opt_name)
 
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
 
@@ -1394,6 +1417,7 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
         write_timeout=TG_FILE_TIMEOUT,
         media_write_timeout=TG_FILE_TIMEOUT,
         pool_timeout=TG_CONNECT_TIMEOUT,
+        socket_options=_TG_TCP_KEEPALIVE_OPTIONS,
     )
     # get_updates (long-polling) uses its own connection/request object in
     # PTB — separate from the one above, which is for regular bot-API calls
@@ -1407,6 +1431,7 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
         connect_timeout=TG_CONNECT_TIMEOUT,
         read_timeout=TG_CONNECT_TIMEOUT,
         pool_timeout=TG_CONNECT_TIMEOUT,
+        socket_options=_TG_TCP_KEEPALIVE_OPTIONS,
     )
     builder = (
         Application.builder()

@@ -1,5 +1,6 @@
 """Tests for app/tg_handler.py — topic-based reply routing."""
 
+import socket
 from unittest.mock import AsyncMock, MagicMock
 
 from telegram.error import TimedOut
@@ -367,6 +368,21 @@ class TestBuildTgApp:
                             _make_topic_store())
 
         assert app.handlers[0]
+
+    def test_enables_tcp_keepalive_on_both_request_clients(self):
+        """Regression test: TG_PROXY is often a mandatory SOCKS5 hop (see
+        CLAUDE.md/README), and a proxy or intermediary NAT/firewall can
+        silently drop an idle long-polling connection, surfacing later as
+        httpx.RemoteProtocolError. TCP keepalive helps the OS notice a dead
+        connection sooner on both the regular bot-API client and,
+        especially, the get_updates (long-polling) client."""
+        app = build_tg_app("123456:AAABBBCCC", MagicMock(), "-100123456",
+                            _make_topic_store(), proxy_url="socks5://127.0.0.1:1080")
+
+        for request in app.bot._request:
+            transport = request._client_kwargs["transport"]
+            keepalive_opts = transport._pool._socket_options
+            assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in keepalive_opts
 
 
 class TestMediaGrouping:
