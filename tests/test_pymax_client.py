@@ -861,6 +861,55 @@ class TestVoiceUploadUserAgentPatch:
 
         assert self._FakeSession.all_headers[0]["Content-Range"] == "0-4/5"
 
+    async def test_each_variant_gets_a_fresh_upload_slot(self, monkeypatch):
+        """MAX burns the upload cid on a rejected POST, so replaying the
+        next shape against the same slot answers BAD_REQUEST no matter
+        what — which would make the whole comparison meaningless."""
+        class _RejectingSession(self._FakeSession):
+            def post(self, url, headers=None, data=None):
+                rejecting = TestVoiceUploadUserAgentPatch._FakeResponse(200)
+                rejecting.text = _AsyncReturn(
+                    '{"error_code":"4","error_data":"BAD_REQUEST"}'
+                )
+                return rejecting
+
+        _patch_voice_upload_user_agent()
+        monkeypatch.setattr("aiohttp.ClientSession", _RejectingSession)
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        with pytest.raises(UploadError):
+            await UploadService.upload_voice(service, self._FakeVoice())
+
+        # one VIDEO_UPLOAD request per variant tried
+        assert service.app.invoke.await_count == 4
+
+    async def test_a_dropped_connection_does_not_abandon_the_other_variants(
+        self, monkeypatch
+    ):
+        """MAX drops the socket after rejecting an upload; that killed
+        the whole run before the remaining shapes were ever tried."""
+        import aiohttp as _aiohttp
+
+        calls = {"n": 0}
+
+        class _FlakySession(self._FakeSession):
+            def post(self, url, headers=None, data=None):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise _aiohttp.ClientError("Server disconnected")
+                return TestVoiceUploadUserAgentPatch._FakeResponse(200)
+
+        _patch_voice_upload_user_agent()
+        monkeypatch.setattr("aiohttp.ClientSession", _FlakySession)
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        result = await UploadService.upload_voice(service, self._FakeVoice())
+
+        assert calls["n"] == 2  # recovered on the next variant
+        assert result.video_id == 42
+
     async def test_rejected_audio_raises_immediately_not_as_a_timing_error(
         self, monkeypatch
     ):
