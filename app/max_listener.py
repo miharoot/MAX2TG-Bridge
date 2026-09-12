@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from dataclasses import asdict
+from dataclasses import fields as _dataclass_fields
 from datetime import datetime
 from html import escape
 
@@ -16,6 +16,28 @@ log = logging.getLogger(__name__)
 
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+
+def _max_message_to_payload(msg: MaxMessage) -> dict:
+    """Like dataclasses.asdict(msg), but shallow.
+
+    asdict() recursively copy.deepcopy()'s every nested value, all the
+    way down. msg.raw/attaches/link are already plain dict/list (built by
+    _model_dict in pymax_client.py) and about to be json.dumps(...,
+    default=str)'d by Outbox.add() anyway, so a deep copy buys nothing —
+    it only adds a way to crash before we ever reach json.dumps's
+    graceful degradation. That crash is exactly what happened in
+    production: pymax occasionally hits an unresolved-schema edge case
+    right after startup (see the MockValSer handling in _model_dict) and
+    falls back to grabbing a pydantic model's raw internal attributes,
+    one of which turned out to be a generator — copy.deepcopy has no
+    idea how to copy a generator and raises immediately, taking down the
+    whole inbound-event dispatch (not just this one message). A shallow
+    copy sidesteps deepcopy entirely, so worst case json.dumps just
+    stringifies whatever the odd value was.
+    """
+    return {f.name: getattr(msg, f.name) for f in _dataclass_fields(msg)}
+
 
 ATTACHMENT_LABELS = {
     "PHOTO": "📷 <i>[фото — не удалось загрузить]</i>",
@@ -589,7 +611,7 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         if client.is_bridge_echo(msg):
             return
 
-        item_id = await client.outbox.add(outbox.MAX_TO_TG, asdict(msg))
+        item_id = await client.outbox.add(outbox.MAX_TO_TG, _max_message_to_payload(msg))
         try:
             await _deliver_max_message(msg)
         except Exception as exc:

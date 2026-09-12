@@ -1,5 +1,6 @@
 """Tests for app/max_listener.py — pure helper functions."""
 
+import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -7,6 +8,7 @@ from app.pymax_client import MaxMessage
 from app.max_listener import (
     _guess_media_kind,
     _human_size,
+    _max_message_to_payload,
     _send_attach,
     _topic_title_for_message,
     _try_send_media_group,
@@ -404,3 +406,87 @@ class TestAttachmentGrouping:
 
         assert grouped is None
         sender.send_media_group.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _max_message_to_payload — regression test for a real production crash:
+# dataclasses.asdict(msg) deep-copies everything (including msg.raw, a
+# pydantic model_dump()) and blows up with "cannot pickle 'generator'
+# object" if any stray non-deep-copyable value ever ends up in there
+# (e.g. via _model_dict's vars()-fallback for an unresolved pydantic
+# schema right after startup). A shallow copy sidesteps deepcopy
+# entirely — outbox.add() will json.dumps(..., default=str) it, which
+# degrades gracefully instead of crashing the inbound event dispatch.
+# ---------------------------------------------------------------------------
+
+class TestMaxMessageToPayload:
+    def test_produces_same_keys_as_asdict_for_plain_data(self):
+        from dataclasses import asdict
+        msg = MaxMessage(
+            chat_id=1, sender_id=2, text="hi", message_id="mid1",
+            attaches=[{"a": 1}], link={"b": 2}, raw={"c": 3},
+        )
+        assert _max_message_to_payload(msg) == asdict(msg)
+
+    def test_does_not_crash_on_a_non_deep_copyable_raw_value(self):
+        """The exact failure mode seen in production: a generator ends
+        up embedded in msg.raw (via _model_dict's fallback path) and
+        dataclasses.asdict() dies trying to deepcopy it."""
+        def _gen():
+            yield 1
+
+        msg = MaxMessage(
+            chat_id=1, sender_id=2, text="hi", message_id="mid1",
+            raw={"weird": _gen()},
+        )
+
+        payload = _max_message_to_payload(msg)
+
+        assert payload["chat_id"] == 1
+        assert "weird" in payload["raw"]
+
+    def test_asdict_would_have_crashed_on_the_same_input(self):
+        """Confirms the regression this guards against is real, not
+        hypothetical — dataclasses.asdict() itself raises here."""
+        from dataclasses import asdict
+
+        def _gen():
+            yield 1
+
+        msg = MaxMessage(chat_id=1, raw={"weird": _gen()})
+
+        with pytest.raises(TypeError, match="pickle"):
+            asdict(msg)
+
+    def test_result_is_json_serializable_with_default_str(self):
+        """This is the actual contract that matters: whatever comes out
+        must survive Outbox.add()'s json.dumps(payload, default=str)."""
+        def _gen():
+            yield 1
+
+        msg = MaxMessage(
+            chat_id=-100, sender_id=2, text="hi", message_id="mid1",
+            attaches=[{"_type": "PHOTO"}], link={}, raw={"weird": _gen()},
+        )
+
+        payload = _max_message_to_payload(msg)
+        serialized = json.dumps(payload, default=str, ensure_ascii=False)
+        restored = json.loads(serialized)
+
+        assert restored["chat_id"] == -100
+        assert restored["message_id"] == "mid1"
+        assert "generator object" in restored["raw"]["weird"]
+
+    def test_result_round_trips_through_max_message_constructor(self):
+        """This is what outbox_retry.py does on redelivery:
+        MaxMessage(**item.payload) — the shallow dict must have exactly
+        the right keys for that to work."""
+        msg = MaxMessage(
+            chat_id=-100, sender_id=2, text="hi", message_id="mid1",
+            attaches=[{"_type": "PHOTO"}], link={}, raw={"ok": True},
+        )
+
+        payload = _max_message_to_payload(msg)
+        rebuilt = MaxMessage(**payload)
+
+        assert rebuilt == msg
