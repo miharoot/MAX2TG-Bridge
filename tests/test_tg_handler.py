@@ -481,6 +481,88 @@ class TestVoiceMessageUpload:
 
         assert spec == {"kind": "voice", "file_id": "voice123", "duration_ms": None}
 
+    def test_media_spec_recognises_a_video_note(self):
+        """Telegram's round video messages were falling through every
+        branch, so they reached MAX as nothing at all — and, not being in
+        the handler's filter either, without even a warning in the topic."""
+        message = MagicMock()
+        message.photo = None
+        message.voice = None
+        message.audio = None
+        message.document = None
+        message.video = None
+        message.video_note = MagicMock(duration=5, file_id="note123")
+
+        spec = _media_spec_from_message(message)
+
+        assert spec == {
+            "kind": "video_note", "file_id": "note123", "duration_ms": 5000,
+        }
+
+    def test_video_note_handler_filter_covers_it(self):
+        """The filter is the other half: without VIDEO_NOTE in it the
+        update never reaches _on_topic_media at all — which is why these
+        vanished silently, with no warning posted to the topic."""
+        from telegram import Update
+        from telegram.ext import MessageHandler
+
+        from app.tg_handler import _on_topic_media, build_tg_app
+
+        app = build_tg_app(
+            token="123:abc", max_client=MagicMock(), supergroup_id="-100",
+            topic_store=MagicMock(),
+        )
+        media_handler = next(
+            handler
+            for group in app.handlers.values()
+            for handler in group
+            if isinstance(handler, MessageHandler) and handler.callback is _on_topic_media
+        )
+
+        message = MagicMock(spec=[
+            "photo", "voice", "audio", "document", "video", "video_note",
+            "text", "caption", "chat", "effective_attachment",
+        ])
+        message.photo = ()
+        message.voice = None
+        message.audio = None
+        message.document = None
+        message.video = None
+        message.video_note = MagicMock()
+        message.text = None
+        message.caption = None
+        message.chat = MagicMock(type="supergroup")
+        update = MagicMock(spec=Update)
+        update.effective_message = message
+        update.channel_post = None
+        update.edited_channel_post = None
+        update.message = message
+
+        assert media_handler.check_update(update)
+
+    async def test_upload_media_by_spec_sends_a_video_note_as_a_video_note(self):
+        """MAX has its own round-video type, so these should not be
+        flattened into a plain video."""
+        spec = {"kind": "video_note", "file_id": "note123", "duration_ms": 5000}
+
+        tg_file = MagicMock()
+        tg_file.file_size = 1000
+        tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"mp4-bytes"))
+        bot = AsyncMock()
+        bot.get_file = AsyncMock(return_value=tg_file)
+
+        max_client = MagicMock()
+        sent_attach = MagicMock()
+        max_client.upload_video_note = AsyncMock(return_value=sent_attach)
+
+        attach = await _upload_media_by_spec(bot, spec, max_client, 42, 10 * 1024 * 1024)
+
+        bot.get_file.assert_awaited_once_with("note123")
+        max_client.upload_video_note.assert_awaited_once_with(
+            b"mp4-bytes", chat_id=42, filename="video_note.mp4", duration=5000,
+        )
+        assert attach is sent_attach
+
     async def test_upload_media_by_spec_downloads_and_calls_upload_audio(self):
         spec = {"kind": "voice", "file_id": "voice123", "duration_ms": 5000}
 

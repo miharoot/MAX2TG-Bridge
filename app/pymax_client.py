@@ -1141,6 +1141,23 @@ class PyMaxClient:
 
         return Video(raw=data, name=filename)
 
+    async def upload_video_note(
+        self,
+        data: bytes,
+        chat_id=None,
+        filename: str = "video_note.mp4",
+        duration: int | None = None,
+    ):
+        """Telegram's round video message → MAX's own equivalent.
+
+        Uploaded through the same pipeline as a plain video, except MAX
+        confirms these synchronously — pymax's upload_video only waits
+        for a processing notification when it isn't a VideoNote.
+        """
+        from pymax import VideoNote
+
+        return VideoNote(raw=data, name=filename, duration=duration)
+
     async def upload_audio(
         self,
         data: bytes,

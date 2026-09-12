@@ -361,6 +361,16 @@ async def _download_tg_file_by_id(bot, file_id: str, max_bytes: int) -> bytes | 
     return None
 
 
+def _duration_ms(duration) -> int | None:
+    """Telegram durations in milliseconds, from either shape PTB hands us
+    (a timedelta on newer versions, plain seconds on older ones)."""
+    if duration is None:
+        return None
+    if hasattr(duration, "total_seconds"):
+        return int(duration.total_seconds() * 1000)
+    return int(duration * 1000)
+
+
 def _media_spec_from_message(message) -> dict | None:
     """Extract a JSON-safe {kind, file_id, filename, mimetype, duration_ms}
     from a live PTB message's attachment — everything _upload_media_by_spec
@@ -372,12 +382,8 @@ def _media_spec_from_message(message) -> dict | None:
         return {"kind": "photo", "file_id": photo.file_id}
     if message.voice:
         v = message.voice
-        duration_ms = None
-        if v.duration is not None:
-            duration_ms = (int(v.duration.total_seconds() * 1000)
-                            if hasattr(v.duration, "total_seconds")
-                            else int(v.duration * 1000))
-        return {"kind": "voice", "file_id": v.file_id, "duration_ms": duration_ms}
+        return {"kind": "voice", "file_id": v.file_id,
+                "duration_ms": _duration_ms(v.duration)}
     if message.audio:
         a = message.audio
         return {"kind": "audio", "file_id": a.file_id,
@@ -390,6 +396,12 @@ def _media_spec_from_message(message) -> dict | None:
         v = message.video
         return {"kind": "video", "file_id": v.file_id,
                 "filename": v.file_name, "mimetype": v.mime_type}
+    if message.video_note:
+        # Telegram's round video messages. MAX has its own equivalent,
+        # so these go over as VideoNote rather than a plain video.
+        vn = message.video_note
+        return {"kind": "video_note", "file_id": vn.file_id,
+                "duration_ms": _duration_ms(vn.duration)}
     return None
 
 
@@ -430,6 +442,12 @@ async def _upload_media_by_spec(bot, spec: dict, max_client, max_chat_id, max_up
             data, chat_id=max_chat_id,
             filename=spec.get("filename") or "video.mp4",
             mimetype=spec.get("mimetype") or "video/mp4",
+        )
+    if kind == "video_note":
+        return await max_client.upload_video_note(
+            data, chat_id=max_chat_id,
+            filename="video_note.mp4",
+            duration=spec.get("duration_ms"),
         )
     return None
 
@@ -1487,7 +1505,7 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
     )
     media_filter = (
         filters.PHOTO | filters.VOICE | filters.AUDIO
-        | filters.Document.ALL | filters.VIDEO
+        | filters.Document.ALL | filters.VIDEO | filters.VIDEO_NOTE
     )
     app.add_handler(
         MessageHandler(media_filter & chat_filter, _on_topic_media)
