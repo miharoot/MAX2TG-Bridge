@@ -11,6 +11,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# MAX's "Избранное" is an ordinary DIALOG whose only participant is you —
+# a chat with yourself. It carries no title of its own, so without this it
+# shows up nameless everywhere the peer's name would go.
+SAVED_MESSAGES_TITLE = "Избранное"
+
 
 class ContactResolver:
     def __init__(self, client: PyMaxClient | None = None):
@@ -43,6 +48,26 @@ class ContactResolver:
             return int(chat_id) > 0
         except (TypeError, ValueError):
             return False
+
+    def is_saved_messages(self, chat_id: Any) -> bool:
+        """Whether this is MAX's own saved-messages chat ("Избранное").
+
+        It is a dialog with exactly one participant — you. Every other
+        chat has someone else in it, so nothing else answers to this.
+        """
+        if self._my_id is None:
+            return False
+        chat = self.chats_raw.get(chat_id) or {}
+        participants = chat.get("participants") or {}
+        if not participants:
+            return False
+        ids = set()
+        for uid in participants:
+            try:
+                ids.add(int(uid))
+            except (TypeError, ValueError):
+                return False
+        return ids == {int(self._my_id)}
 
     def user_name(self, user_id: Any) -> str:
         return self.users.get(user_id, str(user_id))
@@ -140,6 +165,9 @@ class ContactResolver:
                         break
                 if peer_id:
                     self.chats[cid] = f"DM:{peer_id}"
+                elif participants:
+                    # Nobody but us in it: MAX's saved-messages chat.
+                    self.chats[cid] = SAVED_MESSAGES_TITLE
 
         log.info(
             "Snapshot parsed: %d chats, my_id=%s, %d participant IDs to resolve",

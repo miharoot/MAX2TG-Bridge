@@ -21,6 +21,7 @@ from telegram.request import HTTPXRequest
 from app import outbox
 from app.outbox import PermanentDeliveryFailure
 from app.pymax_client import PyMaxClient, _normalized_phone
+from app.resolver import SAVED_MESSAGES_TITLE
 from app.topics import TopicStore
 
 log = logging.getLogger(__name__)
@@ -705,6 +706,31 @@ async def post_topic_intro(bot, supergroup_id, max_client: PyMaxClient,
 
     is_dm = resolver.is_dm(max_chat_id)
 
+    if resolver.is_saved_messages(max_chat_id):
+        # A chat with yourself has no peer to profile, but the topic
+        # still deserves to say what it is rather than open blank.
+        body = (f"<b>{SAVED_MESSAGES_TITLE}</b>\n"
+                f"id: <code>{max_chat_id}</code>\n\n"
+                "<i>Чат с самим собой в MAX: всё, что вы напишете в этом "
+                "топике, попадёт в «Избранное».</i>")
+        try:
+            sent = await bot.send_message(
+                chat_id=int(supergroup_id), text=body, parse_mode="HTML",
+                message_thread_id=thread_id,
+            )
+        except Exception:
+            log.exception("post_topic_intro: send_message failed")
+            return
+        if pin and sent is not None:
+            try:
+                await bot.pin_chat_message(chat_id=int(supergroup_id),
+                                           message_id=sent.message_id,
+                                           disable_notification=True)
+            except Exception:
+                log.warning("post_topic_intro: could not pin the card in topic %s",
+                            thread_id)
+        return
+
     if is_dm:
         peer_id = _peer_id_in_dm(resolver, max_chat_id)
         if peer_id is None:
@@ -1132,12 +1158,23 @@ HELP_TEXT = (
     "Команды в супергруппе:\n"
     "• <code>/bind &lt;chat_id или URL&gt; [название]</code> — привязать "
     "новый топик к чату MAX в этой группе.\n"
-    "• <code>/add &lt;https://max.ru/join/...&gt;</code> — открыть "
-    "групповую/канальную ссылку MAX, создать топик в этой группе и "
-    "поставить карточку.\n"
+    "• <code>/add &lt;ссылка, номер или id&gt;</code> — привязать чат MAX к "
+    "новому топику в этой группе, вступив в него, если ещё не состоишь. "
+    "Понимает:\n"
+    "   – <code>https://max.ru/join/...</code> — приглашение в группу/канал: "
+    "бот вступит и привяжет;\n"
+    "   – <code>https://max.ru/id..._gos</code> — публичная ссылка "
+    "группы/канала: если уже подписан, привяжет сразу;\n"
+    "   – <code>https://max.ru/u/...</code> — личная ссылка человека: "
+    "её читает сам MAX, при успехе привяжет диалог с ним;\n"
+    "   – <code>+79991234567</code> — найти человека по номеру телефона;\n"
+    "   – <code>6633015816</code> — id пользователя: диалог с ним;\n"
+    "   – <code>-69369957050939</code> — id группы или канала: привяжет "
+    "сразу, как <code>/bind</code> (вступить по id в MAX нельзя).\n"
     "• <code>/list</code> — только в основной группе (<code>TG_CHAT_ID</code>): "
-    "список всех чатов MAX (группы, каналы и личные сообщения) с id и "
-    "ссылкой, чтобы скопировать нужный chat_id в <code>/bind</code>.\n"
+    "список всех чатов MAX (группы, каналы, личные сообщения и "
+    "«Избранное») моноширинными строками — id, веб-ссылка и, если MAX её "
+    "дал, ссылка-приглашение, чтобы копировать в <code>/bind</code>.\n"
     "• <code>/profile</code> — внутри топика: показать профиль собеседника "
     "из MAX (имя, id, аватар).\n"
     "• <code>/intro</code> — перепостить и закрепить карточку профиля "
@@ -1155,7 +1192,9 @@ HELP_TEXT = (
     "сообщение (такого события у ботов нет) — отметка ставится по "
     "факту ответа, а не по факту открытия топика.\n\n"
     "Если кто-то новый пишет тебе в MAX — топик создастся автоматически "
-    "и в нём сразу появится карточка собеседника."
+    "и в нём сразу появится карточка собеседника.\n\n"
+    "«Избранное» (чат с самим собой в MAX) — обычный чат в этом списке: "
+    "привяжи его, и топик станет заметками, которые видны и в MAX."
 )
 
 
@@ -1205,7 +1244,9 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     entries = []
     for chat_id, chat in resolver.chats_raw.items():
         chat_type = resolver.chat_types.get(chat_id, chat.get("type", "?"))
-        if resolver.is_dm(chat_id):
+        if resolver.is_saved_messages(chat_id):
+            title = SAVED_MESSAGES_TITLE
+        elif resolver.is_dm(chat_id):
             # DM chats don't get a real "title" from MAX — resolve the
             # peer's name instead of showing the "DM:<id>" placeholder.
             peer_id = None

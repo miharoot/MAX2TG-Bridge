@@ -10,7 +10,7 @@ from app import outbox
 from app.config import Settings
 from app.outbox import Outbox
 from app.pymax_client import MaxMessage, MaxReactionEvent, MaxReadEvent, PyMaxClient
-from app.resolver import ContactResolver
+from app.resolver import SAVED_MESSAGES_TITLE, ContactResolver
 from app.tg_sender import TelegramSender
 
 log = logging.getLogger(__name__)
@@ -458,6 +458,11 @@ async def _topic_title_for_message(msg: MaxMessage, resolver: ContactResolver,
     live MAX lookup (``resolver.resolve_chat``) for the real chat title
     before ever considering the sender as a fallback.
     """
+    if is_dm and resolver.is_saved_messages(msg.chat_id):
+        # A chat with yourself: the sender's name is your own, which says
+        # nothing about what the topic is.
+        return SAVED_MESSAGES_TITLE, True
+
     if is_dm:
         return raw_sender, False
 

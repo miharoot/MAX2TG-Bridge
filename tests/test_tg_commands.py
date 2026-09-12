@@ -309,3 +309,63 @@ class TestCmdAddWithAnId:
         await self._run(ctx, update)
 
         assert "Использование" in _replies(update)[0]
+
+
+class TestSavedMessages:
+    """MAX's "Избранное" is a dialog with exactly one participant: you.
+    Having no peer to name it after, it used to show up blank everywhere
+    and its topic got no card at all."""
+
+    def _resolver(self, my_id=100, participants=None):
+        from app.resolver import ContactResolver
+
+        resolver = ContactResolver()
+        resolver._my_id = my_id
+        resolver.chats_raw = {0: {"id": 0, "type": "DIALOG",
+                                  "participants": participants
+                                  if participants is not None else {"100": 1}}}
+        return resolver
+
+    def test_a_chat_with_only_me_in_it_is_saved_messages(self):
+        assert self._resolver().is_saved_messages(0) is True
+
+    def test_a_dialog_with_someone_else_is_not(self):
+        resolver = self._resolver(participants={"100": 1, "42": 1})
+        assert resolver.is_saved_messages(0) is False
+
+    def test_a_chat_we_know_nothing_about_is_not(self):
+        assert self._resolver().is_saved_messages(-42) is False
+
+    def test_it_takes_knowing_who_we_are(self):
+        assert self._resolver(my_id=None).is_saved_messages(0) is False
+
+    async def test_list_names_it_rather_than_leaving_it_blank(self):
+        update = _make_update("/list")
+        ctx = _make_context(args=[])
+        ctx.bot_data[SUPERGROUP_KEY] = TG_CHAT_ID
+        resolver = self._resolver(my_id=100)
+        resolver.chat_types = {0: "DIALOG"}
+        ctx.bot_data[MAX_CLIENT_KEY].resolver = resolver
+        ctx.bot_data[TOPIC_STORE_KEY].get_topic = MagicMock(return_value=None)
+
+        await _cmd_list(update, ctx)
+
+        body = "\n".join(_replies(update))
+        assert "Избранное" in body
+        assert "(без названия)" not in body
+
+    async def test_its_topic_gets_a_card_saying_what_it_is(self):
+        """The card was skipped outright: the DM branch needs a peer, and
+        a chat with yourself has none."""
+        from app.tg_handler import post_topic_intro
+
+        max_client = MagicMock()
+        max_client.resolver = self._resolver(my_id=100)
+        bot = AsyncMock()
+        bot.send_message = AsyncMock(return_value=MagicMock(message_id=5))
+
+        await post_topic_intro(bot, TG_CHAT_ID, max_client, 0, thread_id=7)
+
+        body = bot.send_message.await_args.kwargs["text"]
+        assert "Избранное" in body
+        bot.pin_chat_message.assert_awaited_once()

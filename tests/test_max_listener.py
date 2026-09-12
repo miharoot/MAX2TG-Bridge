@@ -169,6 +169,7 @@ def _msg(chat_id=-100, sender_id=1):
 class TestTopicTitleForMessage:
     async def test_dm_uses_sender_name_and_never_force_renames(self):
         resolver = MagicMock()
+        resolver.is_saved_messages.return_value = False   # an ordinary dialog
         title, force = await _topic_title_for_message(
             _msg(), resolver, raw_sender="Наринэ Ермилова", is_dm=True,
         )
@@ -490,3 +491,38 @@ class TestMaxMessageToPayload:
         rebuilt = MaxMessage(**payload)
 
         assert rebuilt == msg
+
+
+class TestSavedMessagesTitle:
+    """A chat with yourself would otherwise be titled with your own name,
+    since in a dialog the sender is the topic's subject."""
+
+    async def test_the_topic_is_called_saved_messages(self):
+        from unittest.mock import MagicMock
+
+        from app.max_listener import _topic_title_for_message
+
+        resolver = MagicMock()
+        resolver.is_saved_messages = MagicMock(return_value=True)
+        msg = MagicMock()
+        msg.chat_id = 0
+
+        title, confirmed = await _topic_title_for_message(msg, resolver, "mihr", True)
+
+        assert title == "Избранное"
+        assert confirmed is True
+
+    async def test_an_ordinary_dialog_still_uses_the_sender(self):
+        from unittest.mock import MagicMock
+
+        from app.max_listener import _topic_title_for_message
+
+        resolver = MagicMock()
+        resolver.is_saved_messages = MagicMock(return_value=False)
+        msg = MagicMock()
+        msg.chat_id = 418124176
+
+        title, confirmed = await _topic_title_for_message(
+            msg, resolver, "Наринэ Ермилова", True)
+
+        assert title == "Наринэ Ермилова"
