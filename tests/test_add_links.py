@@ -1,9 +1,10 @@
 """Resolving max.ru links for /add (app/pymax_client.py).
 
-Three link shapes reach open_by_link, and only one of them — a join
-token — is something pymax can handle on its own. A profile link names a
-person, so there is no chat to join: MAX derives the id of a one-to-one
-chat from the two participants, and that is computed locally.
+The shape of a link says less than it looks like it does. MAX gives
+public groups and channels a handle link — https://max.ru/id6633015816_gos
+is one, belonging to a *channel*, not to a person — so digits in a link
+are no evidence of a user id. What settles it is the chat data we already
+hold, then MAX itself.
 """
 
 import asyncio
@@ -11,141 +12,99 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.pymax_client import PyMaxClient, _user_id_from_profile_link
+from app.pymax_client import PyMaxClient, _normalized_link
 
 
-class TestProfileLinkParsing:
-    @pytest.mark.parametrize("link,expected", [
-        ("https://max.ru/id6633015816_gos", 6633015816),
-        ("https://max.ru/id6633015816", 6633015816),
-        ("https://web.max.ru/id42", 42),
-        ("http://max.ru/id42/", 42),
-        ("  https://max.ru/id42  ", 42),
-        ("HTTPS://MAX.RU/ID42", 42),
+class TestLinkNormalisation:
+    @pytest.mark.parametrize("a,b", [
+        ("https://max.ru/id42_gos", "https://max.ru/id42_gos"),
+        ("https://max.ru/id42_gos", "http://max.ru/id42_gos/"),
+        ("https://max.ru/id42_gos", "  HTTPS://MAX.RU/ID42_GOS  "),
+        ("https://max.ru/id42_gos", "https://web.max.ru/id42_gos"),
     ])
-    def test_reads_the_user_id_out_of_a_profile_link(self, link, expected):
-        assert _user_id_from_profile_link(link) == expected
+    def test_the_same_link_written_differently_still_matches(self, a, b):
+        assert _normalized_link(a) == _normalized_link(b)
 
-    @pytest.mark.parametrize("link", [
-        "https://max.ru/join/abcdef",       # an invite, not a profile
-        "https://max.ru/username",          # a handle with no numeric id
-        "https://max.ru/u/sometoken",
-        "https://example.com/id42",         # not MAX at all
-        "https://web.max.ru/-75107924425434",  # a chat id, handled elsewhere
-        "",
-        None,
-    ])
-    def test_leaves_everything_else_alone(self, link):
-        assert _user_id_from_profile_link(link) is None
+    def test_different_links_stay_different(self):
+        assert _normalized_link("https://max.ru/id42_gos") != \
+               _normalized_link("https://max.ru/id43_gos")
 
 
-def _client_with(my_id=100, user=MagicMock()):
+def _client_with(chats_raw=None):
     client = PyMaxClient.__new__(PyMaxClient)   # no connection, no auth
-    client._my_id = my_id
-    client.resolver = None
+    client._my_id = 100
+    client.resolver = MagicMock()
+    client.resolver.chats_raw = chats_raw if chats_raw is not None else {}
     client._client = MagicMock()
-    client._client.get_user = AsyncMock(return_value=user)
-    client._client.get_chat_id = MagicMock(side_effect=lambda a, b: a ^ b)
     client._client.join_group = AsyncMock(side_effect=ValueError("Invalid group link"))
     client._client.join_channel = AsyncMock(side_effect=RuntimeError("MAX refused"))
     return client
 
 
-class TestOpenDialogWithUser:
-    async def test_a_profile_link_resolves_to_the_dialog_without_joining(self):
-        """The bug this fixes: /add on a profile link used to be handed to
-        join_group/join_channel, which can only answer with an error —
-        there is nothing to join behind a person."""
-        client = _client_with(my_id=100)
+CHANNEL = {
+    "id": -69369957050939,
+    "type": "CHANNEL",
+    "title": 'МАДОУ детский сад №43 "Малыш"',
+    "link": "https://max.ru/id6633015816_gos",
+    "participants": {"100": 0},
+}
 
-        result = await client.open_by_link("https://max.ru/id42_gos")
 
-        assert result["chatId"] == 100 ^ 42
-        assert result["chat"]["type"] == "DIALOG"
+class TestAChatWeAlreadyHave:
+    """The case that sent /add down the wrong path entirely: a channel's
+    own handle link, mistaken for a person's profile, bound a dialog that
+    does not exist while the channel stayed unbound."""
+
+    async def test_a_handle_link_binds_the_chat_it_belongs_to(self):
+        client = _client_with({-69369957050939: CHANNEL})
+
+        result = await client.open_by_link("https://max.ru/id6633015816_gos")
+
+        assert result["chatId"] == -69369957050939
+        assert result["chat"]["title"] == 'МАДОУ детский сад №43 "Малыш"'
+
+    async def test_it_needs_neither_joining_nor_asking(self):
+        """We have the chat because we're in it — there is nothing to
+        join and nothing to look up."""
+        client = _client_with({-69369957050939: CHANNEL})
+
+        await client.open_by_link("https://max.ru/id6633015816_gos")
+
         client._client.join_group.assert_not_awaited()
         client._client.join_channel.assert_not_awaited()
 
-    async def test_an_unknown_user_still_gets_their_dialog_bound(self):
-        """MAX can decline to say anything about someone who isn't a
-        contact. The chat id doesn't depend on that answer, so the bind
-        goes ahead — only the name is lost."""
-        client = _client_with(my_id=100)
-        client._client.get_user = AsyncMock(return_value=None)
+    async def test_a_link_written_differently_still_finds_it(self):
+        client = _client_with({-69369957050939: CHANNEL})
 
-        result = await client.open_by_link("https://max.ru/id42")
+        result = await client.open_by_link("http://web.max.ru/id6633015816_gos/")
 
-        assert result["chatId"] == 100 ^ 42
+        assert result["chatId"] == -69369957050939
 
-    async def test_no_name_means_no_title_rather_than_a_stand_in_id(self):
-        """A title made of the id would look like a real name downstream
-        and suppress both /add's own peer lookup and ensure_topic's later
-        rename — leaving the topic called by number for good."""
-        client = _client_with(my_id=100)
-        client._client.get_user = AsyncMock(return_value=None)
+    async def test_an_unrelated_link_is_not_matched(self):
+        client = _client_with({-69369957050939: CHANNEL})
+        chat = MagicMock()
+        chat.id = -1
+        client._client.join_group = AsyncMock(return_value=chat)
 
-        result = await client.open_dialog_with_user(42)
+        result = await client.open_by_link("https://max.ru/join/sometoken")
 
-        assert "title" not in result["chat"]
+        assert result["chatId"] == -1
+        client._client.join_group.assert_awaited_once()
 
-    async def test_a_lookup_that_never_answers_does_not_hang_the_command(self, monkeypatch):
-        """Observed live: the request went out and nothing came back, so
-        /add waited forever and the user got no reply at all."""
-        monkeypatch.setattr("app.pymax_client.USER_LOOKUP_TIMEOUT", 0.01)
-        client = _client_with(my_id=100)
+    async def test_chats_without_a_link_are_skipped_not_crashed_on(self):
+        client = _client_with({
+            -1: {"id": -1, "title": "без ссылки"},
+            -2: "not even a dict",
+            -69369957050939: CHANNEL,
+        })
 
-        async def _never_answers(_user_id):
-            await asyncio.sleep(3600)
+        result = await client.open_by_link("https://max.ru/id6633015816_gos")
 
-        client._client.get_user = _never_answers
-
-        result = await asyncio.wait_for(client.open_dialog_with_user(42), timeout=5)
-
-        assert result["chatId"] == 100 ^ 42
-
-    async def test_it_waits_until_max_has_told_us_who_we_are(self):
-        client = _client_with(my_id=None)
-
-        result = await client.open_dialog_with_user(42)
-
-        assert "_max_error" in result
-        client._client.get_user.assert_not_awaited()
-
-    async def test_a_failing_lookup_costs_the_name_not_the_bind(self):
-        client = _client_with(my_id=100)
-        client._client.get_user = AsyncMock(side_effect=RuntimeError("нет связи"))
-
-        result = await client.open_dialog_with_user(42)
-
-        assert result["chatId"] == 100 ^ 42
-
-    async def test_the_resolved_name_becomes_the_title(self):
-        user = MagicMock()
-        user.names = []
-        client = _client_with(user=user)
-        client.resolver = MagicMock()
-        client.resolver._extract_name_from_contact = MagicMock(return_value="Иван Петров")
-        client.resolver.users = {}
-
-        result = await client.open_dialog_with_user(42)
-
-        assert result["chat"]["title"] == "Иван Петров"
-        assert client.resolver.users[42] == "Иван Петров"
-
-    async def test_an_unnamed_user_leaves_the_title_open(self):
-        client = _client_with(my_id=100)
-        client.resolver = MagicMock()
-        client.resolver._extract_name_from_contact = MagicMock(return_value="")
-        client.resolver.users = {}
-
-        result = await client.open_dialog_with_user(42)
-
-        assert result["chatId"] == 100 ^ 42
-        assert "title" not in result["chat"]
-        assert client.resolver.users == {}  # nothing worth caching
+        assert result["chatId"] == -69369957050939
 
 
-class TestJoinLinksStillWork:
-    async def test_a_join_link_goes_through_pymax_untouched(self):
+class TestJoinLinks:
+    async def test_a_join_link_goes_through_pymax(self):
         client = _client_with()
         chat = MagicMock()
         chat.id = -75107924425434
@@ -158,9 +117,9 @@ class TestJoinLinksStillWork:
 
 
 class TestJoinRefusedByMax:
-    """A join link MAX answers with "not.found" — which it also says for a
-    chat you're already in. /add wants a chat id to bind, not membership,
-    so the link is put to LINK_INFO before giving up."""
+    """A join MAX answers with not.found — which it also says for a chat
+    you're already in — or with error.user.restricted.join, seen live on
+    an account that may not join anything at all."""
 
     def _client_that_cannot_join(self, link_info_chat=None):
         client = _client_with()
@@ -172,8 +131,6 @@ class TestJoinRefusedByMax:
         return client
 
     async def test_a_chat_we_are_already_in_is_bound_despite_the_refused_join(self):
-        """MAX answers not.found for a chat you're already a member of.
-        Nothing needs joining there — the bind is what /add was after."""
         client = self._client_that_cannot_join(
             link_info_chat={"id": -68192506787240, "type": "CHAT",
                             "title": "Сотрудники", "participants": {"100": 0}},
@@ -200,8 +157,7 @@ class TestJoinRefusedByMax:
 
     async def test_a_chat_we_are_not_in_is_never_bound_without_joining(self):
         """/add joins; resolving is not joining. A topic bound to a chat
-        we never entered could never receive a message, so the join
-        failure is reported instead."""
+        we never entered could never receive a message."""
         client = self._client_that_cannot_join(
             link_info_chat={"id": -68192506787240, "type": "CHAT",
                             "title": "Чужой чат", "participants": {"999": 0}},
@@ -209,45 +165,15 @@ class TestJoinRefusedByMax:
 
         result = await client.open_by_link("https://max.ru/join/sometoken")
 
+        assert "chatId" not in result
         assert "not.found" in result["_max_error"]["message"]
 
-    async def test_the_join_error_is_what_gets_reported_when_that_fails_too(self):
-        """It describes what the user actually typed; a LINK_INFO miss
-        would only say the link resolved to nothing."""
+    async def test_nothing_resolved_reports_the_join_error(self):
         client = self._client_that_cannot_join()
 
         result = await client.open_by_link("https://max.ru/join/sometoken")
 
         assert "not.found" in result["_max_error"]["message"]
-
-
-class TestTopicNameComesFromMax:
-    """The topic has to be called what the chat is called in MAX."""
-
-    async def test_a_name_max_already_gave_us_needs_no_lookup(self):
-        """Contacts and everyone sharing a chat with us are resolved at
-        startup — asking again would only risk the lookup that hangs."""
-        client = _client_with(my_id=100)
-        client.resolver = MagicMock()
-        client.resolver.users = {42: "Наринэ Ермилова"}
-
-        result = await client.open_dialog_with_user(42)
-
-        assert result["chat"]["title"] == "Наринэ Ермилова"
-        client._client.get_user.assert_not_awaited()
-
-    async def test_a_stranger_is_looked_up(self):
-        user = MagicMock()
-        client = _client_with(my_id=100, user=user)
-        client.resolver = MagicMock()
-        client.resolver.users = {}
-        client.resolver._extract_name_from_contact = MagicMock(return_value="Олег")
-
-        result = await client.open_dialog_with_user(42)
-
-        client._client.get_user.assert_awaited_once()
-        assert result["chat"]["title"] == "Олег"
-        assert client.resolver.users[42] == "Олег"
 
 
 class TestContactLookupIsBounded:
