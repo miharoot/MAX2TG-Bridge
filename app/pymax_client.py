@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import logging
 import time
 from collections import OrderedDict
@@ -270,56 +271,119 @@ def _upload_user_agent(config) -> str:
 # How the multipart file part is labelled, tried in this order. MAX's
 # audio endpoint is undocumented, so these are the plausible spellings
 # of the same Opus-in-OGG payload; see _voice_upload_variants.
-_VOICE_MULTIPART_LABELS = (
-    # field name, filename override, content-type override
-    # (None = take it from the recording itself)
-    ("file", None, None),
-    ("file", None, "audio/ogg; codecs=opus"),
-    ("file", "voice.opus", None),
-    ("file", "voice.oga", None),
-    ("audio", None, None),
-    ("voice", None, None),
+# How to re-package the recording before uploading, tried in this order.
+# (variant name, ffmpeg arguments, filename, content type); ffmpeg args
+# of None means "send the Telegram file untouched".
+#
+# Telegram voice notes are Opus in an OGG container, which MAX rejects
+# with AUDIO_VALIDATION_FAILED however the upload is labelled (settled
+# by an earlier sweep over field names, filenames and content types).
+# MAX's own web client records voice through MediaRecorder, which in
+# Chrome produces WebM/Opus — the same Opus stream in a different
+# container, so remuxing costs nothing and is tried first.
+_VOICE_UPLOAD_FORMATS = (
+    ("webm-opus-remux", ["-c:a", "copy", "-f", "webm"], "voice.webm", "audio/webm"),
+    (
+        "webm-opus-reencode",
+        ["-c:a", "libopus", "-b:a", "32k", "-ar", "48000", "-ac", "1", "-f", "webm"],
+        "voice.webm",
+        "audio/webm",
+    ),
+    (
+        "ogg-opus-reencode",
+        ["-c:a", "libopus", "-b:a", "32k", "-ar", "48000", "-ac", "1", "-f", "ogg"],
+        "voice.ogg",
+        "audio/ogg",
+    ),
+    (
+        "m4a-aac",
+        [
+            "-c:a", "aac", "-b:a", "64k", "-ar", "44100", "-ac", "1",
+            "-movflags", "frag_keyframe+empty_moov", "-f", "mp4",
+        ],
+        "voice.m4a",
+        "audio/mp4",
+    ),
+    ("original-ogg", None, None, None),
 )
 
 
-def _voice_upload_variants():
-    """The shapes to try when POSTing a voice recording to MAX, in order.
+async def _transcode_audio(body: bytes, args: list[str]) -> bytes | None:
+    """Re-package audio with ffmpeg, or ``None`` if that isn't possible.
 
-    MAX's audio endpoint is undocumented, and a sweep in production
-    settled how the request must be framed: pymax posts the raw body
-    with a ``Content-Range`` (copied from its video upload), and MAX
-    answers every spelling of that with ``{"error_code":"4",
-    "error_data":"BAD_REQUEST"}`` — while a **multipart form** (how
-    pymax's working *photo* upload posts) instead gets
-    ``{"error_code":"1","error_data":"AUDIO_VALIDATION_FAILED"}``. A
-    different error means that request was understood and got as far as
-    inspecting the audio, so multipart is the right envelope.
-
-    What is left is how the part inside it is labelled, which is the
-    same guessing game one deploy at a time — so try the plausible
-    labels in one run and log which one MAX accepts.
-
-    Yields ``(variant_name, build)``, where ``build(name, body, size,
-    content_type, user_agent)`` returns the ``(headers, data)`` to post.
-    A fresh builder per attempt matters: a multipart body cannot be
-    replayed across requests.
+    Returns ``None`` rather than raising when ffmpeg is missing or fails,
+    so a deployment without it (or a stream ffmpeg cannot read) just
+    falls through to the remaining upload variants.
     """
+    import asyncio
 
-    def _make(field_name, filename_override, content_type_override):
-        def _build(name, body, size, content_type, user_agent):
-            filename = filename_override or name
-            ct = content_type_override or content_type
-            form = aiohttp.FormData()
-            form.add_field(name=field_name, value=body, filename=filename, content_type=ct)
-            return {"User-Agent": user_agent}, form
-
-        return _build
-
-    for field_name, filename_override, content_type_override in _VOICE_MULTIPART_LABELS:
-        label = f"{field_name}/{filename_override or '<name>'}/{content_type_override or '<type>'}"
-        yield f"multipart:{label}", _make(
-            field_name, filename_override, content_type_override
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", "pipe:0", *args, "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+    except (FileNotFoundError, OSError) as e:
+        log.warning("ffmpeg is not available, sending the recording as-is: %s", e)
+        return None
+
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(body), timeout=60)
+    except (asyncio.TimeoutError, TimeoutError):
+        log.warning("ffmpeg timed out re-packaging the recording")
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        return None
+
+    if proc.returncode != 0 or not out:
+        log.warning(
+            "ffmpeg could not re-package the recording (rc=%s): %s",
+            proc.returncode, err.decode("utf-8", "replace")[:300],
+        )
+        return None
+
+    return out
+
+
+async def _voice_upload_variants(name, body, content_type):
+    """The payloads to try when POSTing a voice recording to MAX.
+
+    Two rounds of production sweeps narrowed this down. The *envelope*
+    is settled: pymax posts the raw body with a ``Content-Range``
+    (copied from its video upload) and MAX answers every spelling of
+    that with ``{"error_code":"4","error_data":"BAD_REQUEST"}``, while a
+    **multipart form** — how pymax's working *photo* upload posts — gets
+    ``{"error_code":"1","error_data":"AUDIO_VALIDATION_FAILED"}``
+    instead. A different error means the request was understood and got
+    as far as inspecting the audio.
+
+    The *labelling* is ruled out too: every field name / filename /
+    content-type spelling of the multipart part gets the same
+    AUDIO_VALIDATION_FAILED. So what MAX objects to is the recording
+    itself — Telegram sends Opus in an OGG container, while MAX's own
+    web client records through MediaRecorder, which in Chrome produces
+    WebM/Opus. Same codec, different container, so try a remux first
+    (no re-encoding, no quality loss) before anything lossy.
+
+    Yields ``(variant_name, form)``. Yielding is lazy on purpose: each
+    variant may have to shell out to ffmpeg, and there is no point
+    paying for that once MAX has accepted an earlier one.
+    """
+    for variant, ffmpeg_args, filename, part_type in _VOICE_UPLOAD_FORMATS:
+        if ffmpeg_args is None:
+            payload, part_name, part_ct = body, name, content_type
+        else:
+            payload = await _transcode_audio(body, ffmpeg_args)
+            if payload is None:
+                log.debug("Skipping voice upload variant=%s (ffmpeg unavailable)", variant)
+                continue
+            part_name, part_ct = filename, part_type
+
+        form = aiohttp.FormData()
+        form.add_field(name="file", value=payload, filename=part_name, content_type=part_ct)
+        yield variant, form
 
 
 async def _request_voice_upload_slot(app):
@@ -448,18 +512,18 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
     verdict_from_max = False
     video_id = None
 
-    for name, build in _voice_upload_variants():
+    async for name, data in _voice_upload_variants(voice.name, body_bytes, content_type):
         # A fresh slot per variant: MAX burns the cid on a rejected POST,
         # so reusing it would answer BAD_REQUEST regardless of the shape
         # and make trying several shapes meaningless. A fresh connection
         # too — MAX drops the socket after rejecting an upload.
         upload_info = await _request_voice_upload_slot(self.app)
         video_id = upload_info.video_id
-        headers, data = build(voice.name, body_bytes, file_size, content_type, user_agent)
+        headers = {"User-Agent": user_agent}
 
         logger.debug(
-            "Voice upload attempt variant=%s voice_id=%s headers=%r url=%s",
-            name, video_id, headers, _redact_url(upload_info.url),
+            "Voice upload attempt variant=%s voice_id=%s url=%s",
+            name, video_id, _redact_url(upload_info.url),
         )
 
         try:

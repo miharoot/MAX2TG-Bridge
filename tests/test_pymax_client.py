@@ -771,6 +771,14 @@ class TestVoiceUploadUserAgentPatch:
         assert "None" not in sent_ua
 
     @staticmethod
+    def _with_ffmpeg(monkeypatch):
+        """Pretend ffmpeg is installed (it isn't in the test env)."""
+        async def _fake_transcode(body, args):
+            return b"transcoded:" + bytes(args[-1], "utf-8")
+
+        monkeypatch.setattr("app.pymax_client._transcode_audio", _fake_transcode)
+
+    @staticmethod
     def _part_of(form):
         """(field name, filename, content type) of a FormData's one part."""
         options, headers, _value = form._fields[0]
@@ -849,6 +857,7 @@ class TestVoiceUploadUserAgentPatch:
                 return TestVoiceUploadUserAgentPatch._FakeResponse(200)
 
         _patch_voice_upload_user_agent()
+        self._with_ffmpeg(monkeypatch)
         monkeypatch.setattr("aiohttp.ClientSession", _PickySession)
         service = self._fake_upload_service()
         from pymax.api.uploads.service import UploadService
@@ -879,10 +888,11 @@ class TestVoiceUploadUserAgentPatch:
         # a Content-Range on a multipart post is what MAX rejected
         assert "Content-Range" not in self._FakeSession.all_headers[0]
 
-    async def test_variants_differ_in_how_the_part_is_labelled(self, monkeypatch):
-        """With the envelope settled, the remaining unknown is how MAX
-        wants the part labelled — so every variant must actually differ
-        in field name / filename / content type."""
+    async def test_variants_repackage_the_recording(self, monkeypatch):
+        """Labelling is ruled out (every spelling got the same
+        AUDIO_VALIDATION_FAILED), so what varies now is the container —
+        starting with a WebM/Opus remux, which is what MAX's own web
+        client records and costs no re-encoding."""
         class _RejectingSession(self._FakeSession):
             def post(self, url, headers=None, data=None):
                 type(self).all_data = type(self).all_data + [data]
@@ -893,6 +903,7 @@ class TestVoiceUploadUserAgentPatch:
                 return rejecting
 
         _patch_voice_upload_user_agent()
+        self._with_ffmpeg(monkeypatch)
         _RejectingSession.all_data = []
         monkeypatch.setattr("aiohttp.ClientSession", _RejectingSession)
         service = self._fake_upload_service()
@@ -901,10 +912,29 @@ class TestVoiceUploadUserAgentPatch:
         with pytest.raises(UploadError):
             await UploadService.upload_voice(service, self._FakeVoice())
 
+        from app.pymax_client import _VOICE_UPLOAD_FORMATS
+
         labels = [self._part_of(form) for form in _RejectingSession.all_data]
-        assert len(labels) == len(set(labels))  # no duplicate attempts
-        assert ("file", "voice.opus", "audio/ogg") in labels
-        assert ("audio", "voice.ogg", "audio/ogg") in labels
+        assert len(labels) == len(_VOICE_UPLOAD_FORMATS)
+        # remux first — same Opus, just MAX's container, no quality loss
+        assert labels[0] == ("file", "voice.webm", "audio/webm")
+        # the untouched Telegram recording last, as the fallback
+        assert labels[-1] == ("file", "voice.ogg", "audio/ogg")
+
+    async def test_without_ffmpeg_it_still_sends_the_original(self, monkeypatch):
+        """A deployment without ffmpeg must not break outright — it just
+        falls back to the untouched Telegram recording."""
+        _patch_voice_upload_user_agent()
+        self._FakeSession.all_data = []
+        monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        result = await UploadService.upload_voice(service, self._FakeVoice())
+
+        assert len(self._FakeSession.all_data) == 1
+        assert self._part_of(self._FakeSession.all_data[0])[1] == "voice.ogg"
+        assert result.video_id == 42
 
     async def test_each_variant_gets_a_fresh_upload_slot(self, monkeypatch):
         """MAX burns the upload cid on a rejected POST, so replaying the
@@ -919,6 +949,7 @@ class TestVoiceUploadUserAgentPatch:
                 return rejecting
 
         _patch_voice_upload_user_agent()
+        self._with_ffmpeg(monkeypatch)
         monkeypatch.setattr("aiohttp.ClientSession", _RejectingSession)
         service = self._fake_upload_service()
         from pymax.api.uploads.service import UploadService
@@ -927,8 +958,8 @@ class TestVoiceUploadUserAgentPatch:
             await UploadService.upload_voice(service, self._FakeVoice())
 
         # one VIDEO_UPLOAD request per variant tried
-        from app.pymax_client import _VOICE_MULTIPART_LABELS
-        assert service.app.invoke.await_count == len(_VOICE_MULTIPART_LABELS)
+        from app.pymax_client import _VOICE_UPLOAD_FORMATS
+        assert service.app.invoke.await_count == len(_VOICE_UPLOAD_FORMATS)
 
     async def test_a_dropped_connection_does_not_abandon_the_other_variants(
         self, monkeypatch
@@ -947,6 +978,7 @@ class TestVoiceUploadUserAgentPatch:
                 return TestVoiceUploadUserAgentPatch._FakeResponse(200)
 
         _patch_voice_upload_user_agent()
+        self._with_ffmpeg(monkeypatch)
         monkeypatch.setattr("aiohttp.ClientSession", _FlakySession)
         service = self._fake_upload_service()
         from pymax.api.uploads.service import UploadService
