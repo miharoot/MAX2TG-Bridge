@@ -725,6 +725,32 @@ class TestVoiceUploadUserAgentPatch:
         assert "%20" not in sent_ua and "%28" not in sent_ua
         assert result.video_id == 42
 
+    async def test_declares_an_audio_content_type(self, monkeypatch):
+        """pymax sends application/octet-stream, leaving MAX's audio
+        validator nothing to identify the payload by — it then rejects
+        the upload outright (AUDIO_VALIDATION_FAILED). A Telegram voice
+        note is Opus in an OGG container, which MAX accepts."""
+        _patch_voice_upload_user_agent()
+        monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
+
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        await UploadService.upload_voice(service, self._FakeVoice())
+
+        assert self._FakeSession.last_headers["Content-Type"] == "audio/ogg"
+
+    def test_audio_content_type_by_extension(self):
+        from app.pymax_client import _audio_content_type
+
+        assert _audio_content_type("voice.ogg") == "audio/ogg"
+        assert _audio_content_type("file_9.oga") == "audio/ogg"
+        assert _audio_content_type("note.opus") == "audio/ogg"
+        assert _audio_content_type("clip.m4a") == "audio/mp4"
+        assert _audio_content_type("song.MP3") == "audio/mpeg"
+        assert _audio_content_type("mystery") == "application/octet-stream"
+        assert _audio_content_type("weird.xyz") == "application/octet-stream"
+
     async def test_attach_serializes_with_audio_id_not_video_token(self, monkeypatch):
         """The actual send-side fix: MAX rejects an AUDIO attach that
         names a video-pipeline token ('video.not.ready', forever), so the
@@ -747,6 +773,31 @@ class TestVoiceUploadUserAgentPatch:
         _patch_voice_upload_user_agent()
         from pymax.api.uploads.service import UploadService
         assert UploadService.upload_voice is not None
+
+    async def test_rejected_audio_raises_immediately_not_as_a_timing_error(
+        self, monkeypatch
+    ):
+        """MAX answers a rejected recording with HTTP 200 + an error body
+        ({"error_code":"1","error_data":"AUDIO_VALIDATION_FAILED"}).
+        That is a verdict on the file, not a "not ready yet" — it must
+        surface as VoiceRejectedByMax so the send path stops retrying."""
+        from app.pymax_client import VoiceRejectedByMax
+
+        class _RejectingResponse(self._FakeResponse):
+            async def text(self):
+                return '{"error_code":"1","error_data":"AUDIO_VALIDATION_FAILED"}'
+
+        class _RejectingSession(self._FakeSession):
+            def post(self, url, headers=None, data=None):
+                return _RejectingResponse(200)
+
+        _patch_voice_upload_user_agent()
+        monkeypatch.setattr("aiohttp.ClientSession", _RejectingSession)
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        with pytest.raises(VoiceRejectedByMax, match="AUDIO_VALIDATION_FAILED"):
+            await UploadService.upload_voice(service, self._FakeVoice())
 
     async def test_upload_http_error_still_raises_upload_error(self, monkeypatch):
         _patch_voice_upload_user_agent()
@@ -796,6 +847,21 @@ class TestSendMessageAttachmentRetry:
         assert raw.send_message.await_count == _ATTACHMENT_READY_MAX_ATTEMPTS
         assert "_max_error" in resp
         assert "Timed out" in resp["_max_error"]["message"]
+
+    async def test_rejected_audio_is_not_retried(self, adapter):
+        """A rejected recording can never become sendable, so burning
+        five re-uploads (~40s) on it is pure waste."""
+        from app.pymax_client import VoiceRejectedByMax
+
+        client, raw = adapter
+        raw.send_message = AsyncMock(
+            side_effect=VoiceRejectedByMax("MAX rejected the audio itself (...)")
+        )
+
+        resp = await client.send_message(20, attaches=[object()])
+
+        raw.send_message.assert_awaited_once()
+        assert "rejected the audio" in resp["_max_error"]["message"]
 
     async def test_non_upload_error_fails_immediately_without_retry(self, adapter):
         client, raw = adapter

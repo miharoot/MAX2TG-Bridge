@@ -213,6 +213,37 @@ def _patch_attachment_wait_timeout() -> None:
     )
 
 
+_AUDIO_CONTENT_TYPES = {
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".aac": "audio/aac",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+}
+
+
+def _audio_content_type(name: str) -> str:
+    """Content-Type for an audio upload, from its file extension."""
+    suffix = name.rsplit(".", 1)[-1].lower() if "." in (name or "") else ""
+    return _AUDIO_CONTENT_TYPES.get(f".{suffix}", "application/octet-stream")
+
+
+class VoiceRejectedByMax(UploadError):
+    """MAX's server rejected the uploaded audio *itself* — as opposed to
+    it merely not having finished processing yet.
+
+    MAX answers the audio upload with an HTTP 200 whose body carries the
+    real verdict (e.g. ``{"error_code":"1","error_data":
+    "AUDIO_VALIDATION_FAILED"}``); pymax never reads that body, which is
+    why this looked for so long like a "not ready yet" timing problem.
+    It is not: a rejected recording never becomes sendable, so waiting
+    and re-uploading it can only burn time.
+    """
+
+
 _PATCHED_VOICE_UPLOAD_USER_AGENT = False
 
 
@@ -243,7 +274,16 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
        carrying *both* ``videoId`` and ``audioId`` (see
        ``_fixed_resolve_attach``): the server does track these under an
        ``audioId``, and that is the id an audio attach should name.
-    2. The ``User-Agent`` header is sent as-is instead of being run
+    2. **The upload declares what it actually is.** pymax hardcodes
+       ``Content-Type: application/octet-stream``, so MAX's audio
+       validator gets no hint about the payload and answers the upload
+       with ``{"error_code":"1","error_data":"AUDIO_VALIDATION_FAILED"}``
+       — in an HTTP *200* body, which is why this looked like a timing
+       problem for so long (pymax never reads that body; its source has
+       a TODO saying as much). MAX does accept Opus, and a Telegram
+       voice note already is Opus in an OGG container, so the codec was
+       never the problem — only that nothing said so.
+    3. The ``User-Agent`` header is sent as-is instead of being run
        through ``urllib.parse.quote()``, which percent-escaped the
        spaces/parens/semicolons in it (a header value is not a URL
        component). ``upload_video``/``upload_file`` send no such header
@@ -312,12 +352,17 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
         "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
         "Content-Length": str(file_size),
         "Connection": "keep-alive",
-        "Content-Type": "application/octet-stream",
-        # The one-line fix: pymax's own version wraps this in quote(),
-        # percent-escaping the header value as if it were a URL — see
-        # this function's docstring.
+        # pymax hardcodes application/octet-stream here, leaving MAX's
+        # audio validator nothing to go on — see this function's
+        # docstring. Telegram voice notes are Opus in an OGG container
+        # (a .oga file is just OGG), which MAX does accept, so name it.
+        "Content-Type": _audio_content_type(voice.name),
+        # pymax's own version wraps this in quote(), percent-escaping
+        # the header value as if it were a URL.
         "User-Agent": user_agent,
     }
+
+    logger.debug("Voice upload headers=%r url=%s", headers, _redact_url(upload_info.url))
 
     timeout = aiohttp.ClientTimeout(total=self.app.config.upload_timeout, sock_read=60)
     video_id = upload_info.video_id
@@ -341,11 +386,22 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
                     )
 
                 # MAX reports upload errors with an HTTP 200, so this
-                # body is the only place such a failure would surface.
+                # body is the only place such a failure surfaces.
                 try:
                     body = (await resp.text())[:500]
                 except Exception:
                     body = "<unreadable>"
+
+                if "error_code" in body:
+                    logger.error(
+                        "MAX rejected the uploaded audio voice_id=%s response_body=%r",
+                        video_id, body,
+                    )
+                    raise VoiceRejectedByMax(
+                        f"MAX rejected the audio itself ({body}) — the recording never "
+                        f"becomes sendable, so retrying cannot help voice_id={video_id}"
+                    )
+
                 logger.debug(
                     "Voice upload complete voice_id=%s response_body=%r", video_id, body,
                 )
@@ -821,6 +877,11 @@ class PyMaxClient:
                     attachments=attaches or None,
                     notify=True,
                 )
+            except VoiceRejectedByMax as exc:
+                # Not a timing problem — re-uploading the same rejected
+                # recording would fail identically every time.
+                log.error("MAX rejected the audio for chat %s: %s", chat_id, exc)
+                return {"_max_error": {"message": str(exc)}}
             except UploadError as exc:
                 last_exc = exc
                 log.warning(
