@@ -1035,9 +1035,25 @@ class PyMaxClient:
         return {"chat": _chat_to_dict(chat)} if chat else {}
 
     async def fetch_contacts(self, contact_ids: list[int]) -> dict:
+        """Look up contacts, giving up rather than waiting forever.
+
+        MAX can leave a lookup unanswered indefinitely — seen live for a
+        profile it won't describe — and this call sits on the path of the
+        topic intro card, the resolver's name lookups and /add's title
+        pick. Unbounded, one silent server meant the card was never
+        posted at all. A missing name only costs a name; a hang costs the
+        whole feature.
+        """
         if not contact_ids:
             return {}
-        users = await self._client.get_users(contact_ids)
+        try:
+            users = await asyncio.wait_for(
+                self._client.get_users(contact_ids), timeout=USER_LOOKUP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning("MAX did not answer a contact lookup for %s in %ss",
+                        contact_ids, USER_LOOKUP_TIMEOUT)
+            return {}
         return {"contacts": [_user_to_dict(user) for user in users if user]}
 
     async def resolve_file_url(self, chat_id, message_id, file_id) -> str | None:
@@ -1287,24 +1303,26 @@ class PyMaxClient:
         # holding rather than importing it or re-deriving the rules here.
         if not title and user is not None and self.resolver is not None:
             title = self.resolver._extract_name_from_contact(_user_to_dict(user))
-        title = title or str(user_id)
         log.info("Resolved MAX profile link: user_id=%s (%r) → dialog chat_id=%s",
-                 user_id, title, chat_id)
+                 user_id, title or "no name yet", chat_id)
 
-        if self.resolver is not None and title != str(user_id):
+        if title and self.resolver is not None:
             # So the topic title and message headers show a name rather
             # than the bare id, without waiting for a contacts fetch.
             self.resolver.users[int(user_id)] = title
 
-        return {
-            "chatId": chat_id,
-            "chat": {
-                "id": chat_id,
-                "type": "DIALOG",
-                "title": title,
-                "participants": {str(self._my_id): 0, str(user_id): 0},
-            },
+        chat = {
+            "id": chat_id,
+            "type": "DIALOG",
+            "participants": {str(self._my_id): 0, str(user_id): 0},
         }
+        # Only a real name goes in. A stand-in id would look like a title
+        # to everyone downstream and suppress the naming they'd otherwise
+        # do — /add's own peer lookup, and ensure_topic's rename once MAX
+        # finally says who this is.
+        if title:
+            chat["title"] = title
+        return {"chatId": chat_id, "chat": chat}
 
     def _is_participant(self, chat: dict) -> bool:
         """Whether we're already in this chat, per MAX's own participant list."""
@@ -1347,7 +1365,15 @@ class PyMaxClient:
             log.warning("LINK_INFO resolved %s to chat %s, but we are not in it — "
                         "reporting the join failure instead of binding it",
                         _redact_url(link), chat.get("id"))
-            return {"_max_error": {"message": str(join_error)}}
+            # Naming the chat turns a dead end into a next step: join it
+            # from the MAX app, then /bind that id (or repeat /add).
+            # Plain text on purpose: /add reports MAX errors without
+            # parse_mode, so markup would show up as markup.
+            return {"_max_error": {"message": (
+                f"{join_error}\n\nЧат найден, его id: {chat['id']} — вступите "
+                f"в него в MAX, затем повторите /add или используйте /bind "
+                f"с этим id."
+            )}}
         log.info("Already a member of chat %s; binding it despite the refused join",
                  chat.get("id"))
         return {"chatId": chat["id"], "chat": chat}

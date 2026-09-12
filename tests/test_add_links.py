@@ -75,7 +75,17 @@ class TestOpenDialogWithUser:
         result = await client.open_by_link("https://max.ru/id42")
 
         assert result["chatId"] == 100 ^ 42
-        assert result["chat"]["title"] == "42"
+
+    async def test_no_name_means_no_title_rather_than_a_stand_in_id(self):
+        """A title made of the id would look like a real name downstream
+        and suppress both /add's own peer lookup and ensure_topic's later
+        rename — leaving the topic called by number for good."""
+        client = _client_with(my_id=100)
+        client._client.get_user = AsyncMock(return_value=None)
+
+        result = await client.open_dialog_with_user(42)
+
+        assert "title" not in result["chat"]
 
     async def test_a_lookup_that_never_answers_does_not_hang_the_command(self, monkeypatch):
         """Observed live: the request went out and nothing came back, so
@@ -91,7 +101,6 @@ class TestOpenDialogWithUser:
         result = await asyncio.wait_for(client.open_dialog_with_user(42), timeout=5)
 
         assert result["chatId"] == 100 ^ 42
-        assert result["chat"]["title"] == "42"
 
     async def test_it_waits_until_max_has_told_us_who_we_are(self):
         client = _client_with(my_id=None)
@@ -108,7 +117,6 @@ class TestOpenDialogWithUser:
         result = await client.open_dialog_with_user(42)
 
         assert result["chatId"] == 100 ^ 42
-        assert result["chat"]["title"] == "42"
 
     async def test_the_resolved_name_becomes_the_title(self):
         user = MagicMock()
@@ -123,15 +131,16 @@ class TestOpenDialogWithUser:
         assert result["chat"]["title"] == "Иван Петров"
         assert client.resolver.users[42] == "Иван Петров"
 
-    async def test_an_unnamed_user_falls_back_to_the_bare_id(self):
-        client = _client_with()
+    async def test_an_unnamed_user_leaves_the_title_open(self):
+        client = _client_with(my_id=100)
         client.resolver = MagicMock()
         client.resolver._extract_name_from_contact = MagicMock(return_value="")
         client.resolver.users = {}
 
         result = await client.open_dialog_with_user(42)
 
-        assert result["chat"]["title"] == "42"
+        assert result["chatId"] == 100 ^ 42
+        assert "title" not in result["chat"]
         assert client.resolver.users == {}  # nothing worth caching
 
 
@@ -174,6 +183,20 @@ class TestJoinRefusedByMax:
 
         assert result["chatId"] == -68192506787240
         client._client._app.invoke.assert_awaited_once()
+
+    async def test_the_error_names_the_chat_so_there_is_a_next_step(self):
+        """Knowing which chat the link points at turns "can't join" into
+        "join it in MAX, then bind this id"."""
+        client = self._client_that_cannot_join(
+            link_info_chat={"id": -68192506787240, "type": "CHAT",
+                            "participants": {"999": 0}},
+        )
+
+        result = await client.open_by_link("https://max.ru/join/sometoken")
+
+        message = result["_max_error"]["message"]
+        assert "-68192506787240" in message
+        assert "<" not in message   # /add reports errors without parse_mode
 
     async def test_a_chat_we_are_not_in_is_never_bound_without_joining(self):
         """/add joins; resolving is not joining. A topic bound to a chat
@@ -225,3 +248,32 @@ class TestTopicNameComesFromMax:
         client._client.get_user.assert_awaited_once()
         assert result["chat"]["title"] == "Олег"
         assert client.resolver.users[42] == "Олег"
+
+
+class TestContactLookupIsBounded:
+    """The contacts fetch sits under the topic intro card, the resolver's
+    name lookups and /add's title pick. Live, one unanswered lookup left
+    the card unposted entirely."""
+
+    async def test_a_lookup_that_never_answers_gives_up(self, monkeypatch):
+        monkeypatch.setattr("app.pymax_client.USER_LOOKUP_TIMEOUT", 0.01)
+        client = _client_with()
+
+        async def _never_answers(_ids):
+            await asyncio.sleep(3600)
+
+        client._client.get_users = _never_answers
+
+        result = await asyncio.wait_for(client.fetch_contacts([42]), timeout=5)
+
+        assert result == {}
+
+    async def test_contacts_that_do_answer_come_back(self):
+        client = _client_with()
+        user = MagicMock()
+        user.names = []
+        client._client.get_users = AsyncMock(return_value=[user])
+
+        result = await client.fetch_contacts([42])
+
+        assert len(result["contacts"]) == 1
