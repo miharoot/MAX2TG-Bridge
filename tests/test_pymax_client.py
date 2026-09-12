@@ -638,11 +638,12 @@ class TestAttachmentWaitTimeoutPatch:
 
 
 class TestVoiceUploadUserAgentPatch:
-    """MaxApiTeam/PyMax#103: pymax's own upload_voice() runs the
-    User-Agent header value through urllib.parse.quote(), producing a
-    mangled percent-escaped value MAX's server never finishes processing
-    (upload_video/upload_file send no User-Agent at all). Patched
-    version must send it unquoted and otherwise behave identically."""
+    """pymax's upload_voice() hands MSG_SEND a video-pipeline token for
+    an AUDIO attach, so MAX answers errors.process.attachment.video.
+    not.ready forever (see MaxApiTeam/PyMax#103). The patched version
+    returns an empty token so the attach serializes as
+    {_type: AUDIO, audioId: ...}, and sends the User-Agent header
+    unquoted."""
 
     class _FakeVoice:
         name = "voice.ogg"
@@ -661,6 +662,9 @@ class TestVoiceUploadUserAgentPatch:
     class _FakeResponse:
         def __init__(self, status=200):
             self.status = status
+
+        async def text(self):
+            return '{"ok": true}'
 
         async def __aenter__(self):
             return self
@@ -719,7 +723,24 @@ class TestVoiceUploadUserAgentPatch:
         sent_ua = self._FakeSession.last_headers["User-Agent"]
         assert sent_ua == "OKMessages/26.8.4 (Linux; Chrome; 1080x1920 1.0x)"
         assert "%20" not in sent_ua and "%28" not in sent_ua
-        assert result.token == "tok123"
+        assert result.video_id == 42
+
+    async def test_attach_serializes_with_audio_id_not_video_token(self, monkeypatch):
+        """The actual send-side fix: MAX rejects an AUDIO attach that
+        names a video-pipeline token ('video.not.ready', forever), so the
+        payload must reference the upload by audioId instead."""
+        _patch_voice_upload_user_agent()
+        monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
+
+        service = self._fake_upload_service()
+        from pymax.api.uploads.service import UploadService
+
+        result = await UploadService.upload_voice(service, self._FakeVoice())
+        serialized = result.model_dump(by_alias=True)
+
+        assert serialized["audioId"] == 42
+        assert "token" not in serialized
+        assert serialized["_type"].value == "AUDIO"
 
     async def test_patching_twice_is_a_no_op(self):
         _patch_voice_upload_user_agent()

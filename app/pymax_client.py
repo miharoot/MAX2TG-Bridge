@@ -219,27 +219,42 @@ _PATCHED_VOICE_UPLOAD_USER_AGENT = False
 async def _upload_voice_without_mangled_user_agent(self, voice):
     """Replacement for pymax's ``UploadService.upload_voice``.
 
-    Root cause (not a workaround like the two patches above): identified
-    from a maintainer-filed upstream bug report — MaxApiTeam/PyMax#103
-    ("2.4.1: голосовое загружается, но сервер не доводит обработку до
-    конца — video.not.ready"). That report shows the exact same symptom
-    we see in production (upload HTTP 200s, MAX's server never sends the
-    NOTIF_ATTACH ready signal, waiting up to 30s+ before giving up does
-    not help) and pins it on the ``User-Agent`` header pymax sends with
-    the voice upload HTTP request: it runs the header value through
-    ``urllib.parse.quote()`` before sending, producing a mangled value
-    like ``OKMessages/26.27.1%20%28Android%2013%3B%20...`` (percent-
-    escaped spaces/parens/semicolons) — a header value is not a URL
-    component and was never meant to be quoted. pymax's own
-    ``upload_video``/``upload_file`` send no ``User-Agent`` header at
-    all, only ``upload_voice`` does this, which lines up with why only
-    voice uploads get stuck "not ready" forever.
+    Fixes two things in the upstream version, both about how a voice
+    upload is handed to the server:
 
-    This is a full copy of pymax's ``upload_voice`` (down to log
-    messages and error handling) with that one line fixed — sending the
-    header value as-is, unquoted. Kept in sync with pymax 2.4.1
-    (maxapi-python); if pymax fixes this upstream, this patch becomes a
-    no-op duplicate and can be removed.
+    1. **The attach is referenced by ``audioId``, not by the video
+       token.** This is what actually makes voice sending work.
+       ``upload_voice`` returns a ``VoiceAttachPayload`` carrying the
+       ``token`` from MAX's *video* upload pipeline (voice is uploaded
+       through it), so ``MSG_SEND`` ends up sending
+       ``{_type: AUDIO, token: <video token>, ...}`` — and MAX answers
+       ``errors.process.attachment.video.not.ready``: a *video* error
+       for an *audio* attach, i.e. it resolved that token through the
+       video pipeline, where nothing is ever going to become ready. The
+       attachment therefore stays "not ready" forever, no amount of
+       waiting or retrying helps (confirmed in production over many
+       attempts, and in upstream bug MaxApiTeam/PyMax#103).
+       ``VideoAttachPayload.serialize_attachment`` already has the
+       correct shape for this — when an AUDIO attach carries no token it
+       serializes as ``{_type: AUDIO, audioId: <id>, ...}`` — but that
+       branch is dead code upstream, because ``upload_voice`` always
+       fills the token in. Passing an empty token here is what reaches
+       it. Corroborated by the ready-notification for a voice upload
+       carrying *both* ``videoId`` and ``audioId`` (see
+       ``_fixed_resolve_attach``): the server does track these under an
+       ``audioId``, and that is the id an audio attach should name.
+    2. The ``User-Agent`` header is sent as-is instead of being run
+       through ``urllib.parse.quote()``, which percent-escaped the
+       spaces/parens/semicolons in it (a header value is not a URL
+       component). ``upload_video``/``upload_file`` send no such header
+       at all. This alone did not fix sending, but a mangled header is
+       still wrong to send.
+
+    Otherwise a faithful copy of pymax 2.4.1's ``upload_voice``
+    (maxapi-python), down to log messages and error handling. The upload
+    response body is logged at debug level because MAX reports upload
+    errors *with* an HTTP 200 (pymax's own source has a TODO about
+    exactly that), so the body is the only place a failure would show.
     """
     from http import HTTPStatus
 
@@ -306,7 +321,6 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
 
     timeout = aiohttp.ClientTimeout(total=self.app.config.upload_timeout, sock_read=60)
     video_id = upload_info.video_id
-    token = upload_info.token
 
     try:
         async with aiohttp.ClientSession(
@@ -326,10 +340,23 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
                         f"Voice upload failed with status {resp.status} video_id={video_id}"
                     )
 
-                logger.debug("Voice upload complete voice_id=%s", video_id)
+                # MAX reports upload errors with an HTTP 200, so this
+                # body is the only place such a failure would surface.
+                try:
+                    body = (await resp.text())[:500]
+                except Exception:
+                    body = "<unreadable>"
+                logger.debug(
+                    "Voice upload complete voice_id=%s response_body=%r", video_id, body,
+                )
+
+                # Empty token on purpose — that is what makes pymax
+                # serialize this attach as {_type: AUDIO, audioId: ...}
+                # instead of naming a video-pipeline token MAX can never
+                # resolve. See this function's docstring.
                 return VoiceAttachPayload(
                     video_id=video_id,
-                    token=token,
+                    token="",
                     duration=await voice.get_duration(),
                     wave=b"\x00" * 80,
                 )
