@@ -1,13 +1,15 @@
 """Tests for app/outbox_retry.py — backoff timing and per-item retry
 dispatch across the three outbox directions."""
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.outbox import MAX_TO_TG, TG_TO_MAX_MEDIA, TG_TO_MAX_TEXT, OutboxItem
-from app.outbox_retry import MAX_BACKOFF, _backoff_seconds, _retry_one
+import app.tg_handler as tg_handler
+from app.outbox import MAX_TO_TG, TG_TO_MAX_MEDIA, TG_TO_MAX_TEXT, Outbox, OutboxItem
+from app.outbox_retry import MAX_BACKOFF, _backoff_seconds, _retry_one, run_outbox_retry_loop
 
 
 class TestBackoffSeconds:
@@ -139,6 +141,74 @@ class TestRetryOneTgToMaxMedia:
 
         client.outbox.remove.assert_not_awaited()
         client.outbox.mark_failed.assert_awaited_once()
+
+
+class TestRunOutboxRetryLoopInFlightGuard:
+    """Covers the race this fixes: a live send (or an earlier sweep tick)
+    can still be waiting on a slow delivery — voice/video attachments
+    routinely take pymax's internal "attachment not ready" retry up to a
+    minute — when the next 20s sweep tick runs. Without a claim check the
+    sweep would start a second, duplicate delivery attempt for the same
+    still-in-progress item."""
+
+    async def _run_one_tick(self, client, sender, monkeypatch):
+        """Drive run_outbox_retry_loop through exactly one sweep iteration
+        by making the second asyncio.sleep call raise CancelledError."""
+        monkeypatch.setattr(
+            "app.outbox_retry.asyncio.sleep",
+            AsyncMock(side_effect=[None, asyncio.CancelledError()]),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await run_outbox_retry_loop(client, sender, 1024)
+
+    async def test_skips_item_already_claimed_in_flight(self, monkeypatch):
+        ob = Outbox(":memory:")
+        item_id = await ob.add(TG_TO_MAX_MEDIA, {
+            "max_chat_id": 42, "tg_chat_id": -100, "thread_id": 10,
+            "tg_message_id": 501, "caption": "", "elements": [],
+            "media_specs": [{"kind": "voice", "file_id": "abc"}],
+        })
+        ob.try_start(item_id)  # simulate the original live send still running
+
+        redeliver_media = AsyncMock()
+        monkeypatch.setattr(tg_handler, "redeliver_tg_to_max_media", redeliver_media)
+
+        client = MagicMock()
+        client.outbox = ob
+        sender = MagicMock()
+        sender.bot = MagicMock()
+
+        await self._run_one_tick(client, sender, monkeypatch)
+
+        redeliver_media.assert_not_awaited()
+        items = await ob.pending()
+        assert len(items) == 1
+        assert items[0].attempts == 0
+        await ob.close()
+
+    async def test_delivers_and_releases_claim_when_not_in_flight(self, monkeypatch):
+        ob = Outbox(":memory:")
+        item_id = await ob.add(TG_TO_MAX_MEDIA, {
+            "max_chat_id": 42, "tg_chat_id": -100, "thread_id": 10,
+            "tg_message_id": 501, "caption": "", "elements": [],
+            "media_specs": [{"kind": "voice", "file_id": "abc"}],
+        })
+
+        redeliver_media = AsyncMock(return_value=True)
+        monkeypatch.setattr(tg_handler, "redeliver_tg_to_max_media", redeliver_media)
+
+        client = MagicMock()
+        client.outbox = ob
+        sender = MagicMock()
+        sender.bot = MagicMock()
+
+        await self._run_one_tick(client, sender, monkeypatch)
+
+        redeliver_media.assert_awaited_once()
+        assert await ob.pending() == []
+        # claim released after delivery, so a later sweep isn't blocked
+        assert ob.try_start(item_id) is True
+        await ob.close()
 
 
 class TestRetryOneUnknownDirection:

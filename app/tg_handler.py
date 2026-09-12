@@ -274,24 +274,32 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "text": message.text,
         "elements": elements,
     })
-
+    # Claim the item before the background retry sweep can see it as
+    # pending (see Outbox.try_start) — this call can never fail here since
+    # item_id was just minted above. Held until the row is finalized
+    # below, so the sweep can't start a duplicate attempt while this one
+    # is still in progress.
+    max_client.outbox.try_start(item_id)
     try:
-        resp = await max_client.send_message(max_chat_id, message.text,
-                                              elements=elements)
-    except Exception as exc:
-        log.exception("Failed to send reply to Max chat %s", max_chat_id)
-        await message.reply_text("⚠️ Ошибка при отправке в Max. Повторю попытку позже.")
-        await max_client.outbox.mark_failed(item_id, str(exc))
-        return
+        try:
+            resp = await max_client.send_message(max_chat_id, message.text,
+                                                  elements=elements)
+        except Exception as exc:
+            log.exception("Failed to send reply to Max chat %s", max_chat_id)
+            await message.reply_text("⚠️ Ошибка при отправке в Max. Повторю попытку позже.")
+            await max_client.outbox.mark_failed(item_id, str(exc))
+            return
 
-    ok = await _surface_send_result(
-        resp, bot=context.bot, tg_chat_id=tg_chat_id, tg_message_id=message.message_id,
-        notify=message.reply_text, max_client=max_client, max_chat_id=max_chat_id,
-    )
-    if ok:
-        await max_client.outbox.remove(item_id)
-    else:
-        await max_client.outbox.mark_failed(item_id, "MAX did not confirm delivery")
+        ok = await _surface_send_result(
+            resp, bot=context.bot, tg_chat_id=tg_chat_id, tg_message_id=message.message_id,
+            notify=message.reply_text, max_client=max_client, max_chat_id=max_chat_id,
+        )
+        if ok:
+            await max_client.outbox.remove(item_id)
+        else:
+            await max_client.outbox.mark_failed(item_id, "MAX did not confirm delivery")
+    finally:
+        max_client.outbox.finish(item_id)
 
 
 async def _download_tg_file(file_obj, max_bytes: int = DEFAULT_MAX_UPLOAD_BYTES) -> bytes | None:
@@ -493,15 +501,26 @@ async def _send_topic_media_messages(messages, max_chat_id, max_client, max_uplo
         "media_specs": specs,
     })
 
-    ok = await _deliver_tg_media(
-        bot, max_client, max_chat_id, max_upload_bytes, caption, elements, specs,
-        notify=caption_message.reply_text,
-        tg_chat_id=tg_chat_id, tg_message_id=caption_message.message_id,
-    )
-    if ok:
-        await max_client.outbox.remove(item_id)
-    else:
-        await max_client.outbox.mark_failed(item_id, "delivery failed")
+    # Claim the item before the background retry sweep can see it as
+    # pending (see Outbox.try_start) — held until the row is finalized
+    # below. Voice/video attachments can legitimately take pymax's
+    # internal "attachment not ready" retry up to a minute to resolve
+    # (see app/pymax_client.py), far longer than the sweep's 20s poll
+    # interval, so without this the sweep would start a duplicate upload
+    # while this one is still in progress.
+    max_client.outbox.try_start(item_id)
+    try:
+        ok = await _deliver_tg_media(
+            bot, max_client, max_chat_id, max_upload_bytes, caption, elements, specs,
+            notify=caption_message.reply_text,
+            tg_chat_id=tg_chat_id, tg_message_id=caption_message.message_id,
+        )
+        if ok:
+            await max_client.outbox.remove(item_id)
+        else:
+            await max_client.outbox.mark_failed(item_id, "delivery failed")
+    finally:
+        max_client.outbox.finish(item_id)
 
 
 async def _flush_media_group(key, context) -> None:

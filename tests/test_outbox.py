@@ -94,6 +94,27 @@ class TestCount:
         assert await ob.count() == 0
 
 
+class TestInFlightTracking:
+    async def test_try_start_succeeds_for_a_fresh_item(self, ob):
+        assert ob.try_start(1) is True
+
+    async def test_try_start_fails_while_already_claimed(self, ob):
+        ob.try_start(1)
+        assert ob.try_start(1) is False
+
+    async def test_try_start_succeeds_again_after_finish(self, ob):
+        ob.try_start(1)
+        ob.finish(1)
+        assert ob.try_start(1) is True
+
+    async def test_finish_is_a_no_op_for_an_unclaimed_item(self, ob):
+        ob.finish(9999)  # must not raise
+
+    async def test_claims_are_independent_per_item(self, ob):
+        ob.try_start(1)
+        assert ob.try_start(2) is True
+
+
 class TestPersistenceAcrossConnections:
     async def test_survives_reopening_the_same_file(self, tmp_path):
         path = str(tmp_path / "outbox.db")

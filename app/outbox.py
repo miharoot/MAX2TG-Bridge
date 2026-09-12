@@ -56,6 +56,39 @@ class Outbox:
         self._path = path
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        # Item ids currently being delivered (live send or a background
+        # retry sweep), so the two never overlap for the same row — see
+        # try_start/finish below.
+        self._in_flight: set[int] = set()
+
+    def try_start(self, item_id: int) -> bool:
+        """Claim an item for delivery. Returns False if it's already being
+        delivered elsewhere (a live send still running, or an earlier
+        retry sweep tick that hasn't finished), in which case the caller
+        must skip it rather than start a second, duplicate attempt.
+
+        This matters most for voice/video attachments: MAX's server can
+        take up to a minute to report an upload "ready" (see the ApiError
+        matching patch in app/pymax_client.py), and the background retry
+        sweep (app/outbox_retry.py) polls every 20 seconds — far sooner
+        than that wait can finish. Without this guard, the sweep would
+        see the row still pending and kick off a brand new upload+send
+        for the same message while the first attempt is still legitimately
+        waiting, risking duplicate delivery or wasted concurrent uploads.
+
+        Plain set membership check-then-add is safe here without locking:
+        this is asyncio, and neither operation awaits, so nothing can
+        interleave between them.
+        """
+        if item_id in self._in_flight:
+            return False
+        self._in_flight.add(item_id)
+        return True
+
+    def finish(self, item_id: int) -> None:
+        """Release a claim made by try_start, whether delivery succeeded
+        or failed."""
+        self._in_flight.discard(item_id)
 
     async def _get_conn(self) -> aiosqlite.Connection:
         if self._conn is not None:
