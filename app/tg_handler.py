@@ -20,7 +20,7 @@ from telegram.request import HTTPXRequest
 
 from app import outbox
 from app.outbox import PermanentDeliveryFailure
-from app.pymax_client import PyMaxClient
+from app.pymax_client import PyMaxClient, _normalized_phone
 from app.topics import TopicStore
 
 log = logging.getLogger(__name__)
@@ -927,8 +927,9 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     `/add https://max.ru/id<digits>_gos` for a public group/channel
     handle — which binds straight away when we're subscribed already.
     See PyMaxClient.open_by_link for how each is resolved. A one-to-one
-    chat has no link to paste, so `/add <user id>` takes the person's id
-    instead and derives their dialog.
+    chat has no link to paste, so `/add +79991234567` (MAX resolves the
+    number) or `/add <user id>` takes the person instead and derives
+    their dialog.
     """
     message = update.message
     if message is None:
@@ -959,23 +960,34 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # PyMaxClient.open_dialog_with_user). Negative numbers are group and
     # channel ids, which /bind takes.
     user_id = None
-    if not link and args and args[0].isdigit():
-        user_id = int(args[0])
+    phone = None
+    if not link and args:
+        argument = " ".join(args).strip()
+        if _normalized_phone(argument) is not None:
+            # A leading + is the only thing separating a phone from a user
+            # id — both are otherwise just digits.
+            phone = argument
+        elif args[0].isdigit():
+            user_id = int(args[0])
 
-    if user_id is None and (not link.startswith(("http://", "https://"))
-                            or "max.ru/" not in link):
+    if user_id is None and phone is None and (
+        not link.startswith(("http://", "https://")) or "max.ru/" not in link
+    ):
         await message.reply_text(
             "Использование: <code>/add https://max.ru/join/...</code> "
             "(приглашение), <code>/add https://max.ru/id..._gos</code> "
-            "(публичная ссылка группы/канала) или <code>/add &lt;id "
-            "пользователя&gt;</code> (личный чат с человеком).",
+            "(публичная ссылка группы/канала), <code>/add +79991234567</code> "
+            "(по номеру телефона) или <code>/add &lt;id пользователя&gt;</code>.",
             parse_mode="HTML",
         )
         return
 
     max_client: PyMaxClient = context.bot_data[MAX_CLIENT_KEY]
     try:
-        if user_id is not None:
+        if phone is not None:
+            log.info("/add: looking up a MAX user by phone")
+            resp = await max_client.open_dialog_by_phone(phone)
+        elif user_id is not None:
             log.info("/add: opening dialog with MAX user %s", user_id)
             resp = await max_client.open_dialog_with_user(user_id)
         else:

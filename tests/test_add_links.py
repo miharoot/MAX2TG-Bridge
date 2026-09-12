@@ -12,7 +12,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.pymax_client import PyMaxClient, _normalized_link, _user_id_in_link
+from app.pymax_client import (
+    PyMaxClient,
+    _normalized_link,
+    _normalized_phone,
+    _user_id_in_link,
+    _user_id_in_payload,
+)
 
 
 class TestLinkNormalisation:
@@ -323,3 +329,124 @@ class TestAProfileLinkIsOnlyAHint:
         result = await client.open_by_link("https://max.ru/id6633015816_gos")
 
         assert "не найдено" in result["_max_error"]["message"]
+
+
+class TestAPersonalLink:
+    """A personal link (max.ru/u/<token>) names someone, and only MAX can
+    read the token — so the answer to LINK_INFO is where the person comes
+    from, not the shape of the link."""
+
+    def _client_answering(self, payload):
+        client = _client_with()
+        client._client.join_group = AsyncMock(side_effect=RuntimeError("не найдено"))
+        response = MagicMock()
+        response.payload = payload
+        client._client._app = MagicMock()
+        client._client._app.invoke = AsyncMock(return_value=response)
+        client._client.get_user = AsyncMock(return_value=MagicMock())
+        client._client.get_chat_id = MagicMock(side_effect=lambda a, b: a ^ b)
+        client.resolver.users = {}
+        client.resolver._extract_name_from_contact = MagicMock(return_value="mihr")
+        return client
+
+    @pytest.mark.parametrize("payload", [
+        {"contact": {"id": 42}},
+        {"user": {"id": 42}},
+        {"profile": {"id": 42}},
+        {"contacts": [{"id": 42}]},
+        {"users": [{"id": 42}]},
+    ])
+    def test_a_person_is_recognised_whichever_key_max_uses(self, payload):
+        assert _user_id_in_payload(payload) == 42
+
+    @pytest.mark.parametrize("payload", [
+        {"chat": {"id": -42}},
+        {"contact": {}},
+        {"contacts": []},
+        {},
+    ])
+    def test_an_answer_without_a_person_yields_none(self, payload):
+        assert _user_id_in_payload(payload) is None
+
+    async def test_a_personal_link_binds_that_person_s_dialog(self):
+        client = self._client_answering({"contact": {"id": 42}})
+
+        result = await client.open_by_link("https://max.ru/u/sometoken")
+
+        assert result["chatId"] == 100 ^ 42
+        assert result["chat"]["type"] == "DIALOG"
+
+    async def test_a_chat_in_the_answer_still_wins_its_own_path(self):
+        client = self._client_answering(
+            {"chat": {"id": -68192506787240, "participants": {"100": 0}}},
+        )
+
+        result = await client.open_by_link("https://max.ru/u/sometoken")
+
+        assert result["chatId"] == -68192506787240
+
+
+class TestAddingSomeoneByPhone:
+    """MAX resolves a number itself (search_by_phone); the dialog then
+    follows the same derivation as everywhere else."""
+
+    def _client_finding(self, user):
+        client = _client_with()
+        client._client.search_by_phone = AsyncMock(return_value=user)
+        client._client.get_chat_id = MagicMock(side_effect=lambda a, b: a ^ b)
+        client._client.get_user = AsyncMock(return_value=user)
+        client.resolver.users = {}
+        client.resolver._extract_name_from_contact = MagicMock(return_value="Олег")
+        return client
+
+    @pytest.mark.parametrize("text,expected", [
+        ("+79991234567", "+79991234567"),
+        ("+7 999 123-45-67", "+79991234567"),
+        ("+7 (999) 123-45-67", "+79991234567"),
+        ("79991234567", None),      # no +: that's a user id, not a phone
+        ("6633015816", None),
+        ("+123", None),
+        ("", None),
+    ])
+    def test_only_an_explicit_plus_makes_it_a_phone(self, text, expected):
+        assert _normalized_phone(text) == expected
+
+    async def test_the_person_max_finds_gets_their_dialog_bound(self):
+        user = MagicMock()
+        user.id = 42
+        client = self._client_finding(user)
+
+        result = await client.open_dialog_by_phone("+7 999 123-45-67")
+
+        assert result["chatId"] == 100 ^ 42
+        assert result["chat"]["title"] == "Олег"
+        client._client.search_by_phone.assert_awaited_once_with("+79991234567")
+
+    async def test_a_number_nobody_owns_is_reported_not_bound(self):
+        client = self._client_finding(None)
+
+        result = await client.open_dialog_by_phone("+79991234567")
+
+        assert "chatId" not in result
+
+    async def test_something_that_is_not_a_number_never_reaches_max(self):
+        client = self._client_finding(MagicMock())
+
+        result = await client.open_dialog_by_phone("не номер")
+
+        assert "chatId" not in result
+        client._client.search_by_phone.assert_not_awaited()
+
+    async def test_a_lookup_that_never_answers_gives_up(self, monkeypatch):
+        monkeypatch.setattr("app.pymax_client.USER_LOOKUP_TIMEOUT", 0.01)
+        client = self._client_finding(MagicMock())
+
+        async def _never_answers(_phone):
+            await asyncio.sleep(3600)
+
+        client._client.search_by_phone = _never_answers
+
+        result = await asyncio.wait_for(
+            client.open_dialog_by_phone("+79991234567"), timeout=5)
+
+        assert "chatId" not in result

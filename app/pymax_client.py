@@ -648,6 +648,51 @@ def _user_id_in_link(link: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+_PHONE_RE = re.compile(r"^\+?\d{10,15}$")
+
+
+def _normalized_phone(text: str) -> str | None:
+    """A phone number as MAX wants it, or None if this isn't one.
+
+    Only an explicit ``+`` marks a phone apart from a user id: both are
+    just digits otherwise, and binding the wrong one of the two would
+    open a dialog with a stranger.
+    """
+    cleaned = re.sub(r"[\s\-()]", "", (text or "").strip())
+    if not cleaned.startswith("+") or not _PHONE_RE.match(cleaned):
+        return None
+    return cleaned
+
+
+def _user_id_in_payload(payload: dict) -> int | None:
+    """A user id in a LINK_INFO answer, if MAX answered with a person.
+
+    A personal link (``max.ru/u/<token>``) names someone, not a chat, and
+    MAX is the only one who can read the token. Which key it returns them
+    under isn't documented, so the plausible ones are all accepted — the
+    id is what matters, and open_dialog_with_user turns it into the
+    dialog. Anything unrecognised is logged by the caller rather than
+    guessed at.
+    """
+    for key in ("contact", "user", "profile"):
+        item = payload.get(key)
+        if isinstance(item, dict) and item.get("id") is not None:
+            try:
+                return int(item["id"])
+            except (TypeError, ValueError):
+                return None
+    for key in ("contacts", "users"):
+        items = payload.get(key)
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            candidate = items[0].get("id")
+            if candidate is not None:
+                try:
+                    return int(candidate)
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
 def _normalized_link(link: str) -> str:
     """A max.ru link reduced to what identifies it, for comparison."""
     text = (link or "").strip().lower().rstrip("/")
@@ -1280,6 +1325,41 @@ class PyMaxClient:
                  _redact_url(link), user_id)
         return resolved
 
+    async def open_dialog_by_phone(self, phone: str) -> dict:
+        """Address the dialog with whoever owns this phone number.
+
+        MAX resolves the number itself (CONTACT_INFO_BY_PHONE, exposed by
+        pymax as search_by_phone); from the user it returns, the dialog
+        follows the same way as everywhere else. Finding nobody is
+        reported rather than bound — the point of asking was to be sure.
+        """
+        normalized = _normalized_phone(phone)
+        if normalized is None:
+            return {"_max_error": {"message": f"Не похоже на номер телефона: {phone}"}}
+        try:
+            user = await asyncio.wait_for(
+                self._client.search_by_phone(normalized), timeout=USER_LOOKUP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning("MAX did not answer a phone lookup in %ss", USER_LOOKUP_TIMEOUT)
+            return {"_max_error": {"message": "MAX не ответил на поиск по номеру"}}
+        except Exception as exc:
+            log.exception("PyMax search_by_phone failed")
+            return {"_max_error": {"message": str(exc)}}
+
+        user_id = getattr(user, "id", None)
+        if user_id is None:
+            return {"_max_error": {"message": "В MAX нет пользователя с таким номером"}}
+
+        # Seed the name so open_dialog_with_user takes it as confirmation
+        # and doesn't look the same person up a second time.
+        if self.resolver is not None:
+            name = self.resolver._extract_name_from_contact(_user_to_dict(user))
+            if name:
+                self.resolver.users[int(user_id)] = name
+        log.info("Phone lookup resolved to MAX user %s", user_id)
+        return await self.open_dialog_with_user(int(user_id))
+
     async def open_dialog_with_user(self, user_id: int) -> dict:
         """Address the one-to-one chat with a MAX user by their id.
 
@@ -1407,7 +1487,23 @@ class PyMaxClient:
             return {"_max_error": {"message": str(join_error)}}
 
         payload = getattr(response, "payload", None) or {}
-        chat = payload.get("chat") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            payload = {}
+        # Logged on every resolution: this is the one place that sees what
+        # MAX makes of a link it alone can read (a personal max.ru/u/<token>
+        # among them), and the shape of that answer is not documented
+        # anywhere — the keys it carries are how we learn it.
+        log.info("LINK_INFO for %s answered with keys=%s",
+                 _redact_url(link), sorted(payload))
+
+        user_id = _user_id_in_payload(payload)
+        if user_id is not None:
+            log.info("LINK_INFO resolved %s to user %s", _redact_url(link), user_id)
+            dialog = await self.open_dialog_with_user(user_id)
+            if "_max_error" not in dialog:
+                return dialog
+
+        chat = payload.get("chat")
         if not isinstance(chat, dict) or chat.get("id") is None:
             log.warning("LINK_INFO gave no chat for %s: %s",
                         _redact_url(link), str(payload)[:300])
