@@ -921,9 +921,12 @@ def _extract_chat_id_from_open(resp: dict) -> int | None:
 
 
 async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Open a max.ru link (user or chat invite) and bind it to a new topic.
+    """Open a max.ru link (profile or chat invite) and bind it to a new topic.
 
-    Usage: `/add https://max.ru/u/<token>` or `/add https://max.ru/join/<token>`.
+    Usage: `/add https://max.ru/join/<token>` for a group/channel, or
+    `/add https://max.ru/id<digits>` for a person — the latter binds the
+    one-to-one chat with them (see PyMaxClient.open_by_link for how each
+    shape is resolved).
     """
     message = update.message
     if message is None:
@@ -949,8 +952,9 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not link.startswith(("http://", "https://")) or "max.ru/" not in link:
         await message.reply_text(
-            "Использование: <code>/add https://max.ru/u/...</code> или "
-            "<code>/add https://max.ru/join/...</code>",
+            "Использование: <code>/add https://max.ru/join/...</code> "
+            "(чат) или <code>/add https://max.ru/id123456789</code> "
+            "(личный чат с человеком)",
             parse_mode="HTML",
         )
         return
@@ -1194,10 +1198,14 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for chat_title, chat_id, _chat_type in chats:
             bound_thread = topic_store.get_topic(chat_id)
             status = f"🔗 топик #{bound_thread}" if bound_thread is not None else "◌ не привязан"
+            # The URL goes in as plain text rather than a titled <a> link:
+            # it has to be selectable and copyable straight out of the
+            # message (into /bind, a browser, a note), which a word that
+            # merely carries a href is not.
             lines.append(
                 f"• <b>{escape(chat_title)}</b>\n"
-                f"  <code>{chat_id}</code> · "
-                f'<a href="https://web.max.ru/{chat_id}">открыть</a> · {status}'
+                f"  <code>{chat_id}</code> · {status}\n"
+                f"  <code>https://web.max.ru/{chat_id}</code>"
             )
 
     for key, label in SECTIONS:

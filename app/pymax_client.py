@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import re
 import logging
 import time
 from collections import OrderedDict
@@ -627,6 +628,23 @@ def _is_allowed_download_url(url: str) -> bool:
     )
 
 
+# A MAX profile link carries the user's numeric id in its path:
+# https://max.ru/id6633015816_gos → 6633015816. The trailing word (_gos
+# and friends) is decoration MAX appends to the handle, not part of the
+# id.
+_PROFILE_LINK_RE = re.compile(r"^https?://(?:web\.)?max\.ru/id(\d+)\w*/?$", re.IGNORECASE)
+
+
+def _user_id_from_profile_link(link: str) -> int | None:
+    """The user id inside a max.ru profile link, or None if this isn't one.
+
+    Profile links are not invitations: there is no chat to join behind
+    them, which is why handing one to pymax's join_group/join_channel can
+    only fail (see PyMaxClient.open_by_link)."""
+    match = _PROFILE_LINK_RE.match((link or "").strip())
+    return int(match.group(1)) if match else None
+
+
 def _redact_url(url: str) -> str:
     try:
         parsed = urlsplit(url)
@@ -1167,18 +1185,115 @@ class PyMaxClient:
         return Voice(raw=data, name=filename, duration=duration)
 
     async def open_by_link(self, link: str) -> dict:
+        """Resolve any max.ru link to a chat the bridge can bind.
+
+        Three shapes, in the order they're tried:
+
+        1. A **profile** link (``max.ru/id<digits>``) names a person, not
+           a chat — there is nothing to join. Its DM is addressed
+           directly instead, see open_dialog_with_user.
+        2. A **join** link (``.../join/<token>``) is what pymax actually
+           supports; it looks for that literal ``join/`` and refuses
+           anything else.
+        3. Anything left (``max.ru/<handle>`` with no numeric id) is put
+           to MAX itself via LINK_INFO, which is how a client resolves a
+           link it can't read on its own.
+        """
+        user_id = _user_id_from_profile_link(link)
+        if user_id is not None:
+            return await self.open_dialog_with_user(user_id)
+
         try:
             chat = await self._client.join_group(link)
         except ValueError:
             try:
                 chat = await self._client.join_channel(link)
             except Exception as exc:
-                log.exception("PyMax open_by_link failed: %s", _redact_url(link))
-                return {"_max_error": {"message": str(exc)}}
+                log.warning("PyMax join failed for %s: %s — asking MAX to resolve it",
+                            _redact_url(link), exc)
+                return await self._resolve_link_via_max(link, exc)
         except Exception as exc:
             log.exception("PyMax open_by_link failed: %s", _redact_url(link))
             return {"_max_error": {"message": str(exc)}}
         return {"chatId": getattr(chat, "id", None), "chat": _chat_to_dict(chat)}
+
+    async def open_dialog_with_user(self, user_id: int) -> dict:
+        """Address the one-to-one chat with a MAX user by their id.
+
+        A DM is not joined, it is derived: MAX's id for the chat between
+        two people is the XOR of their user ids, which pymax computes
+        locally (``get_chat_id``) with no request at all. So the only
+        thing worth asking the server is whether the person exists —
+        without that check a typo would happily "bind" a topic to a chat
+        that can never receive anything.
+
+        Returns the same shape as open_by_link so callers (/add in
+        app/tg_handler.py) need no special case.
+        """
+        if self._my_id is None:
+            return {"_max_error": {
+                "message": "MAX ещё не сообщил мой собственный id — попробуйте позже",
+            }}
+        try:
+            user = await self._client.get_user(int(user_id))
+        except Exception as exc:
+            log.exception("PyMax get_user failed for %s", user_id)
+            return {"_max_error": {"message": str(exc)}}
+        if user is None:
+            return {"_max_error": {"message": f"MAX не знает пользователя {user_id}"}}
+
+        chat_id = self._client.get_chat_id(int(self._my_id), int(user_id))
+        # The resolver already knows how MAX shapes a name ("names" array,
+        # firstName/lastName, friendly, ...); ask the instance we're
+        # holding rather than importing it or re-deriving the rules here.
+        title = str(user_id)
+        if self.resolver is not None:
+            title = self.resolver._extract_name_from_contact(_user_to_dict(user)) or title
+        log.info("Resolved MAX profile link: user_id=%s (%r) → dialog chat_id=%s",
+                 user_id, title, chat_id)
+
+        if self.resolver is not None and title != str(user_id):
+            # So the topic title and message headers show a name rather
+            # than the bare id, without waiting for a contacts fetch.
+            self.resolver.users[int(user_id)] = title
+
+        return {
+            "chatId": chat_id,
+            "chat": {
+                "id": chat_id,
+                "type": "DIALOG",
+                "title": title,
+                "participants": {str(self._my_id): 0, str(user_id): 0},
+            },
+        }
+
+    async def _resolve_link_via_max(self, link: str, join_error: Exception) -> dict:
+        """Last resort for a link pymax itself can't classify: ask MAX.
+
+        LINK_INFO is the opcode pymax uses behind resolve_group_by_link,
+        but that method rejects anything without a ``join/`` token before
+        it ever reaches the wire, so the call is made directly here. If
+        MAX doesn't answer with a chat either, the *join* error is what
+        gets reported — it describes what the user actually typed.
+        """
+        from pymax.api.chats.payloads import LinkInfoPayload
+        from pymax.protocol import Opcode
+
+        try:
+            response = await self._client._app.invoke(
+                Opcode.LINK_INFO, LinkInfoPayload(link=link).to_payload(),
+            )
+        except Exception:
+            log.exception("LINK_INFO failed for %s", _redact_url(link))
+            return {"_max_error": {"message": str(join_error)}}
+
+        payload = getattr(response, "payload", None) or {}
+        chat = payload.get("chat") if isinstance(payload, dict) else None
+        if not isinstance(chat, dict) or chat.get("id") is None:
+            log.warning("LINK_INFO gave no chat for %s: %s",
+                        _redact_url(link), str(payload)[:300])
+            return {"_max_error": {"message": str(join_error)}}
+        return {"chatId": chat["id"], "chat": chat}
 
     async def download_audio_url(
         self,
