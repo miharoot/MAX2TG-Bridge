@@ -9,7 +9,6 @@ Rules under test:
   and never after a disconnect that got suppressed by the throttle.
 """
 
-import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 

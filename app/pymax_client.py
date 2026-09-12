@@ -8,7 +8,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from yarl import URL
@@ -501,12 +501,6 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
     logger = log
 
     logger.info("Uploading voice")
-
-    try:
-        file_size = await voice.size()
-    except Exception as e:
-        logger.exception("Failed to get voice size")
-        raise UploadError("Failed to get voice size") from e
 
     try:
         body_bytes = await voice.read()

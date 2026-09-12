@@ -7,8 +7,6 @@ import qrcode
 
 from app.config import Settings
 
-from pymax import Client, ExtraConfig, WebClient
-
 if TYPE_CHECKING:
     from app.pymax_client import PyMaxClient
 

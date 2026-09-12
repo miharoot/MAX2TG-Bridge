@@ -4,6 +4,7 @@ import os
 from dataclasses import fields as _dataclass_fields
 from datetime import datetime
 from html import escape
+from typing import Any
 
 from app import outbox
 from app.config import Settings
@@ -61,7 +62,7 @@ def _attachment_failure(attach: dict) -> str:
     )
 
 
-def _header(msg: MaxMessage, sender_label: str, chat_label: str, is_dm: bool,
+def _header(sender_label: str, chat_label: str, is_dm: bool,
             is_manual_self: bool = False) -> str:
     if is_manual_self:
         # Typed on your own phone/other MAX client, not through the bridge.
@@ -677,7 +678,7 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
 
         sender_label = escape(raw_sender)
         chat_label = escape(raw_chat)
-        header_text = _header(msg, sender_label, chat_label, is_dm, is_manual_self)
+        header_text = _header(sender_label, chat_label, is_dm, is_manual_self)
 
         last_message = None
 
