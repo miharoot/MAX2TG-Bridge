@@ -1,0 +1,70 @@
+name: Release on version bump
+
+# Watches the VERSION file on main. When a push changes it, asks Claude
+# (via the Claude Code GitHub Action, which runs with `contents: write`
+# and its own GITHUB_TOKEN) to tag the release and publish GitHub Release
+# notes — the two steps a Claude Code *session* cannot do itself, since a
+# session's own git credentials are scoped to branches, not tags/releases.
+on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag and publish release
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --allowedTools "Bash(git tag:*),Bash(git push origin refs/tags/*:*),Bash(git log:*),Bash(git describe:*),Bash(gh release create:*),Bash(gh release view:*),Bash(cat VERSION)"
+          prompt: |
+            The file VERSION on this branch was just updated by a push to
+            main. Read it — its content is the new version number, e.g.
+            "0.2.3" (no leading "v").
+
+            1. Compute the tag name as "v" + that version (e.g. "v0.2.3").
+               Check whether it already exists with:
+                 git tag -l "<tag>"
+               If it does, stop here and do nothing else (this guards
+               against the workflow re-running on an unrelated push that
+               still carries the same VERSION content).
+
+            2. If the tag does not exist yet:
+               - Create an annotated tag on the current commit:
+                   git tag -a "<tag>" -m "<tag>"
+               - Push only that tag (never push to any branch):
+                   git push origin refs/tags/<tag>
+
+            3. Find the previous release tag (the highest vX.Y.Z tag that
+               is an ancestor of HEAD and is not the new tag — e.g. via
+               `git tag --merged HEAD --sort=-v:refname` and taking the
+               first entry that isn't <tag>). List the commits between it
+               and the new tag with:
+                 git log <previous-tag>..<tag> --oneline
+               If there is no previous tag, list the last ~20 commits
+               instead.
+
+            4. Create a GitHub Release for <tag> with:
+                 gh release create <tag> --title "<tag>" --notes "<notes>"
+               where <notes> summarizes those commits in Russian, grouped
+               under short headings by their conventional-commit-style
+               prefix (fix:, feat:, chore:, docs:, refactor:, etc. — map
+               fix->"Исправления", feat->"Новое", chore/docs/other->
+               "Прочее"), one bullet per commit using its message (drop
+               the prefix and the commit hash from the bullet text).
+
+            Do not modify, commit, or push any file — this job only
+            creates a tag and a release, nothing else. Do not push to any
+            branch, including main.
