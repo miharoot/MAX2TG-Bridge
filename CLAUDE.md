@@ -52,6 +52,33 @@ Read-события (`on_message_read`) и реакции (`on_reaction_update`)
 
 ## Git
 
+## Rules
+
+- Do not modify unrelated files.
+- Prefer small, focused changes.
+- Preserve existing architecture unless explicitly asked.
+- Add tests for bug fixes.
+- Do not remove existing tests.
+- Do not change `.env` or secrets.
+- Never commit secrets.
+
+Before making changes:
+- inspect git status
+- inspect relevant code
+- understand existing implementation
+
+After changes:
+- run relevant tests
+- show git diff
+- do not commit unless explicitly requested.
+
+## Investigation
+
+Do not speculate about code that has not been inspected.
+Read the relevant implementation before proposing changes.
+
+## Rules 2
+
 Правила ниже действуют на **каждый** будущий `git push`, без отдельного напоминания от пользователя.
 
 1. Коммитить локально можно свободно и когда угодно.
