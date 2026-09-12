@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import re
@@ -19,6 +20,10 @@ from app.pymax_auth import build_pymax_client
 from pymax.exceptions import ApiError, UploadError
 
 log = logging.getLogger(__name__)
+
+# How long to wait for MAX to say who a user is before giving up and
+# binding their dialog unnamed (see PyMaxClient.open_dialog_with_user).
+USER_LOOKUP_TIMEOUT = 15
 
 _PATCHED_API_ERROR = False
 
@@ -1206,6 +1211,8 @@ class PyMaxClient:
         try:
             chat = await self._client.join_group(link)
         except ValueError:
+            # No join token in the string at all — pymax refused before
+            # reaching the wire.
             try:
                 chat = await self._client.join_channel(link)
             except Exception as exc:
@@ -1213,8 +1220,13 @@ class PyMaxClient:
                             _redact_url(link), exc)
                 return await self._resolve_link_via_max(link, exc)
         except Exception as exc:
-            log.exception("PyMax open_by_link failed: %s", _redact_url(link))
-            return {"_max_error": {"message": str(exc)}}
+            # MAX itself refused the join — "not.found" being the common
+            # one, which it also answers for a chat you are already in.
+            # Resolving the link read-only still finds that chat, and is
+            # exactly what /add wants: a chat id to bind, not membership.
+            log.warning("PyMax join rejected for %s: %s — asking MAX to resolve it",
+                        _redact_url(link), exc)
+            return await self._resolve_link_via_max(link, exc)
         return {"chatId": getattr(chat, "id", None), "chat": _chat_to_dict(chat)}
 
     async def open_dialog_with_user(self, user_id: int) -> dict:
@@ -1234,20 +1246,33 @@ class PyMaxClient:
             return {"_max_error": {
                 "message": "MAX ещё не сообщил мой собственный id — попробуйте позже",
             }}
+        # Bounded, and best-effort on purpose. MAX can simply never answer
+        # a lookup for someone who isn't a contact — observed against a
+        # live server: the request goes out ("fetching users count=1") and
+        # nothing comes back, which left /add waiting forever with the
+        # user staring at silence. The chat id needs no server at all, so
+        # a lookup that fails costs only the name.
+        user = None
         try:
-            user = await self._client.get_user(int(user_id))
-        except Exception as exc:
-            log.exception("PyMax get_user failed for %s", user_id)
-            return {"_max_error": {"message": str(exc)}}
+            user = await asyncio.wait_for(
+                self._client.get_user(int(user_id)), timeout=USER_LOOKUP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning("MAX did not answer a lookup for user %s in %ss; "
+                        "binding the dialog anyway", user_id, USER_LOOKUP_TIMEOUT)
+        except Exception:
+            log.exception("PyMax get_user failed for %s; binding the dialog anyway",
+                          user_id)
         if user is None:
-            return {"_max_error": {"message": f"MAX не знает пользователя {user_id}"}}
+            log.info("No profile came back for user %s — the dialog is still "
+                     "addressable, its topic just starts out named by id", user_id)
 
         chat_id = self._client.get_chat_id(int(self._my_id), int(user_id))
         # The resolver already knows how MAX shapes a name ("names" array,
         # firstName/lastName, friendly, ...); ask the instance we're
         # holding rather than importing it or re-deriving the rules here.
         title = str(user_id)
-        if self.resolver is not None:
+        if user is not None and self.resolver is not None:
             title = self.resolver._extract_name_from_contact(_user_to_dict(user)) or title
         log.info("Resolved MAX profile link: user_id=%s (%r) → dialog chat_id=%s",
                  user_id, title, chat_id)

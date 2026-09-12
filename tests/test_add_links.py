@@ -6,6 +6,7 @@ person, so there is no chat to join: MAX derives the id of a one-to-one
 chat from the two participants, and that is computed locally.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -64,15 +65,33 @@ class TestOpenDialogWithUser:
         client._client.join_group.assert_not_awaited()
         client._client.join_channel.assert_not_awaited()
 
-    async def test_the_user_is_checked_to_exist_first(self):
-        """Deriving the chat id needs no server, but binding a topic to a
-        chat that can never receive anything helps nobody."""
-        client = _client_with()
+    async def test_an_unknown_user_still_gets_their_dialog_bound(self):
+        """MAX can decline to say anything about someone who isn't a
+        contact. The chat id doesn't depend on that answer, so the bind
+        goes ahead — only the name is lost."""
+        client = _client_with(my_id=100)
         client._client.get_user = AsyncMock(return_value=None)
 
         result = await client.open_by_link("https://max.ru/id42")
 
-        assert "_max_error" in result
+        assert result["chatId"] == 100 ^ 42
+        assert result["chat"]["title"] == "42"
+
+    async def test_a_lookup_that_never_answers_does_not_hang_the_command(self, monkeypatch):
+        """Observed live: the request went out and nothing came back, so
+        /add waited forever and the user got no reply at all."""
+        monkeypatch.setattr("app.pymax_client.USER_LOOKUP_TIMEOUT", 0.01)
+        client = _client_with(my_id=100)
+
+        async def _never_answers(_user_id):
+            await asyncio.sleep(3600)
+
+        client._client.get_user = _never_answers
+
+        result = await asyncio.wait_for(client.open_dialog_with_user(42), timeout=5)
+
+        assert result["chatId"] == 100 ^ 42
+        assert result["chat"]["title"] == "42"
 
     async def test_it_waits_until_max_has_told_us_who_we_are(self):
         client = _client_with(my_id=None)
@@ -82,13 +101,14 @@ class TestOpenDialogWithUser:
         assert "_max_error" in result
         client._client.get_user.assert_not_awaited()
 
-    async def test_a_failing_lookup_is_reported_not_raised(self):
-        client = _client_with()
+    async def test_a_failing_lookup_costs_the_name_not_the_bind(self):
+        client = _client_with(my_id=100)
         client._client.get_user = AsyncMock(side_effect=RuntimeError("нет связи"))
 
         result = await client.open_dialog_with_user(42)
 
-        assert "нет связи" in result["_max_error"]["message"]
+        assert result["chatId"] == 100 ^ 42
+        assert result["chat"]["title"] == "42"
 
     async def test_the_resolved_name_becomes_the_title(self):
         user = MagicMock()
@@ -126,3 +146,37 @@ class TestJoinLinksStillWork:
 
         assert result["chatId"] == -75107924425434
         client._client.join_group.assert_awaited_once()
+
+
+class TestJoinRefusedByMax:
+    """A join link MAX answers with "not.found" — which it also says for a
+    chat you're already in. /add wants a chat id to bind, not membership,
+    so the link is put to LINK_INFO before giving up."""
+
+    def _client_that_cannot_join(self, link_info_chat=None):
+        client = _client_with()
+        client._client.join_group = AsyncMock(side_effect=RuntimeError("Не найдено [not.found]"))
+        response = MagicMock()
+        response.payload = {"chat": link_info_chat} if link_info_chat else {}
+        client._client._app = MagicMock()
+        client._client._app.invoke = AsyncMock(return_value=response)
+        return client
+
+    async def test_link_info_resolves_what_the_join_could_not(self):
+        client = self._client_that_cannot_join(
+            link_info_chat={"id": -68192506787240, "type": "CHAT", "title": "Сотрудники"},
+        )
+
+        result = await client.open_by_link("https://max.ru/join/sometoken")
+
+        assert result["chatId"] == -68192506787240
+        client._client._app.invoke.assert_awaited_once()
+
+    async def test_the_join_error_is_what_gets_reported_when_that_fails_too(self):
+        """It describes what the user actually typed; a LINK_INFO miss
+        would only say the link resolved to nothing."""
+        client = self._client_that_cannot_join()
+
+        result = await client.open_by_link("https://max.ru/join/sometoken")
+
+        assert "not.found" in result["_max_error"]["message"]
