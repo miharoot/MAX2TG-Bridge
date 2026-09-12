@@ -1149,6 +1149,10 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# Rule between /list sections — long enough to read as a divider on a
+# phone, short enough not to wrap.
+_LIST_DIVIDER = "──────────"
+
 HELP_TEXT = (
     "<b>max2tg — мост MAX ↔ Telegram</b>\n\n"
     "Бот можно добавить в несколько Telegram-групп (с включёнными темами) — "
@@ -1320,8 +1324,12 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not chats:
             return
         chats = sorted(chats, key=lambda e: e[0].lower())
-        lines.append(f"\n<b>{title}</b>")
-        for chat_title, chat_id, _chat_type, join_link in chats:
+        # A rule before each heading, and a blank line between entries:
+        # every entry is three or four lines of its own now, so without
+        # separators the sections and the chats inside them run together
+        # into one wall of ids.
+        lines.append(f"\n{_LIST_DIVIDER}\n<b>{title}</b>\n")
+        for index, (chat_title, chat_id, _chat_type, join_link) in enumerate(chats):
             bound_thread = topic_store.get_topic(chat_id)
             status = f"🔗 топик #{bound_thread}" if bound_thread is not None else "◌ не привязан"
             # Ids and links go in monospace, each on its own line: they
@@ -1335,6 +1343,8 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ]
             if join_link:
                 entry_lines.append(f"  <code>{escape(str(join_link))}</code>")
+            if index:
+                lines.append("")        # blank line between chats, not before the first
             lines.append("\n".join(entry_lines))
 
     for key, label in SECTIONS:

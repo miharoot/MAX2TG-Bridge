@@ -170,6 +170,9 @@ class TestCmdList:
         resolver.chats_raw = chats_raw
         resolver.chat_types = chat_types or {}
         resolver.is_dm = MagicMock(return_value=False)
+        # A bare MagicMock answers truthily to everything, which would
+        # make every chat here look like saved messages.
+        resolver.is_saved_messages = MagicMock(return_value=False)
         resolver.chat_name = MagicMock(side_effect=lambda cid: str(cid))
         ctx.bot_data[MAX_CLIENT_KEY].resolver = resolver
 
@@ -177,6 +180,25 @@ class TestCmdList:
         ctx.bot_data[TOPIC_STORE_KEY].get_topic = MagicMock(
             side_effect=lambda cid: topics.get(cid))
         return ctx
+
+    async def test_sections_and_chats_are_visibly_separated(self):
+        """Every entry is three or four lines now; without separators the
+        whole listing reads as one wall of ids."""
+        from app.tg_handler import _LIST_DIVIDER
+
+        update = _make_update("/list")
+        ctx = self._list_context(
+            {-42: {"title": "Группа", "type": "CHAT"},
+             -43: {"title": "Ещё группа", "type": "CHAT"}},
+            chat_types={-42: "CHAT", -43: "CHAT"},
+        )
+
+        await _cmd_list(update, ctx)
+
+        body = "\n".join(_replies(update))
+        assert _LIST_DIVIDER in body
+        assert "\n\n• <b>Ещё группа</b>" in body   # blank line between chats
+        assert "\n\n\n" not in body               # but never a double one
 
     async def test_ids_and_links_are_monospace_on_their_own_lines(self):
         update = _make_update("/list")
