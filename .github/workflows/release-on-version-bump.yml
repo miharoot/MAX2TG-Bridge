@@ -1,0 +1,92 @@
+name: Release on version bump
+
+# Watches the VERSION file on main. When a push changes it, tags the
+# release and publishes GitHub Release notes. Pure shell + gh CLI — no
+# LLM call needed for this, so no ANTHROPIC_API_KEY: the job's own
+# `contents: write` permission is enough for the automatic GITHUB_TOKEN
+# to push a tag and create a release (unlike a Claude Code session's own
+# git credentials, which are scoped to branches only).
+on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          version="$(tr -d '[:space:]' < VERSION)"
+          tag="v${version}"
+
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists — nothing to do."
+            exit 0
+          fi
+
+          previous_tag="$(git tag --merged HEAD --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
+
+          if [ -n "${previous_tag}" ]; then
+            range="${previous_tag}..HEAD"
+          else
+            range="HEAD"
+          fi
+
+          notes_file="$(mktemp)"
+          fixes_file="$(mktemp)"
+          feats_file="$(mktemp)"
+          other_file="$(mktemp)"
+
+          while IFS= read -r line; do
+            [ -z "${line}" ] && continue
+            subject="${line#* }"
+            prefix="${subject%%:*}"
+            rest="${subject#*: }"
+            case "${prefix}" in
+              fix|fix\(*)   echo "- ${rest}" >> "${fixes_file}" ;;
+              feat|feat\(*) echo "- ${rest}" >> "${feats_file}" ;;
+              *)            echo "- ${subject}" >> "${other_file}" ;;
+            esac
+          done < <(git log "${range}" --oneline --no-merges -- . ':!VERSION' 2>/dev/null || true)
+
+          {
+            if [ -s "${feats_file}" ]; then
+              echo "## Новое"
+              cat "${feats_file}"
+              echo
+            fi
+            if [ -s "${fixes_file}" ]; then
+              echo "## Исправления"
+              cat "${fixes_file}"
+              echo
+            fi
+            if [ -s "${other_file}" ]; then
+              echo "## Прочее"
+              cat "${other_file}"
+              echo
+            fi
+          } > "${notes_file}"
+
+          if [ ! -s "${notes_file}" ]; then
+            echo "Release ${tag}." > "${notes_file}"
+          fi
+
+          git tag -a "${tag}" -m "${tag}"
+          git push origin "refs/tags/${tag}"
+
+          gh release create "${tag}" --title "${tag}" --notes-file "${notes_file}"

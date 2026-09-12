@@ -52,8 +52,16 @@ async def run_outbox_retry_loop(client, sender: TelegramSender, max_upload_bytes
                                  - (time.time() - item.last_attempt_at))
                     if remaining > 0:
                         continue
-                await _retry_one(client, sender, max_upload_bytes,
-                                  item, redeliver_tg_to_max_text, redeliver_tg_to_max_media)
+                if not client.outbox.try_start(item.id):
+                    # Already being delivered — either the original live
+                    # send hasn't finished yet, or a previous sweep tick
+                    # is still waiting on it. Don't start a duplicate.
+                    continue
+                try:
+                    await _retry_one(client, sender, max_upload_bytes,
+                                      item, redeliver_tg_to_max_text, redeliver_tg_to_max_media)
+                finally:
+                    client.outbox.finish(item.id)
         except asyncio.CancelledError:
             raise
         except Exception:

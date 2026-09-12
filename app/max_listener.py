@@ -612,17 +612,25 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             return
 
         item_id = await client.outbox.add(outbox.MAX_TO_TG, _max_message_to_payload(msg))
+        # Claim the item before the background retry sweep can see it as
+        # pending (see Outbox.try_start) — held until the row is
+        # finalized, so the sweep can't start a duplicate delivery while
+        # this one is still in progress.
+        client.outbox.try_start(item_id)
         try:
-            await _deliver_max_message(msg)
-        except Exception as exc:
-            log.exception(
-                "Failed to forward MAX message chat=%s id=%s to Telegram; "
-                "kept in outbox (id=%s) for retry",
-                msg.chat_id, msg.message_id, item_id,
-            )
-            await client.outbox.mark_failed(item_id, str(exc))
-            return
-        await client.outbox.remove(item_id)
+            try:
+                await _deliver_max_message(msg)
+            except Exception as exc:
+                log.exception(
+                    "Failed to forward MAX message chat=%s id=%s to Telegram; "
+                    "kept in outbox (id=%s) for retry",
+                    msg.chat_id, msg.message_id, item_id,
+                )
+                await client.outbox.mark_failed(item_id, str(exc))
+                return
+            await client.outbox.remove(item_id)
+        finally:
+            client.outbox.finish(item_id)
 
     async def _deliver_max_message(msg: MaxMessage):
         log.info(
