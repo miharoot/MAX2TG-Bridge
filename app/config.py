@@ -25,7 +25,6 @@ class Settings:
     reply_enabled: bool = False
     state_dir: str = "state"
     tg_allowed_user_ids: frozenset[int] | None = None
-    debug_dump_json: bool = False
     max_download_mb: int = 50
     tg_upload_mb: int = 50
     health_port: int | None = None
@@ -149,7 +148,6 @@ def load_settings() -> Settings:
         reply_enabled=os.environ.get("REPLY_ENABLED", "").lower() in ("1", "true", "yes"),
         state_dir=state_dir,
         tg_allowed_user_ids=allowed_user_ids,
-        debug_dump_json=os.environ.get("DEBUG_DUMP_JSON", "").lower() in ("1", "true", "yes"),
         max_download_mb=_int_env("MAX_DOWNLOAD_MB", 50),
         tg_upload_mb=_int_env("TG_UPLOAD_MB", 50),
         health_port=_int_env("HEALTH_PORT", 0) or None,

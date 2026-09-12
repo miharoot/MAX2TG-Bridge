@@ -31,7 +31,6 @@ def test_defaults():
     assert settings.max_chat_ids is None
     assert settings.max_ignore_chat_ids is None
     assert settings.tg_allowed_user_ids is None
-    assert settings.debug_dump_json is False
     assert settings.max_download_mb == 50
     assert settings.tg_upload_mb == 50
     assert settings.health_port is None
@@ -197,11 +196,6 @@ def test_reply_enabled_true_via_yes():
 def test_reply_enabled_false_via_false():
     settings = load({**BASE, "REPLY_ENABLED": "false"})
     assert settings.reply_enabled is False
-
-
-def test_debug_dump_json_true_via_true():
-    settings = load({**BASE, "DEBUG_DUMP_JSON": "true"})
-    assert settings.debug_dump_json is True
 
 
 def test_returns_settings_instance():

@@ -84,7 +84,8 @@ async def main():
     topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"))
 
     sender = TelegramSender(settings.tg_bot_token, settings.tg_chat_id, topic_store,
-                            proxy_url=settings.tg_proxy, chat_routes=settings.chat_routes)
+                            proxy_url=settings.tg_proxy, chat_routes=settings.chat_routes,
+                            max_upload_bytes=settings.tg_upload_mb * 1024 * 1024)
     await sender.start()
 
     client = create_pymax_client(settings, sender)

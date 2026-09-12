@@ -27,7 +27,8 @@ def _looks_numeric(title: str) -> bool:
 
 class TelegramSender:
     def __init__(self, token: str, default_chat_id: str, topic_store: TopicStore,
-                 proxy_url: str | None = None, chat_routes: dict[str, int] | None = None):
+                 proxy_url: str | None = None, chat_routes: dict[str, int] | None = None,
+                 max_upload_bytes: int | None = None):
         request = HTTPXRequest(
             proxy=proxy_url,
             connect_timeout=TG_CONNECT_TIMEOUT,
@@ -41,6 +42,12 @@ class TelegramSender:
         self._topics = topic_store
         self._chat_routes = {str(k): int(v) for k, v in (chat_routes or {}).items()}
         self._topic_lock = asyncio.Lock()
+        # Ceiling for anything uploaded *to* Telegram (TG_UPLOAD_MB). The
+        # Bot API refuses files past its own limit, and a MAX chat can
+        # legitimately carry something bigger than Telegram will take —
+        # MAX_DOWNLOAD_MB governs what we pull from MAX, which is a
+        # different question. None disables the check.
+        self._max_upload_bytes = max_upload_bytes or None
 
     @property
     def bot(self) -> Bot:
@@ -193,6 +200,23 @@ class TelegramSender:
             return text[: TG_CAPTION_MAX - 20] + "\n\n[...усечено]"
         return text
 
+    def _too_large(self, data: bytes, what: str) -> bool:
+        """True if Telegram would reject this upload for its size.
+
+        Refusing here, before the request, turns a doomed Bot API call
+        into a caller-visible ``None`` — every send_* caller in
+        app/max_listener.py already treats that as "couldn't send" and
+        posts a text fallback naming the attachment, so an oversized file
+        is announced in the topic instead of vanishing."""
+        if self._max_upload_bytes and len(data) > self._max_upload_bytes:
+            log.warning(
+                "Not uploading %s to Telegram: %d bytes exceeds the "
+                "TG_UPLOAD_MB limit of %d bytes",
+                what, len(data), self._max_upload_bytes,
+            )
+            return True
+        return False
+
     async def _retry(self, coro_factory):
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -235,6 +259,8 @@ class TelegramSender:
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
                          message_thread_id: int | None = None,
                          chat_id: str | int | None = None):
+        if self._too_large(data, f"photo {filename!r}"):
+            return None
         caption = self._truncate_caption(caption)
         return await self._retry(
             lambda: self._bot.send_photo(
@@ -249,6 +275,8 @@ class TelegramSender:
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
                             message_thread_id: int | None = None,
                             chat_id: str | int | None = None):
+        if self._too_large(data, f"document {filename!r}"):
+            return None
         caption = self._truncate_caption(caption)
         return await self._retry(
             lambda: self._bot.send_document(
@@ -263,6 +291,8 @@ class TelegramSender:
     async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4",
                          message_thread_id: int | None = None,
                          chat_id: str | int | None = None):
+        if self._too_large(data, f"video {filename!r}"):
+            return None
         caption = self._truncate_caption(caption)
         return await self._retry(
             lambda: self._bot.send_video(
@@ -277,6 +307,8 @@ class TelegramSender:
     async def send_voice(self, data: bytes, caption: str = "",
                          message_thread_id: int | None = None,
                          chat_id: str | int | None = None):
+        if self._too_large(data, "voice message"):
+            return None
         caption = self._truncate_caption(caption)
         target = chat_id if chat_id is not None else self._default_chat_id
         result = await self._retry(
@@ -303,6 +335,8 @@ class TelegramSender:
 
     async def send_sticker(self, data: bytes, message_thread_id: int | None = None,
                            chat_id: str | int | None = None):
+        if self._too_large(data, "sticker"):
+            return None
         return await self._retry(
             lambda: self._bot.send_sticker(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
@@ -325,6 +359,8 @@ class TelegramSender:
         caption = self._truncate_caption(caption)
         target = chat_id if chat_id is not None else self._default_chat_id
         last_message = None
+        items = [item for item in items
+                 if not self._too_large(item[1], f"album item {item[2]!r}")]
         for offset in range(0, len(items), 10):
             chunk = items[offset:offset + 10]
 

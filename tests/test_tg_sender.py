@@ -223,3 +223,76 @@ class TestSetReaction:
         ok = await sender.set_reaction(chat_id="-100999", message_id=42, emoji="✅")
 
         assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# TG_UPLOAD_MB — the ceiling on what we hand to the Bot API
+# ---------------------------------------------------------------------------
+
+def _capped_sender(tmp_path, limit_bytes):
+    store = TopicStore(str(tmp_path / "topics.json"))
+    with patch("app.tg_sender.Bot"):
+        sender = TelegramSender("dummy-token", DEFAULT, store,
+                                max_upload_bytes=limit_bytes)
+    sender._bot = MagicMock()
+    for name in ("send_photo", "send_document", "send_video", "send_voice",
+                 "send_sticker", "send_media_group"):
+        setattr(sender._bot, name, AsyncMock(return_value=MagicMock()))
+    return sender
+
+
+class TestUploadSizeLimit:
+    """A MAX chat can carry something bigger than Telegram will accept, so
+    the ceiling is its own setting (TG_UPLOAD_MB) rather than whatever
+    MAX_DOWNLOAD_MB let us fetch. Over it, the send is refused before the
+    request: callers read None as "couldn't send" and post a text fallback
+    naming the attachment, so nothing disappears silently."""
+
+    @pytest.mark.parametrize("method,args", [
+        ("send_photo", (b"x" * 200,)),
+        ("send_document", (b"x" * 200,)),
+        ("send_video", (b"x" * 200,)),
+        ("send_voice", (b"x" * 200,)),
+        ("send_sticker", (b"x" * 200,)),
+    ])
+    async def test_oversized_upload_is_refused_before_the_request(
+        self, tmp_path, method, args,
+    ):
+        sender = _capped_sender(tmp_path, 100)
+
+        assert await getattr(sender, method)(*args) is None
+        getattr(sender._bot, method).assert_not_awaited()
+
+    async def test_an_upload_within_the_limit_still_goes_out(self, tmp_path):
+        sender = _capped_sender(tmp_path, 100)
+
+        assert await sender.send_photo(b"x" * 50) is not None
+        sender._bot.send_photo.assert_awaited_once()
+
+    async def test_no_limit_configured_means_no_check(self, tmp_path):
+        sender = _capped_sender(tmp_path, None)
+
+        assert await sender.send_photo(b"x" * 10_000_000) is not None
+        sender._bot.send_photo.assert_awaited_once()
+
+    async def test_an_album_drops_only_the_oversized_items(self, tmp_path):
+        """One huge photo must not cost the album the rest of its items."""
+        sender = _capped_sender(tmp_path, 100)
+        sender._bot.send_media_group = AsyncMock(return_value=[MagicMock()])
+
+        await sender.send_media_group([
+            ("photo", b"x" * 50, "small.jpg"),
+            ("photo", b"x" * 500, "huge.jpg"),
+            ("photo", b"x" * 60, "also-small.jpg"),
+        ])
+
+        sender._bot.send_media_group.assert_awaited_once()
+        sent_media = sender._bot.send_media_group.await_args.kwargs["media"]
+        assert len(sent_media) == 2
+
+    async def test_an_album_of_nothing_but_oversized_items_sends_nothing(self, tmp_path):
+        sender = _capped_sender(tmp_path, 100)
+        sender._bot.send_media_group = AsyncMock()
+
+        assert await sender.send_media_group([("photo", b"x" * 500, "huge.jpg")]) is None
+        sender._bot.send_media_group.assert_not_awaited()
