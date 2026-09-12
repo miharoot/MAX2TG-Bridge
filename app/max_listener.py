@@ -574,7 +574,11 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         only the *other* side reading is interesting to see in Telegram."""
         if event.set_as_unread:
             return
-        if client.my_id is not None and event.user_id == client.my_id:
+        # Compared as strings: MAX ids travel as ints in some payloads and
+        # as strings in others, and a type mismatch here fails open — the
+        # ✅ would then be posted for your *own* read marker moving, which
+        # reads in Telegram as "they read it" when nobody has.
+        if client.my_id is not None and str(event.user_id) == str(client.my_id):
             return
         last = _last_tg_message.get(event.chat_id)
         if last is None:
