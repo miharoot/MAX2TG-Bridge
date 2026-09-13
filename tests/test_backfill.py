@@ -197,3 +197,80 @@ class TestIngestHistory:
         assert await client.backfill_chat(-42, 10) == 0
         sender.send.assert_not_awaited()
         await client.outbox.close()
+
+
+class TestSeedSeenMarks:
+    """With the catch-up on and no marks yet, every bound chat starts from
+    where it stands now — otherwise a quiet chat stays uncovered until it
+    happens to receive something."""
+
+    async def _ready(self, snapshot, topics, catchup=True):
+        import asyncio
+
+        from app.config import Settings
+        from app.max_listener import configure_pymax_client
+        from app.outbox import Outbox
+        from tests.test_max_to_tg_outbox import _FakePyMaxClient
+
+        sender = AsyncMock()
+        sender.topic_store = MagicMock()
+        sender.topic_store.get_topic = MagicMock(side_effect=lambda cid: topics.get(cid))
+
+        client = _FakePyMaxClient()
+        client.settings = Settings(tg_bot_token="t", tg_chat_id="-100999",
+                                   catchup_enabled=catchup, catchup_limit=50)
+        client.fetch_recent_messages = AsyncMock(return_value=[])
+        configure_pymax_client(client, sender)
+        client.outbox = Outbox(":memory:")
+
+        await client._on_ready_cb(snapshot)
+        await asyncio.sleep(0.05)        # let the catch-up task run
+        return client
+
+    def _snapshot(self):
+        return {"chats": [
+            {"id": -42, "type": "CHAT", "title": "Рабочий чат",
+             "lastMessage": {"id": 7, "time": 500}, "lastEventTime": 900},
+            {"id": -43, "type": "CHAT", "title": "Соседский чат",
+             "lastMessage": {"id": 9, "time": 700}},
+        ]}
+
+    async def test_a_bound_chat_starts_from_its_last_message(self):
+        client = await self._ready(self._snapshot(), topics={-42: 10})
+
+        assert await client.outbox.seen_mark(-42) == 500
+        await client.outbox.close()
+
+    async def test_a_chat_with_no_topic_is_left_alone(self):
+        """It was never bridged; marking it would arm a catch-up for a
+        topic that doesn't exist."""
+        client = await self._ready(self._snapshot(), topics={-42: 10})
+
+        assert await client.outbox.seen_mark(-43) is None
+        await client.outbox.close()
+
+    async def test_the_mark_is_not_taken_from_lastEventTime(self):
+        """It moves on reads and joins too, so it can jump past a message
+        that was never forwarded."""
+        client = await self._ready(self._snapshot(), topics={-42: 10})
+
+        assert await client.outbox.seen_mark(-42) != 900
+        await client.outbox.close()
+
+    async def test_existing_marks_are_never_reseeded(self):
+        import asyncio
+
+        client = await self._ready(self._snapshot(), topics={-42: 10})
+        await client.outbox.mark_seen(-42, 1000)
+
+        await client._on_ready_cb(self._snapshot())
+        await asyncio.sleep(0.05)
+
+        assert await client.outbox.seen_mark(-42) == 1000
+        await client.outbox.close()
+
+    async def test_nothing_is_seeded_while_the_option_is_off(self):
+        client = await self._ready(self._snapshot(), topics={-42: 10}, catchup=False)
+
+        assert await client.outbox.seen_marks() == {}
+        await client.outbox.close()

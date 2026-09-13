@@ -576,6 +576,13 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         except Exception:
             log.exception("Catch-up: cannot read the seen marks")
             return
+        if not marks:
+            # Nothing forwarded on this version yet. Start the count from
+            # where each chat stands now instead of skipping chats until
+            # their first message arrives — otherwise a quiet chat stays
+            # uncovered for as long as it stays quiet.
+            await _seed_seen_marks()
+            return
         total = 0
         for chat_id, mark in marks.items():
             key: Any = chat_id
@@ -592,6 +599,29 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
                 log.exception("Catch-up failed for MAX chat %s", chat_id)
         if total:
             log.info("Catch-up: forwarded %d missed messages", total)
+
+    async def _seed_seen_marks() -> None:
+        """Mark every bound chat as forwarded up to its last message.
+
+        Only ever runs with the table empty, and takes the time from MAX's
+        own snapshot (``lastMessage.time``) rather than the clock here:
+        message times come from MAX's server, so a container whose clock
+        runs fast would otherwise skip messages as "older than the mark".
+        ``lastEventTime`` is no good for this — it also moves on reads and
+        joins, so it can jump past a message that was never forwarded.
+        """
+        seeded = 0
+        for chat_id, chat in (resolver.chats_raw or {}).items():
+            if sender.topic_store.get_topic(chat_id) is None:
+                continue
+            last = (chat or {}).get("lastMessage") or {}
+            stamp = last.get("time") if isinstance(last, dict) else None
+            if stamp is None:
+                continue
+            await client.outbox.mark_seen(chat_id, stamp, last.get("id"))
+            seeded += 1
+        log.info("Catch-up: starting from now — %d chat(s) marked; messages "
+                 "that arrived before this are only in MAX", seeded)
 
     @client.on_qr
     async def handle_qr(qr_url: str, png_bytes: bytes):
