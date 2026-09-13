@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import contextlib
 import logging
 import os
 import threading
@@ -38,6 +39,22 @@ class _SyncExecutor(ThreadPoolExecutor):
         except Exception as exc:
             f.set_exception(exc)
         return f
+
+
+async def bring_up_telegram(sender, start_polling) -> None:
+    """Connect to Telegram, however long it takes, off the startup path.
+
+    Waiting for Telegram inline used to hold up the MAX listener, so an
+    unreachable proxy meant MAX was never connected either: messages sent
+    to MAX during the outage weren't received, weren't queued in the
+    outbox, and were simply missed. The two sides are independent — MAX
+    runs from the start, and whatever it delivers waits in the outbox
+    until Telegram answers again.
+    """
+    await retry_until_reachable("bot startup", sender.connect)
+    if start_polling is not None:
+        await retry_until_reachable("polling startup", start_polling)
+        log.info("Telegram polling started (reply → Max enabled)")
 
 
 async def main():
@@ -86,7 +103,6 @@ async def main():
     sender = TelegramSender(settings.tg_bot_token, settings.tg_chat_id, topic_store,
                             proxy_url=settings.tg_proxy, chat_routes=settings.chat_routes,
                             max_upload_bytes=settings.tg_upload_mb * 1024 * 1024)
-    await sender.start()
 
     client = create_pymax_client(settings, sender)
     log.info(
@@ -106,6 +122,7 @@ async def main():
                               topic_store, allowed_user_ids=settings.tg_allowed_user_ids,
                               proxy_url=settings.tg_proxy,
                               max_upload_bytes=settings.max_download_mb * 1024 * 1024)
+
         async def _start_polling() -> None:
             # Each step guarded: a retry runs this again, and starting an
             # Application (or an Updater) that is already running raises.
@@ -115,17 +132,21 @@ async def main():
             if tg_app.updater.running:
                 return
             await tg_app.updater.start_polling(
-                drop_pending_updates=True,
+                # Never drop what Telegram held for us: messages sent while
+                # the bridge was down (it keeps them ~24h) are exactly the
+                # ones that must still reach MAX.
+                drop_pending_updates=False,
                 allowed_updates=Update.ALL_TYPES,
                 # Keep retrying the initial getUpdates too: the proxy can
                 # still be coming up while we get this far.
                 bootstrap_retries=-1,
             )
-
-        await retry_until_reachable("polling startup", _start_polling)
-        log.info("Telegram polling started (reply → Max enabled)")
     else:
         log.info("Reply to Max disabled (REPLY_ENABLED=false)")
+
+    telegram_task = asyncio.create_task(
+        bring_up_telegram(sender, None if tg_app is None else _start_polling)
+    )
 
     log.info("Starting Max listener...")
     max_upload_bytes = settings.max_download_mb * 1024 * 1024
@@ -149,6 +170,9 @@ async def main():
         raise
     finally:
         log.info("Shutting down...")
+        telegram_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await telegram_task
         outbox_retry_task.cancel()
         try:
             await outbox_retry_task

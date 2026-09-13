@@ -97,9 +97,15 @@ class TelegramSender:
         return self._topics
 
     async def start(self):
-        await retry_until_reachable("bot startup", self._connect)
+        """Connect, waiting out a network that isn't there yet.
 
-    async def _connect(self) -> None:
+        app/main.py drives this in the background (see _bring_up_telegram)
+        so the MAX side doesn't wait on Telegram; ``connect`` is the single
+        attempt it retries.
+        """
+        await retry_until_reachable("bot startup", self.connect)
+
+    async def connect(self) -> None:
         await self._bot.initialize()
         me = await self._bot.get_me()
         log.info("Telegram bot ready: @%s", me.username)
