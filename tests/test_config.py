@@ -269,3 +269,32 @@ def test_chat_routes_non_object_json_raises():
 def test_chat_routes_non_integer_value_raises():
     with pytest.raises(SystemExit, match="MAX_CHAT_ROUTES"):
         load({**BASE, "MAX_CHAT_ROUTES": '{"42": "not-a-number"}'})
+
+
+class TestBackfillSettings:
+    """Both history options are off unless asked for, and capped when on."""
+
+    def test_off_by_default(self):
+        settings = load(BASE)
+        assert settings.backfill_enabled is False
+        assert settings.catchup_enabled is False
+
+    def test_enabled_with_their_limits(self):
+        settings = load({**BASE, "MAX_BACKFILL": "true", "MAX_BACKFILL_LIMIT": "5",
+                         "MAX_CATCHUP": "yes", "MAX_CATCHUP_LIMIT": "30"})
+        assert settings.backfill_enabled is True
+        assert settings.backfill_limit == 5
+        assert settings.catchup_enabled is True
+        assert settings.catchup_limit == 30
+
+    def test_the_limits_are_capped(self):
+        """A typo in .env shouldn't pull thousands of old messages into
+        Telegram."""
+        settings = load({**BASE, "MAX_BACKFILL_LIMIT": "100000",
+                         "MAX_CATCHUP_LIMIT": "100000"})
+        assert settings.backfill_limit == 200
+        assert settings.catchup_limit == 200
+
+    def test_a_negative_limit_is_refused_outright(self):
+        with pytest.raises(SystemExit):
+            load({**BASE, "MAX_CATCHUP_LIMIT": "-5"})

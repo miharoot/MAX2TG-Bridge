@@ -48,6 +48,9 @@ def _make_context(args=None, existing_topic=None, allowed_user_ids=None):
 
     max_client = MagicMock()
     max_client.resolver = None
+    # Off, as it is by default: a bare MagicMock would read as "backfill
+    # 〈Mock〉 messages" and make every /bind and /add pull history.
+    max_client.backfill_limit = 0
 
     ctx.bot_data = {
         ALLOWED_USER_KEY: allowed_user_ids,

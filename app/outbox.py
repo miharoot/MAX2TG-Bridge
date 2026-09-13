@@ -128,9 +128,61 @@ class Outbox:
                     )
                     """
                 )
+                # How far each MAX chat has been forwarded. Lives here
+                # rather than in topics.json because it's written on every
+                # delivered message: one row updated in place beats
+                # rewriting a JSON file, and concurrent deliveries can't
+                # clobber each other.
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS seen (
+                        chat_id   TEXT PRIMARY KEY,
+                        last_time INTEGER NOT NULL,
+                        last_id   TEXT
+                    )
+                    """
+                )
                 await conn.commit()
                 self._conn = conn
         return self._conn
+
+    async def mark_seen(self, chat_id: Any, message_time: Any,
+                        message_id: Any = None) -> None:
+        """Record that this chat has been forwarded up to this message.
+
+        Never moves backwards: a retry or an out-of-order delivery of an
+        older message must not make the bridge re-send everything after it.
+        """
+        try:
+            stamp = int(message_time)
+        except (TypeError, ValueError):
+            return
+        conn = await self._get_conn()
+        await conn.execute(
+            """
+            INSERT INTO seen (chat_id, last_time, last_id) VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                last_time = excluded.last_time,
+                last_id   = excluded.last_id
+            WHERE excluded.last_time > seen.last_time
+            """,
+            (str(chat_id), stamp, None if message_id is None else str(message_id)),
+        )
+        await conn.commit()
+
+    async def seen_mark(self, chat_id: Any) -> int | None:
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT last_time FROM seen WHERE chat_id = ?", (str(chat_id),)
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else int(row[0])
+
+    async def seen_marks(self) -> dict[str, int]:
+        conn = await self._get_conn()
+        async with conn.execute("SELECT chat_id, last_time FROM seen") as cur:
+            rows = await cur.fetchall()
+        return {str(chat_id): int(last_time) for chat_id, last_time in rows}
 
     async def add(self, direction: str, payload: dict[str, Any]) -> int:
         conn = await self._get_conn()

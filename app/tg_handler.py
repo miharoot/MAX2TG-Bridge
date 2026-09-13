@@ -915,6 +915,7 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         post_topic_intro(context.bot, target_chat_id, max_client,
                           max_chat_id, thread_id)
     )
+    _backfill_new_topic(max_client, max_chat_id)
 
 
 _MAX_LINK_RE = re.compile(r"https?://max\.ru/[A-Za-z0-9_\-/]+")
@@ -946,6 +947,21 @@ def _extract_chat_id_from_open(resp: dict) -> int | None:
             except ValueError:
                 pass
     return None
+
+
+def _backfill_new_topic(max_client, max_chat_id) -> None:
+    """Pull the chat's recent MAX messages into a topic just created.
+
+    Off unless MAX_BACKFILL is set; MAX_BACKFILL_LIMIT caps how many.
+    Fire-and-forget: binding shouldn't wait on MAX's history, and the
+    messages go through the outbox like any other, so a failure here
+    costs nothing but an empty topic.
+    """
+    limit = getattr(max_client, "backfill_limit", 0) or 0
+    backfill = getattr(max_client, "backfill_chat", None)
+    if limit <= 0 or backfill is None:
+        return
+    asyncio.create_task(backfill(max_chat_id, limit))
 
 
 def _chat_is_known(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
@@ -1169,6 +1185,7 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         post_topic_intro(context.bot, target_chat_id, max_client,
                           chat_id, thread_id)
     )
+    _backfill_new_topic(max_client, chat_id)
 
 
 # Rule between /list sections — long enough to read as a divider on a

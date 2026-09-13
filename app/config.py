@@ -28,6 +28,14 @@ class Settings:
     max_download_mb: int = 50
     tg_upload_mb: int = 50
     health_port: int | None = None
+    # When a chat is bound to a fresh topic, pull this many of its most
+    # recent MAX messages in so the topic doesn't open empty.
+    backfill_enabled: bool = False
+    backfill_limit: int = 20
+    # On reconnect, fetch what MAX received while the bridge was down —
+    # everything newer than the last message it forwarded, per chat.
+    catchup_enabled: bool = False
+    catchup_limit: int = 50
 
 
 def _parse_chat_routes(raw: str | None) -> dict[str, int]:
@@ -151,4 +159,8 @@ def load_settings() -> Settings:
         max_download_mb=_int_env("MAX_DOWNLOAD_MB", 50),
         tg_upload_mb=_int_env("TG_UPLOAD_MB", 50),
         health_port=_int_env("HEALTH_PORT", 0) or None,
+        backfill_enabled=os.environ.get("MAX_BACKFILL", "").lower() in ("1", "true", "yes"),
+        backfill_limit=min(_int_env("MAX_BACKFILL_LIMIT", 20), 200),
+        catchup_enabled=os.environ.get("MAX_CATCHUP", "").lower() in ("1", "true", "yes"),
+        catchup_limit=min(_int_env("MAX_CATCHUP_LIMIT", 50), 200),
     )

@@ -502,6 +502,14 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
     state_dir = getattr(_settings, "state_dir", None) or "state"
     client.outbox = Outbox(os.path.join(state_dir, "outbox.db"))
 
+    # How many recent messages a freshly bound topic pulls in (0 = off).
+    # Read off the client so tg_handler's /bind and /add don't need the
+    # whole Settings object plumbed through build_tg_app.
+    client.backfill_limit = (
+        getattr(_settings, "backfill_limit", 0)
+        if getattr(_settings, "backfill_enabled", False) else 0
+    )
+
     _first_connect = True
     # Reconnect ("восстановлено") should only ever follow a disconnect
     # notice the user actually saw — otherwise pymax's internal
@@ -546,6 +554,44 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             chat_count = len(resolver.chats)
             await sender.broadcast(f"✅ <b>Max:</b> подключён | чатов: {chat_count}")
         _first_connect = False
+
+        if getattr(_settings, "catchup_enabled", False):
+            asyncio.create_task(_catch_up_missed())
+
+    async def _catch_up_missed() -> None:
+        """Forward what MAX received while the bridge was down.
+
+        Only chats that already have a topic are considered — a chat with
+        no topic was never bridged, and pulling its history in on the
+        first connect would open a topic full of old messages nobody
+        asked for. The per-chat mark comes from the outbox database, so
+        it survives restarts; chats with no mark are skipped for the same
+        reason.
+        """
+        limit = getattr(_settings, "catchup_limit", 0) or 0
+        if limit <= 0:
+            return
+        try:
+            marks = await client.outbox.seen_marks()
+        except Exception:
+            log.exception("Catch-up: cannot read the seen marks")
+            return
+        total = 0
+        for chat_id, mark in marks.items():
+            key: Any = chat_id
+            try:
+                key = int(chat_id)
+            except (TypeError, ValueError):
+                pass
+            if sender.topic_store.get_topic(key) is None:
+                continue
+            try:
+                total += await _ingest_history(key, limit, since=mark,
+                                               what="подхват пропущенного")
+            except Exception:
+                log.exception("Catch-up failed for MAX chat %s", chat_id)
+        if total:
+            log.info("Catch-up: forwarded %d missed messages", total)
 
     @client.on_qr
     async def handle_qr(qr_url: str, png_bytes: bytes):
@@ -613,14 +659,14 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         await sender.send(f"👍 <i>Реакция на сообщение: {parts}</i>",
                           message_thread_id=thread_id, chat_id=tg_chat_id)
 
-    @client.on_message
-    async def handle_message(msg: MaxMessage):
-        # An echo of a message the bridge itself just sent — drop it, or it
-        # would loop back into Telegram. Not an outbox-worthy event: it was
-        # never meant to be forwarded, so there's nothing to persist/retry.
-        if client.is_bridge_echo(msg):
-            return
+    async def _ingest_max_message(msg: MaxMessage) -> None:
+        """Persist a MAX message, then deliver it to Telegram.
 
+        The one path in: a live event, a message pulled in when a topic is
+        created, and one picked up after downtime all go through here, so
+        each is queued before any delivery is attempted and survives a
+        Telegram outage the same way.
+        """
         item_id = await client.outbox.add(outbox.MAX_TO_TG, _max_message_to_payload(msg))
         # Claim the item before the background retry sweep can see it as
         # pending (see Outbox.try_start) — held until the row is
@@ -641,6 +687,40 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             await client.outbox.remove(item_id)
         finally:
             client.outbox.finish(item_id)
+            # Marked even when delivery failed: the message is in the
+            # outbox, so the retry loop owns it from here — a catch-up
+            # must not queue it a second time.
+            await client.outbox.mark_seen(msg.chat_id, msg.timestamp, msg.message_id)
+
+    @client.on_message
+    async def handle_message(msg: MaxMessage):
+        # An echo of a message the bridge itself just sent — drop it, or it
+        # would loop back into Telegram. Not an outbox-worthy event: it was
+        # never meant to be forwarded, so there's nothing to persist/retry.
+        if client.is_bridge_echo(msg):
+            return
+
+        await _ingest_max_message(msg)
+
+    async def _ingest_history(chat_id: Any, limit: int, *,
+                              since: int | None = None, what: str = "догрузка") -> int:
+        """Pull recent MAX messages into Telegram, oldest first.
+
+        ``since`` keeps a catch-up to what arrived after the last forwarded
+        message; without it (a freshly bound topic) the last ``limit``
+        messages are taken as they are.
+        """
+        messages = await client.fetch_recent_messages(chat_id, limit)
+        if since is not None:
+            messages = [m for m in messages if (m.timestamp or 0) > since]
+        if not messages:
+            return 0
+        log.info("%s: %d messages from MAX chat %s", what, len(messages), chat_id)
+        for msg in messages:
+            await _ingest_max_message(msg)
+        return len(messages)
+
+    client.backfill_chat = _ingest_history
 
     async def _deliver_max_message(msg: MaxMessage):
         log.info(

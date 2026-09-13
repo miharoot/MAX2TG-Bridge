@@ -1571,6 +1571,30 @@ class PyMaxClient:
                  chat.get("id"))
         return {"chatId": chat["id"], "chat": chat}
 
+    async def fetch_recent_messages(self, chat_id: Any, limit: int) -> list[MaxMessage]:
+        """The chat's most recent messages, oldest first.
+
+        MAX keeps the history and pymax asks for it with CHAT_HISTORY
+        (opcode 49); ``backward`` counts back from now. Used to fill a
+        freshly bound topic and to pick up what arrived while the bridge
+        was down — both go through the same delivery path a live message
+        takes, so nothing about the formatting differs.
+        """
+        if limit <= 0:
+            return []
+        try:
+            raw = await self._client.fetch_history(chat_id=int(chat_id), backward=int(limit))
+        except Exception:
+            log.exception("fetch_history failed for chat %s", chat_id)
+            return []
+        messages = [
+            msg for msg in (_message_from_pymax(m, self._my_id) for m in (raw or []))
+            if msg is not None
+        ]
+        messages.sort(key=lambda m: m.timestamp or 0)
+        log.info("Fetched %d recent messages from MAX chat %s", len(messages), chat_id)
+        return messages
+
     async def download_audio_url(
         self,
         audio_id,
