@@ -9,9 +9,11 @@ from logging.handlers import RotatingFileHandler
 from telegram import Update
 
 from app.config import load_settings
-from app.max_listener import create_max_client
+from app.health import start_health_server
+from app.max_listener import create_pymax_client
+from app.outbox_retry import run_outbox_retry_loop
 from app.tg_handler import build_tg_app
-from app.tg_sender import TelegramSender
+from app.tg_sender import TelegramSender, retry_until_reachable
 from app.topics import TopicStore
 
 threading.stack_size(524288)
@@ -66,6 +68,13 @@ async def main():
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING if not settings.debug else logging.DEBUG)
 
+    _version_path = os.path.join(os.path.dirname(__file__), "..", "VERSION")
+    try:
+        with open(_version_path, encoding="utf-8") as f:
+            _version = f.read().strip()
+    except OSError:
+        _version = "unknown"
+    log.info("MAX2TG-Bridge v%s", _version)
     log.info("Debug mode: %s", "ON" if settings.debug else "OFF")
 
     if settings.tg_proxy:
@@ -75,39 +84,84 @@ async def main():
     topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"))
 
     sender = TelegramSender(settings.tg_bot_token, settings.tg_chat_id, topic_store,
-                            proxy_url=settings.tg_proxy)
+                            proxy_url=settings.tg_proxy, chat_routes=settings.chat_routes,
+                            max_upload_bytes=settings.tg_upload_mb * 1024 * 1024)
     await sender.start()
 
-    client = create_max_client(
-        settings.max_token, settings.max_device_id, sender, settings.max_chat_ids,
-        debug=settings.debug,
+    client = create_pymax_client(settings, sender)
+    log.info(
+        "Using PyMax (auth=%s, session=%s/%s)",
+        settings.max_pymax_auth,
+        settings.max_pymax_work_dir,
+        settings.max_pymax_session_name,
     )
+
+    health_runner = None
+    if settings.health_port:
+        health_runner = await start_health_server(client, settings.health_port)
 
     tg_app = None
     if settings.reply_enabled:
         tg_app = build_tg_app(settings.tg_bot_token, client, settings.tg_chat_id,
-                              topic_store, allowed_user_id=settings.tg_allowed_user_id,
-                              proxy_url=settings.tg_proxy)
-        await tg_app.initialize()
-        await tg_app.start()
-        await tg_app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
+                              topic_store, allowed_user_ids=settings.tg_allowed_user_ids,
+                              proxy_url=settings.tg_proxy,
+                              max_upload_bytes=settings.max_download_mb * 1024 * 1024)
+        async def _start_polling() -> None:
+            # Each step guarded: a retry runs this again, and starting an
+            # Application (or an Updater) that is already running raises.
+            await tg_app.initialize()
+            if not tg_app.running:
+                await tg_app.start()
+            if tg_app.updater.running:
+                return
+            await tg_app.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+                # Keep retrying the initial getUpdates too: the proxy can
+                # still be coming up while we get this far.
+                bootstrap_retries=-1,
+            )
+
+        await retry_until_reachable("polling startup", _start_polling)
         log.info("Telegram polling started (reply → Max enabled)")
     else:
         log.info("Reply to Max disabled (REPLY_ENABLED=false)")
 
     log.info("Starting Max listener...")
+    max_upload_bytes = settings.max_download_mb * 1024 * 1024
+    outbox_retry_task = asyncio.create_task(
+        run_outbox_retry_loop(client, sender, max_upload_bytes)
+    )
     try:
         await client.run()
+    except Exception:
+        log.exception("Max listener crashed")
+        try:
+            # broadcast(), not send() — every routed group should see
+            # this, not just the default one (same reasoning as the
+            # connection-lost/restored notices above).
+            await sender.broadcast(
+                "❌ <b>Max:</b> не удалось подключиться/авторизоваться. "
+                "Бот перезапустится через 30 секунд."
+            )
+        except Exception:
+            log.exception("Failed to notify Telegram about Max listener crash")
+        raise
     finally:
         log.info("Shutting down...")
+        outbox_retry_task.cancel()
+        try:
+            await outbox_retry_task
+        except asyncio.CancelledError:
+            pass
         if tg_app:
             await tg_app.updater.stop()
             await tg_app.stop()
             await tg_app.shutdown()
+        if health_runner:
+            await health_runner.cleanup()
         await sender.stop()
+        await client.outbox.close()
 
 
 if __name__ == "__main__":

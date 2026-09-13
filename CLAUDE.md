@@ -1,141 +1,129 @@
 # MAX2TG-Bridge — контекст для AI-ассистентов
 
-Этот файл — короткая шпаргалка для будущих сессий ассистента: что такое проект, что уже сделано, какие подводные камни.
+## Назначение
 
-## Что это
+Двусторонний мост MAX ↔ Telegram через форум-топики супергруппы. Каждый MAX-чат соответствует отдельному Telegram topic. Репозиторий полностью переведён на PyMax; собственного WebSocket-клиента больше нет.
 
-Двусторонний мост MAX (`ws-api.oneme.ru`) ↔ Telegram через форум-топики супергруппы. Каждый MAX-чат = свой topic в Telegram. Userbot подключается WebSocket'ом к MAX по `__oneme_auth` токену, Telegram-side — обычный bot через python-telegram-bot polling.
+Проект основан на [ircitdev/MAX2TG-Bridge](https://github.com/ircitdev/MAX2TG-Bridge), который развивает [Aist/max2tg](https://github.com/Aist/max2tg). Лицензия MIT.
 
-Основан на [Aist/max2tg](https://github.com/Aist/max2tg), но переписан вокруг форум-топиков и расширен. Лицензия MIT.
+Разные MAX-чаты можно направлять в разные Telegram-супергруппы (`MAX_CHAT_ROUTES`, `/bind`, `/add` в нужной группе) — не только в разные топики одной группы.
 
 ## Структура
 
-```
-app/
-  main.py          # entry: load .env → MaxClient + Telegram Application
-  config.py        # Settings dataclass + load_settings()
-  max_client.py    # WS клиент MAX. Opcodes, retry, reconnect, upload_*
-  max_listener.py  # MAX → TG handler (incoming), auto-topic creation
-  resolver.py      # кеш контактов / чатов (chats_raw, contacts_raw)
-  tg_sender.py     # TelegramSender + ensure_topic (create/rename)
-  tg_handler.py    # TG → MAX handler + команды /bind, /add, /profile, /intro, /del, /help
-  topics.py        # TopicStore: JSON-карта max_chat_id ↔ thread_id
-tests/             # 191 pytest, asyncio_mode=auto
-docs/cover.jpg     # обложка README
-state/             # runtime (топик-карта), gitignored
-logs/              # логи, gitignored
-```
+- `app/main.py` — запуск PyMax и Telegram polling.
+- `app/config.py` — конфигурация окружения; QR является auth-flow по умолчанию.
+- `app/pymax_auth.py` — фабрика `pymax.Client`/`WebClient`.
+- `app/pymax_client.py` — единый клиент MAX: события, чаты, контакты, медиа и безопасное скачивание.
+- `app/max_listener.py` — MAX → Telegram, альбомы, fallback вложений, read/reaction форвардинг, уведомления reconnect.
+- `app/tg_handler.py` — Telegram → MAX, команды, буферизация альбомов и нативные PyMax attachments.
+- `app/tg_sender.py` — Telegram Bot API, топики, мультигрупповой роутинг, media groups, retry и увеличенные timeout.
+- `app/resolver.py` — кеш чатов и контактов.
+- `app/topics.py` — постоянная карта MAX chat ID ↔ (Telegram chat ID, thread ID).
 
-## Протокол MAX (наши находки)
+## PyMax
 
-WebSocket: `wss://ws-api.oneme.ru/websocket`, `Origin: https://web.max.ru`.
+Переменные: `MAX_PYMAX_AUTH=qr|sms`, `MAX_PHONE` для SMS, опциональные `MAX_2FA_PASSWORD`, `MAX_PYMAX_WORK_DIR`, `MAX_PYMAX_SESSION_NAME`. Сессия находится в `state/pymax` и должна сохраняться между рестартами.
 
-Пакет: `{"ver":11,"cmd":0,"seq":N,"opcode":OP,"payload":{...}}`. Ответ: `cmd=1` (OK) или `cmd=3` (error).
+Используются нативные `Photo`, `Video`, `Voice` и `File`. Голосовые TG → MAX перед загрузкой перекодируются через ffmpeg (`imageio-ffmpeg` в зависимостях) — см. патч `upload_voice` в «Известных ограничениях». Telegram-альбом собирается по `media_group_id` и отправляется одним сообщением MAX. MAX-вложения группируются в Telegram media group до 10 элементов. Чаты из `MAX_CHAT_IDS`, отсутствующие в incremental sync, догружаются через PyMax.
 
-| Opcode | Назначение |
-|---|---|
-| 1 | HEARTBEAT_PING (раз в 30 сек) |
-| 6 | HANDSHAKE |
-| 19 | AUTH_SNAPSHOT (логин + первый snapshot чатов) |
-| 32 | CONTACT_GET — возвращает `{names, baseUrl, photoId}`, **НЕ возвращает phone/about** |
-| 35 | CONTACT_PRESENCE |
-| 48 | CHAT_GET |
-| 57 | open by link — работает только для `/join/<token>` (group/channel); `/u/<token>` падает с `not.found / chat namespace` |
-| 64 | SEND_MESSAGE (text, elements, attaches, link) |
-| 65 | ATTACH_TYPING ("я загружаю PHOTO/AUDIO/...") |
-| 67 | EDIT_MESSAGE |
-| 80 | PHOTO_UPLOAD_URL → `{count:1}` → `{url}` → POST → `{photos:{...:{token}}}` → attach `{_type:PHOTO, photoToken}` |
-| 82 | VIDEO_UPLOAD_URL |
-| 83 | VIDEO_DOWNLOAD_URL (на видео из MAX) |
-| 84 | **CALLS** `createJoinLink` — НЕ аудио (как мы предполагали) |
-| 85 | **CALLS** `getOkCallData` — тоже не аудио |
-| 86 | Что-то с upload, требует `count + show + chatId`, возвращает `{}` |
-| 87 | FILE_UPLOAD_URL → `{count:1}` → `{info:[{url, fileId}]}` → POST → ждать DISPATCH `op=136` → attach `{_type:FILE, fileId}` |
-| 88 | FILE_DOWNLOAD_URL |
-| 128 | DISPATCH (incoming сообщения от MAX) |
-| 136 | UPLOAD_READY (server подтверждает обработку загруженного файла) |
+Read-события (`on_message_read`) и реакции (`on_reaction_update`) из PyMax смэплены на `MaxReadEvent`/`MaxReactionEvent` в `app/pymax_client.py` — отметки «прочитано» ставятся ✅-реакцией на последнее пересланное сообщение, реакции идут отдельной строкой в топике.
 
-### Элементы форматирования в `SEND_MESSAGE.message.elements`
+Текст Telegram → MAX пока plain text: публичный `pymax.send_message()` не принимает старые entities напрямую.
 
-`{type, from, length}` — `from` это codepoint-индекс (НЕ UTF-16; Telegram-side юзает UTF-16, конвертация в `tg_handler._utf16_to_char_offset`).
+## Runtime
 
-| TG MessageEntityType | MAX element type |
-|---|---|
-| BOLD | `STRONG` |
-| ITALIC | `EMPHASIZED` |
-| STRIKETHROUGH | `STRIKETHROUGH` |
-| UNDERLINE | `UNDERLINE` |
-| CODE | `MONOSPACED` |
-| PRE | `BLOCKQUOTE` (MAX не имеет boxed code-block; квоту юзер сам выбрал) |
-| BLOCKQUOTE / EXPANDABLE_BLOCKQUOTE | `BLOCKQUOTE` |
-| TEXT_LINK | `LINK` с `attributes.url` |
-
-`CODE_BLOCK` отвергается валидацией (`No enum constant`). Имена `EMPHASIS`, `EM`, `ITALIC` тоже отвергались — пришли к `EMPHASIZED` (как в `max-botapi-python.enums.text_style`).
-
-### Attach типы (входящие из MAX)
-
-`PHOTO` (baseUrl/baseRawUrl + photoToken), `VIDEO` (thumbnail), `FILE` (url + name + size), `AUDIO` (url), `STICKER` (url), `SHARE` (url + title + description), `LOCATION` (lat/lon), `CONTACT` (name + phone), `UNSUPPORTED` (новый voice — `audioId + token + duration + wave`, опкод download неизвестен).
-
-### Особенности WS
-
-- `proto.payload` ошибки **закрывают WS** для некоторых опкодов (мост авто-реконнектится через 5 сек). Это мешает массовому пробингу: после первой неудачи остальные опкоды успевают только таймаут схватить.
-- Токен MAX молча ротируется при логине в web.max.ru с другого устройства: handshake проходит, AUTH_SNAPSHOT не приходит → бот висит. Решение — освежить `MAX_TOKEN`.
-
-## Telegram-side нюансы
-
-- Бот должен быть **админом супергруппы с правом «Управление темами»** (`can_manage_topics: true`) — иначе `create_forum_topic` падает.
-- Супергруппа должна быть **forum-enabled** (включены Topics).
-- Доступные реакции в чате — по умолчанию ограничены, для 👀 нужно «Все эмодзи» в настройках.
-- Bot API лимит загрузки файла — 20 МБ.
-- Bot **не может** ставить custom-emoji реакции (нужен Premium).
-
-## Команды (в супергруппе)
-
-- `/bind <chat_id|URL> [title]` — ручная привязка топика к MAX-чату.
-- `/add <https://max.ru/join/...>` — резолв инвайт-ссылки + создание топика. `/u/<token>` пока не поддерживается.
-- `/profile` — в топике, профиль собеседника (имя/id/аватар).
-- `/intro` — перепост закреплённой карточки.
-- `/del` — удалить топик с подтверждением (inline-кнопки).
-- `/help` — справка.
-
-## Состояние / runtime
-
-- `state/topics.json` — JSON-карта `max_chat_id ↔ {topic_id, title}`. Атомарно перезаписывается (tmpfile + os.replace). Critical для непересоздавания топиков. Том должен быть mounted в docker-compose.
-- `logs/max2tg.log` — RotatingFileHandler 10MB × 5.
+- `state/topics.json` — карта топиков, не удалять.
+- `state/pymax/*.db` — авторизованная PyMax-сессия, не удалять.
+- `logs/max2tg.log` — rotating log.
+- Контейнер запускается через `docker compose up -d --build`.
 
 ## Тесты
 
-`pytest -q` → 191 passed. asyncio_mode=auto. Покрытие: TopicStore, config, listener helpers (форматирование размеров, throttle), tg_handler (роутинг команд, маршрутизация медиа), max_client опкоды.
+`pytest -q`. Покрываются config, topics, resolver, PyMax auth/client, маршрутизация (включая мульти-группу), медиа, альбомы и reconnect.
 
-## Деплой
+## Известные ограничения
 
-Docker. `docker-compose.yml` биндит `./logs:/app/logs` и `./state:/app/state`. Алёрт о подключении/обрыве идёт в General-топик.
+- Некоторые входящие voice attachments MAX не содержат доступного URL; мост отправляет fallback-текст.
+- `/u/<token>` — личная ссылка человека; pymax понимает только `join/<токен>`, поэтому такая ссылка уходит в `LINK_INFO` (опкод 89), и если MAX отвечает пользователем (`contact`/`user`/`profile`/`contacts`/`users` — какой именно ключ, апстрим не документирует, поэтому принимаются все и ключи ответа логируются), привязывается диалог с ним. Надёжнее — `/add +7…` (поиск по номеру, `search_by_phone`) или `/add <user_id>`. Ссылки вида `max.ru/id<цифры>_gos` — это **публичные хэндлы групп и каналов**, а не профили людей (проверено на живом канале); цифры в них не user_id, поэтому `/add` сначала ищет ссылку среди уже известных чатов (`chat["link"]`) и привязывает найденный чат без запросов. Личный чат привязывается по id человека (`/add <user_id>` или ссылка `max.ru/id<цифры>` как последняя попытка): id чата — это XOR двух user_id (`Client.get_chat_id`), подтверждено на живых DM, но привязка происходит только если MAX подтвердил существование пользователя — на цифры от хэндла канала он отвечает пустым списком.
+- Phone/about могут отсутствовать в ответах MAX.
+- PyMax использует неофициальный внутренний API MAX и может ломаться при изменениях протокола.
+- Реакции MAX → TG не привязаны к конкретному сообщению (нет карты MAX message_id ↔ TG message_id) — идут отдельной строкой в топике.
+- `app/pymax_client.py` при создании клиента патчит `upload_voice` целиком (`_patch_voice_upload_user_agent`) — апстримная версия отправляет голосовые так, что MAX их молча отвергает (см. [PyMax#103](https://github.com/MaxApiTeam/PyMax/issues/103)). Установлено перебором против живого сервера, все три части обязательны:
+  - **multipart-форма**, а не сырое тело с `Content-Range` (скопировано апстримом с video-загрузки) — на любое сырое тело MAX отвечает `BAD_REQUEST`;
+  - **`audioId`**, а не token из video-пайплайна: `VoiceAttachPayload` с пустым token сериализуется в `{_type: AUDIO, audioId: ...}` (в апстриме эта ветка — мёртвый код, т.к. token проставляется всегда), иначе MAX резолвит токен как видео и отвечает `errors.process.attachment.video.not.ready` навсегда;
+  - **перекодирование через ffmpeg** в Opus 48 кГц моно (`_VOICE_UPLOAD_FORMATS`): телеграмовский файл — уже Opus в OGG, но MAX бракует его с `AUDIO_VALIDATION_FAILED` (и WebM-ремукс тоже); дело не в контейнере, а в параметрах записи. ffmpeg берётся системный, иначе из пакета `imageio-ffmpeg`; без него отправляется оригинал.
+  Ошибки загрузки MAX отдаёт **с HTTP 200** в теле ответа — апстрим его не читает, из-за чего отказ годами выглядел как таймаут обработки. Тело логируется.
+- Ещё два патча связаны с тем, что голосовые грузятся через video-пайплайн:
+  - `pymax.exceptions.ApiError.__init__` (`_patch_api_error_not_ready_matching`) — обходит баг, из-за которого встроенный retry на `attachment.not.ready` не срабатывал для реальных кодов вида `errors.process.attachment.video.not.ready`.
+  - `pymax.dispatch.mapping.EVENT_MAP[Opcode.NOTIF_ATTACH]` (`_patch_voice_ready_resolution`) — обходит баг классификации: уведомление о готовности голосового содержит и `videoId`, и `audioId`, но резолвер проверяет video-сигнал первым и всегда ошибочно принимает голосовое за видео, из-за чего wait в `_process_attachment_error` никогда не резолвится и падает по таймауту (60с).
+  Оба патча идемпотентны и безвредны, если апстрим это когда-нибудь починит — можно оставить или убрать.
 
-## Что осталось / known issues
+## Git
 
-- Голосовые TG → MAX: уходят как `.ogg` файл (FILE), не как voice bubble. Опкод нативной audio-upload неизвестен (issue в vkmax #14 — без ответа). Hunting requires browser-side network capture.
-- Voice MAX → TG: для нового `_type=UNSUPPORTED` нет рабочего download-опкода. Опкод 84/85 — calls service. Probing блокирован WS-disconnect на proto.payload.
-- `/u/<token>` (user share) — opcode 57 ищет в chat-namespace. Server hint «No link or token found» для `{token}` payload — обманчив, реально опкод хочет только `link` URL.
-- Phone/about для контакта — `CONTACT_GET` не возвращает. Нужен другой опкод (предположительно тот же, что юзает web.max.ru при открытии профиля справа).
+## Rules
 
-## Если нужно ребутнуть знание о репо
+- Do not modify unrelated files.
+- Prefer small, focused changes.
+- Preserve existing architecture unless explicitly asked.
+- Add tests for bug fixes.
+- Do not remove existing tests.
+- Do not change `.env` or secrets.
+- Never commit secrets.
+- **Никаких данных из живых логов в репозитории.** Логи, которые присылает
+  пользователь, содержат его настоящие названия чатов, имена людей, id
+  чатов и пользователей, имя Telegram-группы и username бота. Ничего из
+  этого не должно попадать в код, комментарии, docstring'и, тексты команд
+  (`HELP_TEXT`), тесты, README, CLAUDE.md и `.env.example` — даже в
+  качестве примера и даже если «так нагляднее». В логе можно смотреть и
+  разбираться; в репозиторий идут только выдуманные значения:
+  - названия чатов — «Рабочий чат», «Городской канал», «Соседский чат»;
+  - имена людей — «Иван Петров»;
+  - id групп и каналов — `-10000000000001`, `-10000000000002`, …;
+  - id людей — `100000001`, `1234567890`;
+  - телефоны — `+79991234567`; ссылки — `https://max.ru/id1234567890_gos`,
+    `https://max.ru/u/<token>`, `https://max.ru/join/<token>`;
+  - группа Telegram — «Мост MAX», бот — `bridge_bot`.
+  То же касается текста коммитов, релизов и ответов пользователю: id из
+  его лога можно называть в переписке, но не сохранять в репозиторий.
+  Перед каждым коммитом проверять диф на такие значения.
 
-```bash
-# Локально
-cd /d/DevTools/Database/max2tg
-git status
-pytest -q
+Before making changes:
+- inspect git status
+- inspect relevant code
+- understand existing implementation
 
-# Прод (VPS Kyonix)
-ssh max2tg "cd /opt/max2tg && docker compose ps && docker compose logs --tail=50 max2tg"
+After changes:
+- run only relevant tests
+- show git diff
+- do not commit unless explicitly requested.
 
-# Структура развёртывания
-# - Контейнер max2tg-max2tg-1, образ собран из ./Dockerfile (python:3.12-slim → alpine; работает несмотря на glibc→musl, потому что слои совместимы).
-```
+## Investigation
 
-## Ссылки
+Do not speculate about code that has not been inspected.
+Read the relevant implementation before proposing changes.
 
-- Upstream: [Aist/max2tg](https://github.com/Aist/max2tg)
-- Reference opcode-doc: [nsdkinx/vkmax](https://github.com/nsdkinx/vkmax) (особенно [docs/opcodes.md](https://github.com/nsdkinx/vkmax/blob/main/docs/opcodes.md))
-- Официальный бот-API MAX: [max-messenger/max-botapi-python](https://github.com/max-messenger/max-botapi-python) — там же `enums/text_style.py` с правильными именами стилей
-- Альтернативный мост: [mimimiartartart/MaxToTelegramBridge](https://github.com/mimimiartartart/MaxToTelegramBridge) (one-topic-per-всё, аналогичные паттерны)
+## Rules 2
+
+Правила ниже действуют на **каждый** будущий `git push`, без отдельного напоминания от пользователя.
+
+1. Коммитить локально можно свободно и когда угодно.
+2. **Перед `git push`** (в любую ветку, включая `main`) — обязательно спросить разрешения у пользователя и дождаться явного подтверждения. Без него не пушить.
+3. **После получения разрешения, но перед самим пушем** — прогнать `pytest -q`, если менялся код (`app/`, `tests/`); для чисто документационных правок (README.md, CLAUDE.md и т.п. без изменений в коде) тесты не нужны.
+4. **На каждый push, где меняется код `app/`** (не документация) — обязательно, автоматически, без напоминания:
+   - бампнуть `VERSION`: баг-фикс → `+0.0.1` (patch), новая фича → `+0.1.0` (minor); при сомнении, фикс это или фича, считать фиксом (patch);
+   - если пуш содержит новую фичу — добавить её описание в README (в подходящий раздел `## Возможности`/т.п.) и коротко — в сводку отличий этого форка вверху README;
+   - добавить раздел в `CHANGELOG.md` — **сверху**, перед предыдущей версией:
+     заголовок `## X.Y.Z — ГГГГ-ММ-ДД` и под ним, списком, что вошло; тем же
+     текстом, что идёт в коммит бампа (по-русски, по существу: что изменилось
+     и почему, а не перечень файлов). Строку «Текущая стабильная.» держать
+     только у той версии, которая сейчас работает, — при следующем бампе
+     переносить её в новый раздел;
+   - закоммитить бамп версии (правки README и `CHANGELOG.md`) отдельным
+     коммитом `chore: version X.Y.Z` с кратким описанием, что вошло;
+   - запушить ветку;
+   - создать GitHub Release для тега `vX.Y.Z` с описанием изменений.
+5. Если push — только документация (без изменений `app/`/`tests/`), пункт 4 пропускается: версию не бампать, `CHANGELOG.md` не трогать, релиз не делать, просто пушить коммит.
+6. Если несколько локальных коммитов копятся между пушами — версию бампать один раз при итоговом пуше, отражая в разделе `CHANGELOG.md` и в тексте релиза все вошедшие изменения, а не на каждый отдельный коммит.
+7. `CHANGELOG.md` — единственное место, где живёт история версий: история разработки схлопнута в один коммит, а релизы на GitHub могут быть удалены. Разделы прошлых версий не переписывать и не удалять — только добавлять новый сверху.
+
+

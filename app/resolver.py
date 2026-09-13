@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from app.max_client import MaxClient
+    from app.pymax_client import PyMaxClient
 
 log = logging.getLogger(__name__)
 
+# MAX's "Избранное" is an ordinary DIALOG whose only participant is you —
+# a chat with yourself. It carries no title of its own, so without this it
+# shows up nameless everywhere the peer's name would go.
+SAVED_MESSAGES_TITLE = "Избранное"
+
 
 class ContactResolver:
-    def __init__(self, client: MaxClient | None = None):
+    def __init__(self, client: PyMaxClient | None = None):
         self.chats: dict[Any, str] = {}
         self.chat_types: dict[Any, str] = {}
         self.chats_raw: dict[Any, dict] = {}      # full chat snapshot per id
@@ -20,6 +26,7 @@ class ContactResolver:
         self.contacts_raw: dict[Any, dict] = {}   # full contact dicts per id
         self._client = client
         self._fetch_failed: set = set()
+        self._chat_fetch_failed: set = set()
         self._my_id: Any = None
 
     @property
@@ -30,7 +37,54 @@ class ContactResolver:
         return self.chats.get(chat_id, str(chat_id))
 
     def is_dm(self, chat_id: Any) -> bool:
-        return self.chat_types.get(chat_id) == "DIALOG"
+        chat_type = self.chat_types.get(chat_id)
+        if chat_type:
+            return chat_type == "DIALOG"
+        # Unknown chat (not yet in snapshot/fetched): MAX's own convention is
+        # that DM chat IDs are positive and group/channel chat IDs are
+        # negative. Falling back on this avoids briefly misfiling a brand-new
+        # DM as a group (which would use the wrong topic-title heuristic).
+        # Zero is the one dialog that isn't positive — saved messages, whose
+        # id is your own id XOR itself.
+        try:
+            return int(chat_id) >= 0
+        except (TypeError, ValueError):
+            return False
+
+    def is_saved_messages(self, chat_id: Any) -> bool:
+        """Whether this is MAX's own saved-messages chat ("Избранное").
+
+        Its id is 0, and nothing else's can be: a dialog's id is the XOR
+        of the two user ids (``Client.get_chat_id``), and the dialog with
+        yourself XORs your id with itself. That alone identifies it.
+
+        Failing that, it is a dialog with exactly one participant — you.
+        Groups and channels don't qualify even when the snapshot lists
+        only us in ``participants``: MAX ships a partial participant map
+        for large chats, so the one-participant test alone renames real
+        groups (seen live on a 150-member channel).
+        """
+        if self._my_id is None:
+            return False
+        try:
+            if int(chat_id) == 0:
+                return True
+        except (TypeError, ValueError):
+            return False
+        chat = self.chats_raw.get(chat_id) or {}
+        chat_type = chat.get("type") or self.chat_types.get(chat_id)
+        if chat_type != "DIALOG":
+            return False
+        participants = chat.get("participants") or {}
+        if not participants:
+            return False
+        ids = set()
+        for uid in participants:
+            try:
+                ids.add(int(uid))
+            except (TypeError, ValueError):
+                return False
+        return ids == {int(self._my_id)}
 
     def user_name(self, user_id: Any) -> str:
         return self.users.get(user_id, str(user_id))
@@ -54,6 +108,31 @@ class ContactResolver:
         if unknown:
             await self._ws_fetch_contacts(unknown)
 
+    async def resolve_chat(self, chat_id: Any, *, refresh: bool = False) -> str:
+        """Best-effort fetch of chat metadata for chats missing from snapshot.
+
+        This is what fixes brand-new MAX chats (e.g. right after the bot's
+        account is added to a group) getting a forum topic named after
+        whoever added it instead of the actual group name: the snapshot
+        taken at startup doesn't know about chats created afterwards, so
+        without this live lookup the fallback used to be the sender's name.
+
+        ``refresh=True`` bypasses the cache/failure memory and re-fetches —
+        used when a topic already exists and its title should be kept in
+        sync with the current MAX chat title (e.g. the group was renamed).
+        """
+        if chat_id in self.chats and not refresh:
+            return self.chat_name(chat_id)
+        if chat_id in self._chat_fetch_failed and not refresh:
+            return self.chat_name(chat_id)
+
+        await self._ws_fetch_chat(chat_id)
+
+        if chat_id in self.chats:
+            return self.chat_name(chat_id)
+        self._chat_fetch_failed.add(chat_id)
+        return self.chat_name(chat_id)
+
     # ── populate from AUTH_SNAPSHOT ────────────────────────────────
 
     def load_snapshot(self, snapshot: dict) -> list:
@@ -62,8 +141,8 @@ class ContactResolver:
         names = profile.get("names", [])
         if names and self._my_id:
             n = names[0]
-            first = n.get("firstName", "")
-            last = n.get("lastName", "")
+            first = n.get("firstName") or ""
+            last = n.get("lastName") or ""
             self.users[self._my_id] = f"{first} {last}".strip() or n.get("name", "")
 
         all_participant_ids: set[int] = set()
@@ -103,6 +182,9 @@ class ContactResolver:
                         break
                 if peer_id:
                     self.chats[cid] = f"DM:{peer_id}"
+                elif participants:
+                    # Nobody but us in it: MAX's saved-messages chat.
+                    self.chats[cid] = SAVED_MESSAGES_TITLE
 
         log.info(
             "Snapshot parsed: %d chats, my_id=%s, %d participant IDs to resolve",
@@ -118,6 +200,8 @@ class ContactResolver:
         try:
             resp = await self._client.fetch_contacts(user_ids)
             self._parse_contacts_response(resp)
+        except asyncio.CancelledError:
+            log.warning("Contact fetch cancelled, falling back to numeric user IDs")
         except Exception:
             log.exception("Failed to fetch contacts via WS")
 
@@ -152,6 +236,58 @@ class ContactResolver:
         # Walk the entire response for any name-bearing objects
         self._deep_extract(resp, depth=0)
 
+    async def _ws_fetch_chat(self, chat_id: Any) -> None:
+        if not self._client:
+            return
+        try:
+            resp = await self._client.fetch_chat(chat_id)
+            self._parse_chat_response(resp, requested_chat_id=chat_id)
+        except asyncio.CancelledError:
+            log.warning("Chat fetch cancelled, falling back to cached chat metadata")
+        except Exception:
+            log.exception("Failed to fetch chat via WS")
+
+    def _parse_chat_response(
+        self,
+        resp: dict,
+        requested_chat_id: Any | None = None,
+    ) -> None:
+        """Parse a CHAT_GET-like response and update known chat metadata."""
+        if not isinstance(resp, dict) or not resp or "_max_error" in resp:
+            return
+
+        chats = []
+        if isinstance(resp.get("chat"), dict):
+            chats.append(resp["chat"])
+
+        resp_chats = resp.get("chats")
+        if isinstance(resp_chats, dict):
+            chats.extend(c for c in resp_chats.values() if isinstance(c, dict))
+        elif isinstance(resp_chats, list):
+            chats.extend(c for c in resp_chats if isinstance(c, dict))
+
+        if not chats and (
+            resp.get("id") == requested_chat_id
+            or resp.get("chatId") == requested_chat_id
+            or resp.get("title")
+            or resp.get("participants")
+        ):
+            chats.append(resp)
+
+        for chat in chats:
+            cid = chat.get("id") or chat.get("chatId") or requested_chat_id
+            if cid is None:
+                continue
+            ctype = chat.get("type")
+            title = chat.get("title")
+
+            self.chats_raw[cid] = chat
+            if ctype:
+                self.chat_types[cid] = ctype
+            if title:
+                self.chats[cid] = title
+            log.info("Fetched chat %s → title=%r type=%s", cid, title, ctype)
+
     def _deep_extract(self, obj: Any, depth: int) -> None:
         if depth > 5:
             return
@@ -175,8 +311,8 @@ class ContactResolver:
         names_list = c.get("names")
         if isinstance(names_list, list) and names_list:
             n = names_list[0]
-            first = n.get("firstName", "")
-            last = n.get("lastName", "")
+            first = n.get("firstName") or ""
+            last = n.get("lastName") or ""
             if first or last:
                 return f"{first} {last}".strip()
             if n.get("name"):
