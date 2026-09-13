@@ -1,11 +1,11 @@
 name: Release on version bump
 
-# Watches the VERSION file on main. When a push changes it, tags the
-# release and publishes GitHub Release notes. Pure shell + gh CLI — no
-# LLM call needed for this, so no ANTHROPIC_API_KEY: the job's own
-# `contents: write` permission is enough for the automatic GITHUB_TOKEN
-# to push a tag and create a release (unlike a Claude Code session's own
-# git credentials, which are scoped to branches only).
+# Watches the VERSION file on main. When a push changes it, publishes a
+# GitHub Release — gh creates the tag at the pushed commit as part of
+# that. Pure shell + gh CLI, no LLM call and no ANTHROPIC_API_KEY. Needs
+# `contents: write` for the automatic GITHUB_TOKEN, which also has to be
+# allowed repo-side: Settings → Actions → General → Workflow permissions
+# → "Read and write permissions", or this fails with a bare 403.
 on:
   push:
     branches: [main]
@@ -30,9 +30,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
 
           version="$(tr -d '[:space:]' < VERSION)"
           tag="v${version}"
@@ -90,7 +87,10 @@ jobs:
             echo "Release ${tag}." > "${notes_file}"
           fi
 
-          git tag -a "${tag}" -m "${tag}"
-          git push origin "refs/tags/${tag}"
-
-          gh release create "${tag}" --title "${tag}" --notes-file "${notes_file}"
+          # gh creates the tag itself, at --target, through the API — one
+          # call instead of tag + push + create, and one thing that can
+          # fail instead of two. (Both still need contents: write.)
+          gh release create "${tag}" \
+            --target "${GITHUB_SHA}" \
+            --title "${tag}" \
+            --notes-file "${notes_file}"
