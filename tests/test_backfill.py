@@ -65,9 +65,9 @@ class TestFetchRecentMessages:
         client._client.fetch_history = AsyncMock(return_value=raw_messages)
         return client
 
-    def _raw(self, msg_id, time_ms, text):
+    def _raw(self, msg_id, time_ms, text, chat_id=-42):
         raw = MagicMock()
-        raw.chat_id = -42
+        raw.chat_id = chat_id
         raw.sender = 100000001
         raw.text = text
         raw.time = time_ms
@@ -84,6 +84,17 @@ class TestFetchRecentMessages:
         messages = await client.fetch_recent_messages(-42, 10)
 
         assert [m.text for m in messages] == ["первое", "второе"]
+
+    async def test_history_messages_carry_no_chat_id_of_their_own(self):
+        """CHAT_HISTORY answers with the messages alone — the chat was in
+        the request. Dropping them for a missing chat_id is what made a
+        live /catchup say "MAX не вернул ни одного сообщения" while the
+        response held 8 KB of them."""
+        client = self._client([self._raw(1, 100, "привет", chat_id=None)])
+
+        messages = await client.fetch_recent_messages(-42, 10)
+
+        assert [m.chat_id for m in messages] == [-42]
 
     async def test_nothing_is_fetched_for_a_zero_limit(self):
         client = self._client([self._raw(1, 100, "x")])

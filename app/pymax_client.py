@@ -824,8 +824,15 @@ def _attachment_to_dict(attach: Any) -> dict:
     return data
 
 
-def _message_from_pymax(message: Any, my_id: Any = None) -> MaxMessage | None:
-    chat_id = getattr(message, "chat_id", None)
+def _message_from_pymax(message: Any, my_id: Any = None,
+                        chat_id: Any = None) -> MaxMessage | None:
+    # A live event carries its own chat_id; a message from CHAT_HISTORY
+    # doesn't — the chat was in the request, not the answer — so the
+    # caller passes it. Without this every fetched message was dropped
+    # here and a /catchup reported "MAX не вернул ни одного сообщения"
+    # while the response held them.
+    own_chat_id = getattr(message, "chat_id", None)
+    chat_id = own_chat_id if own_chat_id is not None else chat_id
     if chat_id is None:
         return None
 
@@ -1620,7 +1627,9 @@ class PyMaxClient:
             log.exception("fetch_history failed for chat %s", chat_id)
             return []
         messages = [
-            msg for msg in (_message_from_pymax(m, self._my_id) for m in (raw or []))
+            msg for msg in (
+                _message_from_pymax(m, self._my_id, chat_id) for m in (raw or [])
+            )
             if msg is not None
         ]
         messages.sort(key=lambda m: m.timestamp or 0)
