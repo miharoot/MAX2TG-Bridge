@@ -9,33 +9,39 @@ import pytest
 
 import app.tg_handler as tg_handler
 from app.outbox import MAX_TO_TG, TG_TO_MAX_MEDIA, TG_TO_MAX_TEXT, Outbox, OutboxItem
-from app.outbox_retry import MAX_BACKOFF, _backoff_seconds, _retry_one, run_outbox_retry_loop
+from app.outbox_retry import (
+    MAX_BACKOFF,
+    MIN_BACKOFF,
+    _backoff_seconds,
+    _retry_one,
+    run_outbox_retry_loop,
+)
 
 
 class TestBackoffSeconds:
     def test_zero_attempts_is_immediate(self):
         assert _backoff_seconds(0) == 0
 
-    def test_first_retry_is_immediate(self):
-        # attempts == 1 means it failed once already; still counts as a
-        # fresh item as far as backoff goes (immediate first retry is
-        # attempts == 0 before any failure has been recorded)
-        assert _backoff_seconds(1) == 60
+    def test_the_first_wait_after_a_failure_is_two_minutes(self):
+        # attempts == 1 means it failed once already; attempts == 0 is a
+        # fresh item, retried immediately
+        assert _backoff_seconds(1) == 120
 
     def test_backoff_doubles_each_attempt(self):
-        assert _backoff_seconds(2) == 120
-        assert _backoff_seconds(3) == 240
-        assert _backoff_seconds(4) == 480
+        assert _backoff_seconds(2) == 240
+        assert _backoff_seconds(3) == 480
 
     def test_backoff_caps_at_max(self):
         assert _backoff_seconds(20) == MAX_BACKOFF
         assert _backoff_seconds(1000) == MAX_BACKOFF
 
-    def test_the_cap_is_an_hour(self):
-        # A target that has been refusing for hours isn't worth
-        # re-downloading and re-uploading to more often than that; the
-        # item is still never dropped, just throttled.
-        assert MAX_BACKOFF == 3600
+    def test_the_throttle_runs_from_two_to_ten_minutes(self):
+        # Long enough that a refusing target isn't hammered with repeated
+        # downloads and uploads, short enough that a message doesn't sit
+        # around long after delivery became possible again. The item is
+        # never dropped, only throttled.
+        assert MIN_BACKOFF == 120
+        assert MAX_BACKOFF == 600
 
 
 def _make_item(direction, payload, item_id=1, attempts=0) -> OutboxItem:

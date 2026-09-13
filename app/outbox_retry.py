@@ -18,21 +18,24 @@ from app.tg_sender import TelegramSender
 log = logging.getLogger(__name__)
 
 SWEEP_INTERVAL = 20  # seconds between checks for pending outbox items
-MAX_BACKOFF = 3600   # cap retry spacing at an hour per item, however many
+MIN_BACKOFF = 120    # first retry after a failure waits two minutes: a
+                      # target that just refused rarely recovers sooner,
+                      # and each attempt can mean re-downloading and
+                      # re-uploading the whole attachment.
+MAX_BACKOFF = 600    # and never more than ten minutes apart, however many
                       # times it's failed — never give up entirely, per the
-                      # "keep retrying, don't drop it" requirement, but a
-                      # target that has been refusing for hours is not worth
-                      # re-downloading and re-uploading to more often than
-                      # that. Delivery that *can* succeed usually does so
-                      # long before the interval grows this far.
+                      # "keep retrying, don't drop it" requirement, but an
+                      # outage that lasts hours shouldn't leave a message
+                      # sitting an hour past the moment delivery became
+                      # possible again.
 
 
 def _backoff_seconds(attempts: int) -> float:
-    """1st retry: immediate. 2nd: 1 min. 3rd: 2 min. 4th: 4 min...
-    capped at MAX_BACKOFF."""
+    """Immediate before the first failure, then 2 min, 4 min, 8 min,
+    capped at MAX_BACKOFF (10 min)."""
     if attempts <= 0:
         return 0
-    return min(60 * (2 ** (attempts - 1)), MAX_BACKOFF)
+    return min(MIN_BACKOFF * (2 ** (attempts - 1)), MAX_BACKOFF)
 
 
 async def run_outbox_retry_loop(client, sender: TelegramSender, max_upload_bytes: int) -> None:
