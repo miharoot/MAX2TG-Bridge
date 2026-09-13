@@ -1291,6 +1291,22 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("В MAX пока нет чатов.")
         return
 
+    # Which Telegram group each topic lives in: with MAX_CHAT_ROUTES the
+    # topics are spread over several supergroups, so "топик #70" alone
+    # doesn't say where to look. One get_chat per distinct group (there
+    # are a handful at most), cached, and the id as fallback.
+    tg_titles: dict[int, str] = {}
+    for _entry in entries:
+        tg_id = topic_store.get_chat_id(_entry[1])
+        if tg_id is None or tg_id in tg_titles:
+            continue
+        try:
+            tg_chat = await context.bot.get_chat(tg_id)
+            tg_titles[tg_id] = str(getattr(tg_chat, "title", None) or tg_id)
+        except Exception as exc:                       # noqa: BLE001
+            log.debug("/list: cannot read Telegram chat %s: %s", tg_id, exc)
+            tg_titles[tg_id] = str(tg_id)
+
     log.info("/list: showing %d MAX chats to user_id=%s",
              len(entries), update.effective_user.id if update.effective_user else None)
 
@@ -1331,7 +1347,14 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"\n{_LIST_DIVIDER}\n<b>{title}</b>\n")
         for index, (chat_title, chat_id, _chat_type, join_link) in enumerate(chats):
             bound_thread = topic_store.get_topic(chat_id)
-            status = f"🔗 топик #{bound_thread}" if bound_thread is not None else "◌ не привязан"
+            if bound_thread is None:
+                status = "◌ не привязан"
+            else:
+                tg_id = topic_store.get_chat_id(chat_id)
+                where = tg_titles.get(tg_id) if tg_id is not None else None
+                status = f"🔗 топик #{bound_thread}"
+                if where:
+                    status += f" · {escape(where)}"
             # Ids and links go in monospace, each on its own line: they
             # exist to be copied out of the message — into /bind, a
             # browser, a note — which a word merely carrying a href is

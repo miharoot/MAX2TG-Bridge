@@ -52,12 +52,18 @@ class ContactResolver:
     def is_saved_messages(self, chat_id: Any) -> bool:
         """Whether this is MAX's own saved-messages chat ("Избранное").
 
-        It is a dialog with exactly one participant — you. Every other
-        chat has someone else in it, so nothing else answers to this.
+        It is a dialog with exactly one participant — you. Groups and
+        channels don't qualify even when the snapshot lists only us in
+        ``participants``: MAX ships a partial participant map for large
+        chats, so the one-participant test alone renames real groups
+        (seen live on a 150-member channel).
         """
         if self._my_id is None:
             return False
         chat = self.chats_raw.get(chat_id) or {}
+        chat_type = chat.get("type") or self.chat_types.get(chat_id)
+        if chat_type != "DIALOG":
+            return False
         participants = chat.get("participants") or {}
         if not participants:
             return False

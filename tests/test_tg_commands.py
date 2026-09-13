@@ -162,7 +162,8 @@ class TestCmdList:
     """What /list prints per chat: everything copyable is monospace and on
     its own line, and the invite link MAX already sent us is shown as-is."""
 
-    def _list_context(self, chats_raw, chat_types=None, topics=None):
+    def _list_context(self, chats_raw, chat_types=None, topics=None,
+                      tg_chats=None, tg_titles=None):
         ctx = _make_context(args=[])
         ctx.bot_data[SUPERGROUP_KEY] = TG_CHAT_ID
 
@@ -177,9 +178,50 @@ class TestCmdList:
         ctx.bot_data[MAX_CLIENT_KEY].resolver = resolver
 
         topics = topics or {}
+        tg_chats = tg_chats or {}
+        tg_titles = tg_titles or {}
         ctx.bot_data[TOPIC_STORE_KEY].get_topic = MagicMock(
             side_effect=lambda cid: topics.get(cid))
+        ctx.bot_data[TOPIC_STORE_KEY].get_chat_id = MagicMock(
+            side_effect=lambda cid: tg_chats.get(cid))
+
+        async def _get_chat(tg_id):
+            chat = MagicMock()
+            chat.title = tg_titles[tg_id]
+            return chat
+
+        ctx.bot.get_chat = AsyncMock(side_effect=_get_chat)
         return ctx
+
+    async def test_bound_chats_name_their_telegram_group(self):
+        """With MAX_CHAT_ROUTES the topics live in several supergroups,
+        so a bare "топик #70" doesn't say where to look."""
+        update = _make_update("/list")
+        ctx = self._list_context(
+            {-42: {"title": "Группа", "type": "CHAT"}},
+            chat_types={-42: "CHAT"},
+            topics={-42: 70},
+            tg_chats={-42: TG_CHAT_ID},
+            tg_titles={TG_CHAT_ID: "MAX2TG_miha"},
+        )
+
+        await _cmd_list(update, ctx)
+
+        assert "топик #70 · MAX2TG_miha" in "\n".join(_replies(update))
+
+    async def test_an_unreadable_telegram_group_falls_back_to_its_id(self):
+        update = _make_update("/list")
+        ctx = self._list_context(
+            {-42: {"title": "Группа", "type": "CHAT"}},
+            chat_types={-42: "CHAT"},
+            topics={-42: 70},
+            tg_chats={-42: TG_CHAT_ID},
+        )
+        ctx.bot.get_chat = AsyncMock(side_effect=RuntimeError("no access"))
+
+        await _cmd_list(update, ctx)
+
+        assert f"топик #70 · {TG_CHAT_ID}" in "\n".join(_replies(update))
 
     async def test_sections_and_chats_are_visibly_separated(self):
         """Every entry is three or four lines now; without separators the
@@ -354,6 +396,26 @@ class TestSavedMessages:
     def test_a_dialog_with_someone_else_is_not(self):
         resolver = self._resolver(participants={"100": 1, "42": 1})
         assert resolver.is_saved_messages(0) is False
+
+    def test_a_group_that_lists_only_me_is_not(self):
+        """MAX ships a partial participant map for large chats, so a real
+        group or channel can arrive with only us in ``participants`` —
+        that used to rename it to «Избранное» in /list and in its topic."""
+        resolver = self._resolver()
+        resolver.chats_raw[-69411105308916] = {
+            "id": -69411105308916, "type": "CHAT",
+            "title": "Домовой чат", "participants": {"100": 1},
+        }
+        assert resolver.is_saved_messages(-69411105308916) is False
+
+    def test_a_channel_that_lists_only_me_is_not(self):
+        resolver = self._resolver()
+        resolver.chat_types = {-69369957050939: "CHANNEL"}
+        resolver.chats_raw[-69369957050939] = {
+            "id": -69369957050939, "title": "МАДОУ детский сад",
+            "participants": {"100": 1},
+        }
+        assert resolver.is_saved_messages(-69369957050939) is False
 
     def test_a_chat_we_know_nothing_about_is_not(self):
         assert self._resolver().is_saved_messages(-42) is False
