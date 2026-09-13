@@ -13,7 +13,7 @@ from app.health import start_health_server
 from app.max_listener import create_pymax_client
 from app.outbox_retry import run_outbox_retry_loop
 from app.tg_handler import build_tg_app
-from app.tg_sender import TelegramSender
+from app.tg_sender import TelegramSender, retry_until_reachable
 from app.topics import TopicStore
 
 threading.stack_size(524288)
@@ -106,12 +106,23 @@ async def main():
                               topic_store, allowed_user_ids=settings.tg_allowed_user_ids,
                               proxy_url=settings.tg_proxy,
                               max_upload_bytes=settings.max_download_mb * 1024 * 1024)
-        await tg_app.initialize()
-        await tg_app.start()
-        await tg_app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
+        async def _start_polling() -> None:
+            # Each step guarded: a retry runs this again, and starting an
+            # Application (or an Updater) that is already running raises.
+            await tg_app.initialize()
+            if not tg_app.running:
+                await tg_app.start()
+            if tg_app.updater.running:
+                return
+            await tg_app.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+                # Keep retrying the initial getUpdates too: the proxy can
+                # still be coming up while we get this far.
+                bootstrap_retries=-1,
+            )
+
+        await retry_until_reachable("polling startup", _start_polling)
         log.info("Telegram polling started (reply → Max enabled)")
     else:
         log.info("Reply to Max disabled (REPLY_ENABLED=false)")

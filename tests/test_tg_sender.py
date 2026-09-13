@@ -296,3 +296,55 @@ class TestUploadSizeLimit:
 
         assert await sender.send_media_group([("photo", b"x" * 500, "huge.jpg")]) is None
         sender._bot.send_media_group.assert_not_awaited()
+
+
+class TestStartWaitsForTheNetwork:
+    """The bridge talks to Telegram through a SOCKS5 proxy that can come
+    up after the container does. An unguarded get_me() on startup killed
+    the process outright — the log ended mid-line with no bridge left."""
+
+    async def test_it_retries_until_telegram_answers(self, tmp_path):
+        from telegram.error import NetworkError
+
+        sender, _ = _sender(tmp_path)
+        me = MagicMock()
+        me.username = "MAX2TG2MAXbot"
+        sender._bot.initialize = AsyncMock()
+        sender._bot.get_me = AsyncMock(
+            side_effect=[NetworkError("proxy refused"), NetworkError("proxy refused"), me])
+
+        with patch("app.tg_sender.asyncio.sleep", AsyncMock()) as slept:
+            await sender.start()
+
+        assert sender._bot.get_me.await_count == 3
+        assert slept.await_count == 2
+
+    async def test_a_bad_token_is_not_waited_out(self, tmp_path):
+        """No amount of retrying fixes it, and retrying forever would hide
+        the one startup error worth reporting."""
+        from telegram.error import InvalidToken
+
+        sender, _ = _sender(tmp_path)
+        sender._bot.initialize = AsyncMock()
+        sender._bot.get_me = AsyncMock(side_effect=InvalidToken("nope"))
+
+        with pytest.raises(InvalidToken):
+            await sender.start()
+
+    async def test_the_wait_between_attempts_is_capped(self, tmp_path):
+        from app.tg_sender import TG_START_RETRY_MAX, retry_until_reachable
+
+        from telegram.error import NetworkError
+
+        attempts = {"n": 0}
+
+        async def _fails_ten_times():
+            attempts["n"] += 1
+            if attempts["n"] <= 10:
+                raise NetworkError("still down")
+
+        with patch("app.tg_sender.asyncio.sleep", AsyncMock()) as slept:
+            await retry_until_reachable("test", _fails_ten_times)
+
+        delays = [call.args[0] for call in slept.await_args_list]
+        assert max(delays) <= TG_START_RETRY_MAX

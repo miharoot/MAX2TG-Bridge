@@ -4,7 +4,7 @@ import logging
 
 from telegram import Bot, InputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TimedOut
+from telegram.error import InvalidToken, NetworkError, RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
 
 from app.topics import TopicStore
@@ -17,12 +17,41 @@ TG_TOPIC_NAME_MAX = 128
 MAX_RETRIES = 3
 TG_CONNECT_TIMEOUT = 20.0
 TG_REQUEST_TIMEOUT = 180.0
+# Longest wait between attempts to reach Telegram at startup.
+TG_START_RETRY_MAX = 60
 
 
 def _looks_numeric(title: str) -> bool:
     """A title is 'placeholder' when it carries no human-readable name yet."""
     title = (title or "").strip()
     return not title or title.isdigit() or title.startswith("DM:")
+
+
+async def retry_until_reachable(what: str, action) -> None:
+    """Run ``action()`` until Telegram answers, waiting out a dead network.
+
+    The bridge goes through a SOCKS5 proxy, which on a reboot can easily
+    come up after the container does. The very first call used to be an
+    unguarded get_me(), so a proxy that wasn't there yet killed the whole
+    process before a single line of work — the bridge must outlive its
+    network instead. A bad token is not waited out: no amount of retrying
+    fixes it.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            await action()
+            if attempt > 1:
+                log.info("Telegram reachable again (%s, attempt %d)", what, attempt)
+            return
+        except InvalidToken:
+            raise
+        except (NetworkError, TimedOut, OSError) as exc:
+            delay = min(2 ** min(attempt, 5), TG_START_RETRY_MAX)
+            log.warning("Telegram unreachable during %s (attempt %d): %s — "
+                        "retrying in %ds", what, attempt, exc, delay)
+            await asyncio.sleep(delay)
 
 
 class TelegramSender:
@@ -64,6 +93,9 @@ class TelegramSender:
         return self._topics
 
     async def start(self):
+        await retry_until_reachable("bot startup", self._connect)
+
+    async def _connect(self) -> None:
         await self._bot.initialize()
         me = await self._bot.get_me()
         log.info("Telegram bot ready: @%s", me.username)
