@@ -17,7 +17,9 @@ TG_TOPIC_NAME_MAX = 128
 MAX_RETRIES = 3
 TG_CONNECT_TIMEOUT = 20.0
 TG_REQUEST_TIMEOUT = 180.0
-# Longest wait between attempts to reach Telegram at startup.
+# Wait between attempts to reach Telegram at startup: the first pause,
+# then that much longer each time, up to the cap.
+TG_START_RETRY_STEP = 10
 TG_START_RETRY_MAX = 60
 
 
@@ -34,8 +36,10 @@ async def retry_until_reachable(what: str, action) -> None:
     come up after the container does. The very first call used to be an
     unguarded get_me(), so a proxy that wasn't there yet killed the whole
     process before a single line of work — the bridge must outlive its
-    network instead. A bad token is not waited out: no amount of retrying
-    fixes it.
+    network instead. Attempts are 10s apart, then 20s, 30s… up to a
+    minute — often enough that a proxy coming up is noticed quickly,
+    rare enough that an outage doesn't fill the log. A bad token is not
+    waited out: no amount of retrying fixes it.
     """
     attempt = 0
     while True:
@@ -48,7 +52,7 @@ async def retry_until_reachable(what: str, action) -> None:
         except InvalidToken:
             raise
         except (NetworkError, TimedOut, OSError) as exc:
-            delay = min(2 ** min(attempt, 5), TG_START_RETRY_MAX)
+            delay = min(TG_START_RETRY_STEP * attempt, TG_START_RETRY_MAX)
             log.warning("Telegram unreachable during %s (attempt %d): %s — "
                         "retrying in %ds", what, attempt, exc, delay)
             await asyncio.sleep(delay)

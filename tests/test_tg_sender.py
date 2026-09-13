@@ -332,7 +332,11 @@ class TestStartWaitsForTheNetwork:
             await sender.start()
 
     async def test_the_wait_between_attempts_is_capped(self, tmp_path):
-        from app.tg_sender import TG_START_RETRY_MAX, retry_until_reachable
+        from app.tg_sender import (
+            TG_START_RETRY_MAX,
+            TG_START_RETRY_STEP,
+            retry_until_reachable,
+        )
 
         from telegram.error import NetworkError
 
@@ -347,4 +351,6 @@ class TestStartWaitsForTheNetwork:
             await retry_until_reachable("test", _fails_ten_times)
 
         delays = [call.args[0] for call in slept.await_args_list]
-        assert max(delays) <= TG_START_RETRY_MAX
+        assert delays[0] == TG_START_RETRY_STEP      # 10s, then 20s, 30s…
+        assert delays == sorted(delays)
+        assert max(delays) == TG_START_RETRY_MAX
