@@ -513,6 +513,42 @@ class TestLeavingAChatInMax:
 
         client._client.leave_group.assert_awaited_once()
 
+    async def test_a_chat_we_never_joined_is_removed_from_the_list(self):
+        """Seen live: a channel sat in /list with no subscription behind
+        it, and unsubscribing answered chat.exit.not.active.user. Leaving
+        is meaningless there — removing it is what was asked for."""
+        client = self._client("CHANNEL")
+        client._client.leave_channel = AsyncMock(side_effect=RuntimeError(
+            "Bot is not active chat member chat.exit.not.active.user "
+            "(Bot is not active chat member) [chat.denied]"))
+
+        result = await client.leave_or_delete_chat(-42)
+
+        client._client.delete_chat.assert_awaited_once()
+        assert result["left"] == "убрал из списка (подписки на него не было)"
+
+    async def test_a_refusal_about_rights_is_still_reported(self):
+        client = self._client("CHAT")
+        client._client.leave_group = AsyncMock(
+            side_effect=RuntimeError("not allowed [chat.denied]"))
+
+        result = await client.leave_or_delete_chat(-42)
+
+        client._client.delete_chat.assert_not_awaited()
+        assert "not allowed" in result["_max_error"]["message"]
+
+    async def test_a_dialog_is_never_retried_as_a_removal(self):
+        """Deleting is already what a dialog gets; a refusal there is a
+        real refusal, not a chat we were never in."""
+        client = self._client("DIALOG")
+        client._client.delete_chat = AsyncMock(
+            side_effect=RuntimeError("chat.exit.not.active.user"))
+
+        result = await client.leave_or_delete_chat(-42)
+
+        assert client._client.delete_chat.await_count == 1
+        assert "_max_error" in result
+
     async def test_a_refusal_comes_back_as_an_error_not_an_exception(self):
         client = self._client("CHAT")
         client._client.leave_group = AsyncMock(side_effect=RuntimeError("нельзя"))

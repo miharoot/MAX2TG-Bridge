@@ -796,6 +796,16 @@ def _model_dict(value: Any) -> dict:
     return _plain(vars(value))
 
 
+def _is_not_a_member_error(exc: Exception) -> bool:
+    """Whether MAX refused because the account isn't in the chat at all.
+
+    Its wording for this is ``chat.exit.not.active.user`` (reported under
+    the generic ``chat.denied``) — distinct from a refusal about rights,
+    so the two aren't handled the same way.
+    """
+    return "not.active.user" in str(exc)
+
+
 def _attachment_to_dict(attach: Any) -> dict:
     data = _model_dict(attach)
     atype = data.get("_type") or data.get("type")
@@ -1340,6 +1350,12 @@ class PyMaxClient:
         person's account as well. Nobody asks for that by asking to leave
         a chat, so it is pinned to False here and not exposed.
 
+        A chat MAX says we're not an active member of is dropped from our
+        list instead: seen live on a channel that sat in /list without a
+        subscription behind it, where leaving answers
+        ``chat.exit.not.active.user``. Leaving is meaningless there, and
+        removing the chat is what was actually being asked for.
+
         Returns {"left": <what was done>} or the usual _max_error shape.
         """
         resolver = self.resolver
@@ -1366,8 +1382,21 @@ class PyMaxClient:
                 await self._client.leave_group(int(chat_id))
                 action = "вышел из чата"
         except Exception as exc:
-            log.exception("Leaving MAX chat %s failed", chat_id)
-            return {"_max_error": {"message": str(exc)}}
+            if not _is_not_a_member_error(exc) or chat_type == "DIALOG":
+                log.exception("Leaving MAX chat %s failed", chat_id)
+                return {"_max_error": {"message": str(exc)}}
+            log.info("MAX says we're not a member of chat %s — removing it "
+                     "from the list instead", chat_id)
+            try:
+                await self._client.delete_chat(
+                    chat_id=int(chat_id),
+                    last_event_time=chat.get("lastEventTime"),
+                    for_all=False,
+                )
+            except Exception as delete_exc:
+                log.exception("Removing MAX chat %s from the list failed", chat_id)
+                return {"_max_error": {"message": str(delete_exc)}}
+            action = "убрал из списка (подписки на него не было)"
 
         log.info("MAX chat %s: %s", chat_id, action)
         return {"left": action}
