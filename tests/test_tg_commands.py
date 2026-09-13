@@ -791,3 +791,89 @@ class TestCmdCatchup:
         await _cmd_catchup(update, ctx)
 
         assert "not.found" in _replies(update)[-1]
+
+
+class TestChatCacheStaysTrue:
+    """The chat caches are filled from the login snapshot. Anything the
+    bridge itself changes afterwards has to be written back, or /list
+    keeps showing a chat the account has left — and misses one it has
+    just joined."""
+
+    def _resolver(self):
+        from app.resolver import ContactResolver
+
+        resolver = ContactResolver()
+        resolver._my_id = 100000002
+        resolver.chats_raw = {-10000000000001: {"id": -10000000000001,
+                                                "type": "CHAT",
+                                                "title": "Рабочий чат"}}
+        resolver.chats = {-10000000000001: "Рабочий чат"}
+        resolver.chat_types = {-10000000000001: "CHAT"}
+        return resolver
+
+    def test_a_left_chat_is_dropped_from_every_cache(self):
+        resolver = self._resolver()
+
+        resolver.forget_chat(-10000000000001)
+
+        assert resolver.chats == {}
+        assert resolver.chats_raw == {}
+        assert resolver.chat_types == {}
+
+    def test_forgetting_clears_a_string_id_too(self):
+        """Ids come back from JSON as strings; half an entry left behind
+        would still show up in /list."""
+        resolver = self._resolver()
+        resolver.chats["-10000000000001"] = "Рабочий чат"
+
+        resolver.forget_chat(-10000000000001)
+
+        assert resolver.chats == {}
+
+    def test_forgetting_an_unknown_chat_is_harmless(self):
+        resolver = self._resolver()
+
+        resolver.forget_chat(-42)
+
+        assert len(resolver.chats) == 1
+
+    def test_a_joined_chat_becomes_visible_at_once(self):
+        resolver = self._resolver()
+
+        chat_id = resolver.remember_chat(
+            {"id": -10000000000002, "type": "CHANNEL", "title": "Городской канал"})
+
+        assert chat_id == -10000000000002
+        assert resolver.chat_name(-10000000000002) == "Городской канал"
+        assert resolver.chat_types[-10000000000002] == "CHANNEL"
+
+    def test_a_chat_without_an_id_is_ignored(self):
+        resolver = self._resolver()
+
+        assert resolver.remember_chat({"title": "ничего"}) is None
+
+    async def test_del_max_forgets_the_chat_it_left(self):
+        from app.tg_handler import _on_del_max_callback
+
+        ctx = _make_context(args=[])
+        ctx.bot_data[SUPERGROUP_KEY] = TG_CHAT_ID
+        resolver = self._resolver()
+        max_client = ctx.bot_data[MAX_CLIENT_KEY]
+        max_client.resolver = resolver
+        max_client.leave_or_delete_chat = AsyncMock(
+            return_value={"left": "вышел из группы"})
+
+        update = MagicMock()
+        update.message = None
+        update.callback_query = MagicMock()
+        update.callback_query.data = "delmax:ok:-10000000000001"
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        update.effective_user = MagicMock()
+        update.effective_user.id = 777
+
+        await _on_del_max_callback(update, ctx)
+
+        assert resolver.chats_raw == {}, "/list would still show the left chat"
+        # …and the confirmation still names it, not just the bare id
+        assert "Рабочий чат" in update.callback_query.edit_message_text.await_args.args[0]

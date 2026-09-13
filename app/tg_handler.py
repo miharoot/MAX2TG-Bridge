@@ -1123,15 +1123,12 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Let the resolver pick up the freshly arrived chat metadata, if any.
+    # Let the resolver pick up the freshly arrived chat metadata, if any:
+    # the snapshot these caches came from was taken at login, so without
+    # this a chat just joined is missing from /list until a reconnect.
     resolver = getattr(max_client, "resolver", None)
     if resolver is not None and isinstance(resp.get("chat"), dict):
-        chat_obj = resp["chat"]
-        resolver.chats_raw[chat_id] = chat_obj
-        if chat_obj.get("type"):
-            resolver.chat_types[chat_id] = chat_obj["type"]
-        if chat_obj.get("title"):
-            resolver.chats[chat_id] = chat_obj["title"]
+        resolver.remember_chat(resp["chat"])
 
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     existing = topic_store.get_topic(chat_id)
@@ -1699,10 +1696,18 @@ async def _on_del_max_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text(f"⚠️ MAX: {desc}")
         return
 
+    # Name the chat before forgetting it, or the confirmation would only
+    # have the bare id left to show.
+    label = _max_chat_label(context, max_chat_id)
+    resolver = getattr(max_client, "resolver", None)
+    if resolver is not None:
+        # MAX has confirmed the departure: the cached copy is now wrong,
+        # and left in place the chat keeps appearing in /list as ours.
+        resolver.forget_chat(max_chat_id)
+
     with contextlib.suppress(Exception):
         await query.edit_message_text(
-            f"Готово: {resp.get('left', 'вышел')} "
-            f"{_max_chat_label(context, max_chat_id)}. "
+            f"Готово: {resp.get('left', 'вышел')} {label}. "
             "Топик в Telegram остался — убрать его можно командой "
             "<code>/del</code> внутри него.",
             parse_mode="HTML",

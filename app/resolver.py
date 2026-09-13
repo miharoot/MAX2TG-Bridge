@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -85,6 +86,48 @@ class ContactResolver:
             except (TypeError, ValueError):
                 return False
         return ids == {int(self._my_id)}
+
+    def remember_chat(self, chat: dict) -> Any | None:
+        """Add (or refresh) a chat the bridge just learned about.
+
+        A chat joined through /add exists as far as MAX is concerned the
+        moment it answers, but the snapshot that filled these caches was
+        taken at login — without this the chat is missing from /list and
+        nameless in its own topic until the next reconnect.
+        """
+        if not isinstance(chat, dict):
+            return None
+        chat_id = chat.get("id")
+        if chat_id is None:
+            return None
+        self.chats_raw[chat_id] = chat
+        chat_type = chat.get("type")
+        if chat_type:
+            self.chat_types[chat_id] = chat_type
+        title = chat.get("title")
+        if title:
+            self.chats[chat_id] = title
+        elif chat_id not in self.chats and self.is_saved_messages(chat_id):
+            self.chats[chat_id] = SAVED_MESSAGES_TITLE
+        self._chat_fetch_failed.discard(chat_id)
+        return chat_id
+
+    def forget_chat(self, chat_id: Any) -> None:
+        """Drop a chat the account has left, unsubscribed from or deleted.
+
+        MAX has confirmed the action by the time this is called, so the
+        cached copy is simply wrong: left there, the chat keeps showing
+        up in /list as if it were still ours.
+        """
+        for cache in (self.chats, self.chat_types, self.chats_raw):
+            cache.pop(chat_id, None)
+            # MAX ids arrive as ints, but a stored id can come back from
+            # JSON as a string — clear both spellings rather than leave
+            # half of the entry behind.
+            with contextlib.suppress(TypeError, ValueError):
+                cache.pop(int(chat_id), None)
+            cache.pop(str(chat_id), None)
+        self._chat_fetch_failed.discard(chat_id)
 
     def user_name(self, user_id: Any) -> str:
         return self.users.get(user_id, str(user_id))
