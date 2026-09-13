@@ -207,7 +207,7 @@ class TestCmdList:
 
         await _cmd_list(update, ctx)
 
-        assert "топик #70 · MAX2TG_miha" in "\n".join(_replies(update))
+        assert "MAX2TG_miha\\топик #70" in "\n".join(_replies(update))
 
     async def test_an_unreadable_telegram_group_falls_back_to_its_id(self):
         update = _make_update("/list")
@@ -221,7 +221,7 @@ class TestCmdList:
 
         await _cmd_list(update, ctx)
 
-        assert f"топик #70 · {TG_CHAT_ID}" in "\n".join(_replies(update))
+        assert f"{TG_CHAT_ID}\\топик #70" in "\n".join(_replies(update))
 
     async def test_sections_and_chats_are_visibly_separated(self):
         """Every entry is three or four lines now; without separators the

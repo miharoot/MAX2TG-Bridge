@@ -1374,9 +1374,8 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 tg_id = topic_store.get_chat_id(chat_id)
                 where = tg_titles.get(tg_id) if tg_id is not None else None
-                status = f"🔗 топик #{bound_thread}"
-                if where:
-                    status += f" · {escape(where)}"
+                status = (f"🔗 {escape(where)}\\топик #{bound_thread}" if where
+                          else f"🔗 топик #{bound_thread}")
             # Ids and links go in monospace, each on its own line: they
             # exist to be copied out of the message — into /bind, a
             # browser, a note — which a word merely carrying a href is
