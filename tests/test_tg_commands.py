@@ -909,10 +909,14 @@ class TestListRefreshesFromMax:
         ctx.bot_data[TOPIC_STORE_KEY].get_chat_id = MagicMock(return_value=None)
         return ctx, resolver
 
-    def _snapshot(self, *chat_ids):
+    def _snapshot(self, *chat_ids, listed=None):
+        """``chats`` is what pymax has cached (it never forgets one);
+        ``_listed_ids`` is what the refresh actually walked."""
+        cached = set(chat_ids) | set(listed or ())
         return {"profile": {}, "contacts": [],
                 "chats": [{"id": cid, "type": "CHAT", "title": f"Чат {cid}"}
-                          for cid in chat_ids]}
+                          for cid in sorted(cached)],
+                "_listed_ids": sorted(chat_ids if listed is None else listed)}
 
     async def test_a_complete_listing_drops_what_is_gone(self):
         update = _make_update("/list")
@@ -955,6 +959,20 @@ class TestListRefreshesFromMax:
         await _cmd_list(update, ctx)
 
         assert "Рабочий чат" in "\n".join(_replies(update))
+
+    async def test_a_chat_left_behind_in_pymax_cache_is_dropped(self):
+        """The snapshot is built from pymax's cache, which keeps every chat
+        it has ever seen — a channel stayed in /list on the live bridge
+        because of exactly this, even after a full refresh."""
+        update = _make_update("/list")
+        ctx, resolver = self._ctx(
+            snapshot=self._snapshot(-10000000000001, -10000000000002,
+                                    listed=[-10000000000001]),
+            complete=True)
+
+        await _cmd_list(update, ctx)
+
+        assert -10000000000002 not in resolver.chats_raw
 
     async def test_a_complete_listing_adds_what_is_new(self):
         update = _make_update("/list")

@@ -1713,7 +1713,7 @@ class PyMaxClient:
         finally:
             await session.close()
 
-    async def _fetch_all_chats(self, pymax_client) -> bool:
+    async def _fetch_all_chats(self, pymax_client) -> tuple[bool, set]:
         """Page through the complete MAX chat list before building the snapshot.
 
         PyMax's login/sync only returns a limited window of the most
@@ -1739,9 +1739,14 @@ class PyMaxClient:
         """
         fetch_chats = getattr(pymax_client, "fetch_chats", None)
         if fetch_chats is None:
-            return False
+            return False, set()
 
         total_seen = {chat.id for chat in (getattr(pymax_client, "chats", None) or [])}
+        # What *this* walk actually saw, as opposed to what pymax has
+        # accumulated in its own cache since login: only the former says
+        # what the account still has, since pymax's cache never forgets a
+        # chat and _build_snapshot reads from it.
+        listed: set = set()
         marker = None
         # Whether the listing can be trusted as the whole picture: a page
         # that failed, or the page cap cutting the walk short, means chats
@@ -1759,6 +1764,7 @@ class PyMaxClient:
                 break
 
             total_seen.update(chat.id for chat in page)
+            listed.update(chat.id for chat in page)
             event_times = [getattr(chat, "last_event_time", 0) for chat in page]
             event_times = [t for t in event_times if t]
             oldest = min(event_times) if event_times else None
@@ -1772,9 +1778,9 @@ class PyMaxClient:
                 break
             marker = next_marker
 
-        log.info("PyMax full chat list loaded: %d chats total (complete=%s)",
-                 len(total_seen), complete)
-        return complete
+        log.info("PyMax full chat list loaded: %d chats total, %d listed now "
+                 "(complete=%s)", len(total_seen), len(listed), complete)
+        return complete, listed
 
     def _extract_my_id(self, pymax_client) -> Any:
         me = getattr(pymax_client, "me", None)
@@ -1791,11 +1797,16 @@ class PyMaxClient:
         anything. ``(None, False)`` means MAX didn't answer at all.
         """
         try:
-            complete = await asyncio.wait_for(
+            complete, listed = await asyncio.wait_for(
                 self._fetch_all_chats(self._client), CHAT_REFRESH_TIMEOUT,
             )
             snapshot = self._build_snapshot(self._client)
             await self._add_configured_chats(snapshot)
+            # _build_snapshot reads pymax's cumulative cache, which keeps
+            # every chat it has ever seen — including ones the account no
+            # longer has. Carry what this walk actually listed so the
+            # caller can tell the two apart.
+            snapshot["_listed_ids"] = sorted(listed)
         except asyncio.TimeoutError:
             log.warning("Chat list refresh timed out after %ss", CHAT_REFRESH_TIMEOUT)
             return None, False

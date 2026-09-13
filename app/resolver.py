@@ -143,6 +143,13 @@ class ContactResolver:
             chat.get("id") for chat in (snapshot.get("chats") or [])
             if isinstance(chat, dict)
         }
+        # The snapshot is built from pymax's own cache, which never forgets
+        # a chat; ``_listed_ids`` is what the listing just walked. When it's
+        # there, that is the account's current set — anything else in the
+        # snapshot is a leftover in the cache.
+        listed = snapshot.get("_listed_ids")
+        if listed:
+            present &= set(listed)
         removed = [chat_id for chat_id in before if chat_id not in present]
         for chat_id in removed:
             self.forget_chat(chat_id)
