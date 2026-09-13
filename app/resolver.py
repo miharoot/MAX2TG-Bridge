@@ -44,21 +44,32 @@ class ContactResolver:
         # that DM chat IDs are positive and group/channel chat IDs are
         # negative. Falling back on this avoids briefly misfiling a brand-new
         # DM as a group (which would use the wrong topic-title heuristic).
+        # Zero is the one dialog that isn't positive — saved messages, whose
+        # id is your own id XOR itself.
         try:
-            return int(chat_id) > 0
+            return int(chat_id) >= 0
         except (TypeError, ValueError):
             return False
 
     def is_saved_messages(self, chat_id: Any) -> bool:
         """Whether this is MAX's own saved-messages chat ("Избранное").
 
-        It is a dialog with exactly one participant — you. Groups and
-        channels don't qualify even when the snapshot lists only us in
-        ``participants``: MAX ships a partial participant map for large
-        chats, so the one-participant test alone renames real groups
-        (seen live on a 150-member channel).
+        Its id is 0, and nothing else's can be: a dialog's id is the XOR
+        of the two user ids (``Client.get_chat_id``), and the dialog with
+        yourself XORs your id with itself. That alone identifies it.
+
+        Failing that, it is a dialog with exactly one participant — you.
+        Groups and channels don't qualify even when the snapshot lists
+        only us in ``participants``: MAX ships a partial participant map
+        for large chats, so the one-participant test alone renames real
+        groups (seen live on a 150-member channel).
         """
         if self._my_id is None:
+            return False
+        try:
+            if int(chat_id) == 0:
+                return True
+        except (TypeError, ValueError):
             return False
         chat = self.chats_raw.get(chat_id) or {}
         chat_type = chat.get("type") or self.chat_types.get(chat_id)

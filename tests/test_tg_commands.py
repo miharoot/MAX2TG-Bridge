@@ -380,22 +380,23 @@ class TestSavedMessages:
     Having no peer to name it after, it used to show up blank everywhere
     and its topic got no card at all."""
 
-    def _resolver(self, my_id=100, participants=None):
+    def _resolver(self, my_id=100, participants=None, chat_id=0):
         from app.resolver import ContactResolver
 
         resolver = ContactResolver()
         resolver._my_id = my_id
-        resolver.chats_raw = {0: {"id": 0, "type": "DIALOG",
-                                  "participants": participants
-                                  if participants is not None else {"100": 1}}}
+        resolver.chats_raw = {chat_id: {"id": chat_id, "type": "DIALOG",
+                                        "participants": participants
+                                        if participants is not None else {"100": 1}}}
         return resolver
 
     def test_a_chat_with_only_me_in_it_is_saved_messages(self):
         assert self._resolver().is_saved_messages(0) is True
 
     def test_a_dialog_with_someone_else_is_not(self):
-        resolver = self._resolver(participants={"100": 1, "42": 1})
-        assert resolver.is_saved_messages(0) is False
+        # id 78 = 100 ^ 42, how MAX derives a dialog's id from its pair.
+        resolver = self._resolver(chat_id=78, participants={"100": 1, "42": 1})
+        assert resolver.is_saved_messages(78) is False
 
     def test_a_group_that_lists_only_me_is_not(self):
         """MAX ships a partial participant map for large chats, so a real
@@ -416,6 +417,14 @@ class TestSavedMessages:
             "participants": {"100": 1},
         }
         assert resolver.is_saved_messages(-69369957050939) is False
+
+    def test_zero_is_saved_messages_even_without_a_snapshot(self):
+        """A dialog's id is the XOR of the two user ids, so the dialog
+        with yourself — and only it — comes out zero."""
+        resolver = self._resolver()
+        resolver.chats_raw = {}
+        assert resolver.is_saved_messages(0) is True
+        assert resolver.is_dm(0) is True
 
     def test_a_chat_we_know_nothing_about_is_not(self):
         assert self._resolver().is_saved_messages(-42) is False
