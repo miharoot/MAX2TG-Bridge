@@ -486,6 +486,52 @@ async def _topic_title_for_message(msg: MaxMessage, resolver: ContactResolver,
     return str(msg.chat_id), False
 
 
+
+async def _control_event_line(msg, resolver) -> str | None:
+    """Render MAX's service events — someone added, removed, left, the
+    chat renamed — instead of calling them "нетекстовое сообщение".
+
+    They arrive as a CONTROL attachment: ``{"_type": "CONTROL", "event":
+    "add", "userIds": [...], "title": ...}``. The event names come from
+    live traffic, so an unfamiliar one is shown as itself rather than
+    swallowed — that's how the next one gets recognised.
+    """
+    control = next(
+        (a for a in (msg.attaches or [])
+         if isinstance(a, dict) and a.get("_type") == "CONTROL"),
+        None,
+    )
+    if control is None:
+        return None
+
+    event = str(control.get("event") or "").lower()
+    title = control.get("title")
+
+    names = []
+    for user_id in (control.get("userIds") or control.get("userids") or []):
+        try:
+            names.append(await resolver.resolve_user(user_id))
+        except Exception:                              # noqa: BLE001
+            names.append(str(user_id))
+    who = ", ".join(escape(str(name)) for name in names)
+
+    if event == "add":
+        return f"➕ добавил(а) в чат: {who}" if who else "➕ добавил(а) участника"
+    if event in ("remove", "kick"):
+        return f"➖ убрал(а) из чата: {who}" if who else "➖ убрал(а) участника"
+    if event == "leave":
+        return "🚪 вышел(а) из чата"
+    if event == "new":
+        return (f"🆕 создал(а) чат «{escape(str(title))}»" if title
+                else "🆕 создал(а) чат")
+    if event in ("title", "rename"):
+        return (f"✏️ переименовал(а) чат: «{escape(str(title))}»" if title
+                else "✏️ переименовал(а) чат")
+    if event == "pin":
+        return "📌 закрепил(а) сообщение"
+    return f"ℹ️ служебное событие MAX: {escape(event or '?')}"
+
+
 def create_pymax_client(settings: Settings, sender: TelegramSender) -> PyMaxClient:
     client = PyMaxClient(settings)
     return configure_pymax_client(client, sender)
@@ -872,7 +918,12 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             if msg.text and not text_sent:
                 last_message = await sender.send(f"{header_text}\n{escape(msg.text)}", message_thread_id=thread_id, chat_id=target_chat_id)
         else:
-            body = escape(msg.text) if msg.text else "<i>[нетекстовое сообщение]</i>"
+            if msg.text:
+                body = escape(msg.text)
+            else:
+                control = await _control_event_line(msg, resolver)
+                body = (f"<i>{control}</i>" if control
+                        else "<i>[нетекстовое сообщение]</i>")
             last_message = await sender.send(f"{header_text}\n{body}", message_thread_id=thread_id, chat_id=target_chat_id)
             log.info("Forwarded text → TG")
 
