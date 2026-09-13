@@ -179,6 +179,8 @@ class TestCmdList:
         resolver.is_saved_messages = MagicMock(return_value=False)
         resolver.chat_name = MagicMock(side_effect=lambda cid: str(cid))
         ctx.bot_data[MAX_CLIENT_KEY].resolver = resolver
+        # No refresh in these: a bare MagicMock would be awaited as one.
+        ctx.bot_data[MAX_CLIENT_KEY].refresh_chats = None
 
         topics = topics or {}
         tg_chats = tg_chats or {}
@@ -877,3 +879,90 @@ class TestChatCacheStaysTrue:
         assert resolver.chats_raw == {}, "/list would still show the left chat"
         # …and the confirmation still names it, not just the bare id
         assert "Рабочий чат" in update.callback_query.edit_message_text.await_args.args[0]
+
+
+class TestListRefreshesFromMax:
+    """/list asks MAX for the current list first — the caches otherwise
+    date from login, so a chat left from the phone since then would still
+    be listed as ours."""
+
+    def _ctx(self, *, snapshot, complete):
+        from app.resolver import ContactResolver
+
+        ctx = _make_context(args=[])
+        ctx.bot_data[SUPERGROUP_KEY] = TG_CHAT_ID
+
+        resolver = ContactResolver()
+        resolver._my_id = 100000002
+        resolver.chats_raw = {-10000000000001: {"id": -10000000000001, "type": "CHAT",
+                                                "title": "Рабочий чат"},
+                              -10000000000002: {"id": -10000000000002, "type": "CHAT",
+                                                "title": "Соседский чат"}}
+        resolver.chats = {-10000000000001: "Рабочий чат",
+                          -10000000000002: "Соседский чат"}
+        resolver.chat_types = {-10000000000001: "CHAT", -10000000000002: "CHAT"}
+
+        max_client = ctx.bot_data[MAX_CLIENT_KEY]
+        max_client.resolver = resolver
+        max_client.refresh_chats = AsyncMock(return_value=(snapshot, complete))
+        ctx.bot_data[TOPIC_STORE_KEY].get_topic = MagicMock(return_value=None)
+        ctx.bot_data[TOPIC_STORE_KEY].get_chat_id = MagicMock(return_value=None)
+        return ctx, resolver
+
+    def _snapshot(self, *chat_ids):
+        return {"profile": {}, "contacts": [],
+                "chats": [{"id": cid, "type": "CHAT", "title": f"Чат {cid}"}
+                          for cid in chat_ids]}
+
+    async def test_a_complete_listing_drops_what_is_gone(self):
+        update = _make_update("/list")
+        ctx, resolver = self._ctx(snapshot=self._snapshot(-10000000000001),
+                                  complete=True)
+
+        await _cmd_list(update, ctx)
+
+        assert -10000000000002 not in resolver.chats_raw
+        assert "-10000000000002" not in "\n".join(_replies(update))
+
+    async def test_a_partial_listing_drops_nothing(self):
+        """A chat missing from half an answer is a gap in the answer, not
+        a chat we've left."""
+        update = _make_update("/list")
+        ctx, resolver = self._ctx(snapshot=self._snapshot(-10000000000001),
+                                  complete=False)
+
+        await _cmd_list(update, ctx)
+
+        assert -10000000000002 in resolver.chats_raw
+        assert "MAX не отдал список целиком" in "\n".join(_replies(update))
+
+    async def test_no_answer_at_all_shows_the_cached_list_with_a_warning(self):
+        update = _make_update("/list")
+        ctx, resolver = self._ctx(snapshot=None, complete=False)
+
+        await _cmd_list(update, ctx)
+
+        body = "\n".join(_replies(update))
+        assert "Рабочий чат" in body and "Соседский чат" in body
+        assert "MAX не отдал список целиком" in body
+
+    async def test_a_refresh_that_raises_does_not_take_the_command_down(self):
+        update = _make_update("/list")
+        ctx, _ = self._ctx(snapshot=None, complete=False)
+        ctx.bot_data[MAX_CLIENT_KEY].refresh_chats = AsyncMock(
+            side_effect=RuntimeError("сеть"))
+
+        await _cmd_list(update, ctx)
+
+        assert "Рабочий чат" in "\n".join(_replies(update))
+
+    async def test_a_complete_listing_adds_what_is_new(self):
+        update = _make_update("/list")
+        ctx, resolver = self._ctx(
+            snapshot=self._snapshot(-10000000000001, -10000000000002,
+                                    -10000000000003),
+            complete=True)
+
+        await _cmd_list(update, ctx)
+
+        assert -10000000000003 in resolver.chats_raw

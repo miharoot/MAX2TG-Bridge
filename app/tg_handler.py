@@ -1290,7 +1290,34 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     resolver = getattr(max_client, "resolver", None)
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
 
-    if not resolver or not resolver.chats_raw:
+    if not resolver:
+        await message.reply_text("Список чатов MAX пока пуст (нет данных снапшота).")
+        return
+
+    # Ask MAX for the current list first: the caches otherwise date from
+    # login, so a chat left from the phone since then would still be
+    # listed here as ours.
+    stale = False
+    refresh = getattr(max_client, "refresh_chats", None)
+    if refresh is not None:
+        try:
+            snapshot, complete = await refresh()
+        except Exception:                              # noqa: BLE001
+            log.exception("/list: chat refresh failed")
+            snapshot, complete = None, False
+        if snapshot and snapshot.get("chats"):
+            if complete:
+                resolver.sync_snapshot(snapshot)
+            else:
+                # Partial answer: take what it adds, but treat nothing as
+                # gone — a chat missing from half a listing is a gap in
+                # the listing, not a chat we've left.
+                resolver.load_snapshot(snapshot)
+                stale = True
+        else:
+            stale = True
+
+    if not resolver.chats_raw:
         await message.reply_text("Список чатов MAX пока пуст (нет данных снапшота).")
         return
 
@@ -1375,6 +1402,11 @@ async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Скопируй <code>chat_id</code> в <code>/bind</code>, чтобы привязать к топику. "
         "Вторая ссылка (если есть) — приглашение в чат от самого MAX.",
     ]
+    if stale:
+        lines.append(
+            "⚠️ MAX не отдал список целиком — показываю, что знаю; "
+            "чат, покинутый недавно, мог остаться в списке."
+        )
 
     def _add_section(title: str, chats: list) -> None:
         if not chats:

@@ -129,6 +129,28 @@ class ContactResolver:
             cache.pop(str(chat_id), None)
         self._chat_fetch_failed.discard(chat_id)
 
+    def sync_snapshot(self, snapshot: dict) -> list:
+        """Adopt a fresh chat listing, dropping chats it no longer has.
+
+        Only for a listing known to be complete (see
+        ``PyMaxClient.refresh_chats``): a chat missing from a partial
+        answer is a gap in the answer, not a chat the account has left,
+        and dropping it would hide a live chat from /list.
+        """
+        before = set(self.chats_raw)
+        self.load_snapshot(snapshot)
+        present = {
+            chat.get("id") for chat in (snapshot.get("chats") or [])
+            if isinstance(chat, dict)
+        }
+        removed = [chat_id for chat_id in before if chat_id not in present]
+        for chat_id in removed:
+            self.forget_chat(chat_id)
+        if removed:
+            log.info("Chat list refresh: %d chat(s) no longer ours: %s",
+                     len(removed), removed)
+        return removed
+
     def user_name(self, user_id: Any) -> str:
         return self.users.get(user_id, str(user_id))
 

@@ -24,6 +24,9 @@ log = logging.getLogger(__name__)
 # How long to wait for MAX to answer a contact lookup before giving up
 # (see PyMaxClient.fetch_contacts): it can stay silent indefinitely.
 USER_LOOKUP_TIMEOUT = 15
+# A /list refresh walks the whole chat list; past this it isn't worth
+# making the user wait, and the cached list is shown instead.
+CHAT_REFRESH_TIMEOUT = 25
 
 _PATCHED_API_ERROR = False
 
@@ -1681,7 +1684,7 @@ class PyMaxClient:
         finally:
             await session.close()
 
-    async def _fetch_all_chats(self, pymax_client) -> None:
+    async def _fetch_all_chats(self, pymax_client) -> bool:
         """Page through the complete MAX chat list before building the snapshot.
 
         PyMax's login/sync only returns a limited window of the most
@@ -1707,10 +1710,15 @@ class PyMaxClient:
         """
         fetch_chats = getattr(pymax_client, "fetch_chats", None)
         if fetch_chats is None:
-            return
+            return False
 
         total_seen = {chat.id for chat in (getattr(pymax_client, "chats", None) or [])}
         marker = None
+        # Whether the listing can be trusted as the whole picture: a page
+        # that failed, or the page cap cutting the walk short, means chats
+        # may be missing from it, and a caller must not read that absence
+        # as "the account has left them".
+        complete = False
         for _ in range(self.MAX_CHAT_LIST_PAGES):
             try:
                 page = await fetch_chats(marker=marker)
@@ -1718,6 +1726,7 @@ class PyMaxClient:
                 log.exception("PyMax fetch_chats page failed (marker=%s)", marker)
                 break
             if not page:
+                complete = True
                 break
 
             total_seen.update(chat.id for chat in page)
@@ -1725,19 +1734,46 @@ class PyMaxClient:
             event_times = [t for t in event_times if t]
             oldest = min(event_times) if event_times else None
             if not oldest or oldest <= 0:
+                complete = True
                 break
 
             next_marker = oldest - 1
             if marker is not None and next_marker >= marker:
-                break  # marker isn't moving further back — avoid looping forever
+                complete = True   # marker isn't moving back: the end of the list
+                break
             marker = next_marker
 
-        log.info("PyMax full chat list loaded: %d chats total", len(total_seen))
+        log.info("PyMax full chat list loaded: %d chats total (complete=%s)",
+                 len(total_seen), complete)
+        return complete
 
     def _extract_my_id(self, pymax_client) -> Any:
         me = getattr(pymax_client, "me", None)
         contact = getattr(me, "contact", None)
         return getattr(contact, "id", None)
+
+    async def refresh_chats(self) -> tuple[dict | None, bool]:
+        """Ask MAX for the current chat list.
+
+        Returns ``(snapshot, complete)``. ``complete`` is True only when
+        the whole list was paged through without a failure — a caller may
+        then treat a chat's absence as "no longer ours". Otherwise the
+        answer is partial and may only be merged, never used to drop
+        anything. ``(None, False)`` means MAX didn't answer at all.
+        """
+        try:
+            complete = await asyncio.wait_for(
+                self._fetch_all_chats(self._client), CHAT_REFRESH_TIMEOUT,
+            )
+            snapshot = self._build_snapshot(self._client)
+            await self._add_configured_chats(snapshot)
+        except asyncio.TimeoutError:
+            log.warning("Chat list refresh timed out after %ss", CHAT_REFRESH_TIMEOUT)
+            return None, False
+        except Exception:
+            log.exception("Chat list refresh failed")
+            return None, False
+        return snapshot, complete
 
     def _build_snapshot(self, pymax_client) -> dict:
         me = getattr(pymax_client, "me", None)
