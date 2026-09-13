@@ -1560,8 +1560,10 @@ class PyMaxClient:
             # from the MAX app, then /bind that id (or repeat /add).
             # Plain text on purpose: /add reports MAX errors without
             # parse_mode, so markup would show up as markup.
+            title = chat.get("title")
+            found = f"«{title}», id: {chat['id']}" if title else f"id: {chat['id']}"
             return {"_max_error": {"message": (
-                f"{join_error}\n\nЧат найден, его id: {chat['id']} — вступите "
+                f"{join_error}\n\nЧат найден — {found}. Вступите "
                 f"в него в MAX, затем повторите /add или используйте /bind "
                 f"с этим id."
             )}}

@@ -5,6 +5,7 @@ import logging
 import re
 import socket
 from html import escape
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import MessageEntityType
@@ -961,6 +962,27 @@ def _chat_is_known(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
     return chat_id in (resolver.chats_raw or {})
 
 
+def _max_chat_label(context: ContextTypes.DEFAULT_TYPE, chat_id: Any) -> str:
+    """``Имя (<id>)`` for a MAX chat, or the bare id when it has no name.
+
+    A raw id tells you nothing about which chat a command is about to act
+    on, so every message that names one puts the name beside it. HTML:
+    the name is escaped, the id monospace to stay copyable.
+    """
+    max_client = context.bot_data.get(MAX_CLIENT_KEY)
+    resolver = getattr(max_client, "resolver", None)
+    name = resolver.chat_name(chat_id) if resolver is not None else None
+    if not name or str(name) == str(chat_id) or str(name).startswith("DM:"):
+        # The topic's stored title is the resolved one we last showed the
+        # user — better than a "DM:<id>" placeholder or nothing at all.
+        store = context.bot_data.get(TOPIC_STORE_KEY)
+        stored = store.get_title(chat_id) if store is not None else None
+        name = stored if stored and str(stored) != str(chat_id) else None
+    if not name:
+        return f"<code>{chat_id}</code>"
+    return f"<b>{escape(str(name))}</b> (<code>{chat_id}</code>)"
+
+
 async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Join a MAX chat by link if we aren't in it, then bind it to a topic.
 
@@ -1469,7 +1491,7 @@ async def _cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     which = "этот топик" if not args else f"топик <code>{thread_id}</code>"
     await message.reply_text(
         f"Удалить {which} вместе со всеми сообщениями и снять связь "
-        f"с MAX-чатом <code>{max_chat_id}</code>?\n\n"
+        f"с MAX-чатом {_max_chat_label(context, max_chat_id)}?\n\n"
         "Восстановить нельзя. Новый топик создастся, если собеседник снова "
         "тебе напишет.",
         parse_mode="HTML",
@@ -1597,7 +1619,6 @@ async def _cmd_del_max(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    name = resolver.chat_name(max_chat_id) if resolver is not None else str(max_chat_id)
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🚪 Выйти в MAX",
@@ -1606,8 +1627,7 @@ async def _cmd_del_max(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ]
     ])
     await message.reply_text(
-        f"Выйти в <b>MAX</b> из чата <b>{escape(str(name))}</b> "
-        f"(<code>{max_chat_id}</code>)?\n\n"
+        f"Выйти в <b>MAX</b> из чата {_max_chat_label(context, max_chat_id)}?\n\n"
         "Группу я покину, от канала отпишусь, диалог удалю — только у себя, "
         "у собеседника переписка останется. В MAX это необратимо.\n\n"
         "Топик в Telegram останется на месте: чтобы убрать и его, вызови "
@@ -1661,7 +1681,8 @@ async def _on_del_max_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     with contextlib.suppress(Exception):
         await query.edit_message_text(
-            f"Готово: {resp.get('left', 'вышел')} <code>{max_chat_id}</code>. "
+            f"Готово: {resp.get('left', 'вышел')} "
+            f"{_max_chat_label(context, max_chat_id)}. "
             "Топик в Telegram остался — убрать его можно командой "
             "<code>/del</code> внутри него.",
             parse_mode="HTML",

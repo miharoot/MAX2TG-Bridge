@@ -505,6 +505,31 @@ class TestDelMax:
         ctx.bot_data[MAX_CLIENT_KEY].leave_or_delete_chat.assert_not_awaited()
         assert "Выйти" in _replies(update)[0]
 
+    async def test_the_question_names_the_chat_beside_its_id(self):
+        from app.tg_handler import _cmd_del_max
+
+        update = _make_update("/del_max -42")
+        ctx = self._ctx()
+        ctx.args = ["-42"]
+
+        await _cmd_del_max(update, ctx)
+
+        assert "<b>Рабочий чат</b> (<code>-42</code>)" in _replies(update)[0]
+
+    async def test_a_chat_without_a_name_still_shows_its_id(self):
+        from app.tg_handler import _cmd_del_max
+
+        update = _make_update("/del_max -42")
+        ctx = self._ctx()
+        ctx.args = ["-42"]
+        ctx.bot_data[MAX_CLIENT_KEY].resolver.chat_name = MagicMock(
+            return_value="-42")                     # nothing better known
+        ctx.bot_data[TOPIC_STORE_KEY].get_title = MagicMock(return_value=None)
+
+        await _cmd_del_max(update, ctx)
+
+        assert "<code>-42</code>" in _replies(update)[0]
+
     async def test_outside_the_main_group_it_refuses(self):
         from app.tg_handler import _cmd_del_max
 
@@ -624,6 +649,22 @@ class TestDelByTopicId:
         await _cmd_del(update, ctx)
 
         assert "-69369957050939" in _replies(update)[0]
+
+    async def test_the_question_names_the_max_chat_beside_its_id(self):
+        """Deleting is irreversible; the id alone doesn't say what you're
+        about to unlink."""
+        from app.tg_handler import _cmd_del
+
+        update = _make_update("/del 144")
+        ctx = self._ctx(topics={(TG_CHAT_ID, 144): -69369957050939})
+        ctx.args = ["144"]
+        resolver = MagicMock()
+        resolver.chat_name = MagicMock(return_value='МАДОУ детский сад')
+        ctx.bot_data[MAX_CLIENT_KEY].resolver = resolver
+
+        await _cmd_del(update, ctx)
+
+        assert "<b>МАДОУ детский сад</b> (<code>-69369957050939</code>)" in _replies(update)[0]
 
     async def test_an_id_of_no_topic_here_is_reported(self):
         from app.tg_handler import _cmd_del

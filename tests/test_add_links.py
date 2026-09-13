@@ -161,6 +161,21 @@ class TestJoinRefusedByMax:
         assert "-68192506787240" in message
         assert "<" not in message   # /add reports errors without parse_mode
 
+    async def test_the_error_names_the_chat_by_title_too(self):
+        """An id alone doesn't say which chat it is — MAX sends the title
+        in the same answer, so it goes next to the id."""
+        client = self._client_that_cannot_join(
+            link_info_chat={"id": -78048322421481, "type": "CHAT",
+                            "title": "Родители 2 младшая группа",
+                            "participants": {"999": 0}},
+        )
+
+        result = await client.open_by_link("https://max.ru/join/sometoken")
+
+        message = result["_max_error"]["message"]
+        assert "Родители 2 младшая группа" in message
+        assert "-78048322421481" in message
+
     async def test_a_chat_we_are_not_in_is_never_bound_without_joining(self):
         """/add joins; resolving is not joining. A topic bound to a chat
         we never entered could never receive a message."""
