@@ -1223,6 +1223,10 @@ HELP_TEXT = (
     "из MAX (имя, id, аватар).\n"
     "• <code>/intro</code> — перепостить и закрепить карточку профиля "
     "в текущем топике (полезно после смены аватара).\n"
+    "• <code>/catchup</code> — внутри топика: перетащить из MAX последние "
+    "сообщения этого чата (сколько — <code>MAX_BACKFILL_LIMIT</code>). "
+    "Работает, только если включена <code>MAX_BACKFILL</code>; уже "
+    "пересланное придёт повторно.\n"
     "• <code>/del</code> — удалить текущий топик и связь с MAX-чатом "
     "(спросит подтверждение). В самом MAX ничего не меняется. Можно и не "
     "заходя в топик: <code>/del 144</code> — по номеру топика или по id "
@@ -1731,6 +1735,58 @@ async def _cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def _cmd_catchup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-fetch this chat's recent MAX messages into the current topic.
+
+    The same pull /bind and /add do for a new topic, on demand: useful
+    for a topic bound before the option existed, or after a spell when
+    the bridge wasn't running. Needs MAX_BACKFILL on, and takes its size
+    from MAX_BACKFILL_LIMIT. Messages already forwarded come through
+    again — MAX's history is all the bridge asks for here.
+    """
+    target = _resolve_topic_target(update, context)
+    message = update.message
+    if message is None:
+        return
+    _log_command(update, "catchup")
+    if not target:
+        await message.reply_text(
+            "Команда работает только внутри топика, связанного с чатом MAX."
+        )
+        return
+    _, max_chat_id, max_client = target
+    if not max_client:
+        await message.reply_text("⚠️ Max клиент не подключён.")
+        return
+
+    limit = getattr(max_client, "backfill_limit", 0) or 0
+    backfill = getattr(max_client, "backfill_chat", None)
+    if limit <= 0 or backfill is None:
+        await message.reply_text(
+            "Догрузка выключена. Включи <code>MAX_BACKFILL=true</code> в "
+            "<code>.env</code> (сколько тянуть — <code>MAX_BACKFILL_LIMIT</code>) "
+            "и перезапусти мост.",
+            parse_mode="HTML",
+        )
+        return
+
+    await message.reply_text(
+        f"Тяну последние <b>{limit}</b> сообщений из "
+        f"{_max_chat_label(context, max_chat_id)}…",
+        parse_mode="HTML",
+    )
+    try:
+        count = await backfill(max_chat_id, limit)
+    except Exception as exc:                           # noqa: BLE001
+        log.exception("/catchup failed for MAX chat %s", max_chat_id)
+        await message.reply_text(f"⚠️ MAX не отдал историю: {exc}")
+        return
+    await message.reply_text(
+        f"Готово: {count} сообщений." if count else
+        "MAX не вернул ни одного сообщения для этого чата."
+    )
+
+
 async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show profile of the Max peer linked to the current topic."""
     target = _resolve_topic_target(update, context)
@@ -1916,6 +1972,7 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("list", _cmd_list, filters=chat_filter))
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
     app.add_handler(CommandHandler("intro", _cmd_intro, filters=chat_filter))
+    app.add_handler(CommandHandler("catchup", _cmd_catchup, filters=chat_filter))
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))
     app.add_handler(CommandHandler("del_max", _cmd_del_max, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))

@@ -137,7 +137,7 @@ class TestEveryCommandAnswersSomething:
     neither raises nor stays mute."""
 
     @pytest.mark.parametrize("name", [
-        "bind", "add", "list", "help", "del", "intro", "profile",
+        "bind", "add", "list", "help", "del", "intro", "profile", "catchup",
     ])
     async def test_command_replies_without_raising(self, name, monkeypatch):
         import app.tg_handler as th
@@ -703,3 +703,91 @@ class TestDelByTopicId:
         await _cmd_del(update, ctx)
 
         assert "/del 144" in _replies(update)[0]
+
+
+class TestCmdCatchup:
+    """/catchup pulls this chat's recent MAX messages into the topic it is
+    called in — the same pull /bind and /add do for a new topic."""
+
+    def _ctx(self, *, limit=20, bound=True, result=3):
+        ctx = _make_context(args=[])
+        store = ctx.bot_data[TOPIC_STORE_KEY]
+        store.chat_for_topic = MagicMock(
+            return_value=-10000000000001 if bound else None)
+
+        max_client = ctx.bot_data[MAX_CLIENT_KEY]
+        max_client.backfill_limit = limit
+        max_client.resolver = MagicMock()
+        max_client.resolver.chat_name = MagicMock(return_value="Рабочий чат")
+        max_client.backfill_chat = AsyncMock(return_value=result)
+        return ctx
+
+    def _update(self):
+        update = _make_update("/catchup")
+        update.message.message_thread_id = 144
+        update.message.is_topic_message = True
+        return update
+
+    async def test_it_asks_for_the_configured_number_of_messages(self):
+        from app.tg_handler import _cmd_catchup
+
+        update, ctx = self._update(), self._ctx(limit=20)
+
+        await _cmd_catchup(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].backfill_chat.assert_awaited_once_with(
+            -10000000000001, 20)
+        assert "Готово: 3" in _replies(update)[-1]
+
+    async def test_it_refuses_while_backfill_is_off(self):
+        """The option is what says how many messages the user wants; with
+        it off there is no number to use."""
+        from app.tg_handler import _cmd_catchup
+
+        update, ctx = self._update(), self._ctx(limit=0)
+
+        await _cmd_catchup(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].backfill_chat.assert_not_awaited()
+        assert "MAX_BACKFILL" in _replies(update)[0]
+
+    async def test_outside_a_topic_it_says_so(self):
+        from app.tg_handler import _cmd_catchup
+
+        update = _make_update("/catchup")
+        update.message.message_thread_id = None
+        ctx = self._ctx()
+
+        await _cmd_catchup(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].backfill_chat.assert_not_awaited()
+        assert "внутри топика" in _replies(update)[0]
+
+    async def test_a_topic_bound_to_nothing_is_refused(self):
+        from app.tg_handler import _cmd_catchup
+
+        update, ctx = self._update(), self._ctx(bound=False)
+
+        await _cmd_catchup(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].backfill_chat.assert_not_awaited()
+
+    async def test_an_empty_history_is_reported_not_silent(self):
+        from app.tg_handler import _cmd_catchup
+
+        update, ctx = self._update(), self._ctx(result=0)
+
+        await _cmd_catchup(update, ctx)
+
+        assert "ни одного сообщения" in _replies(update)[-1]
+
+    async def test_a_refusal_from_max_is_reported(self):
+        from app.tg_handler import _cmd_catchup
+
+        update, ctx = self._update(), self._ctx()
+        ctx.bot_data[MAX_CLIENT_KEY].backfill_chat = AsyncMock(
+            side_effect=RuntimeError("not.found"))
+
+        await _cmd_catchup(update, ctx)
+
+        assert "not.found" in _replies(update)[-1]
