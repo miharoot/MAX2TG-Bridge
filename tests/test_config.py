@@ -249,9 +249,9 @@ def test_chat_routes_empty_dict_when_empty_string():
 
 def test_chat_routes_parses_valid_json_mapping():
     settings = load({**BASE, "MAX_CHAT_ROUTES":
-                      '{"-75107924425434": -1002233445566, "123456": -1009988776655}'})
+                      '{"-10000000000005": -1002233445566, "123456": -1009988776655}'})
     assert settings.chat_routes == {
-        "-75107924425434": -1002233445566,
+        "-10000000000005": -1002233445566,
         "123456": -1009988776655,
     }
 

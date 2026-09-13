@@ -861,7 +861,7 @@ async def _cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     max_chat_id = _parse_max_chat_id(args[0])
     if max_chat_id is None:
         await message.reply_text(
-            "Не понял chat_id. Пример: <code>/bind -75107924425434</code>",
+            "Не понял chat_id. Пример: <code>/bind -10000000000005</code>",
             parse_mode="HTML",
         )
         return
@@ -1195,8 +1195,8 @@ HELP_TEXT = (
     "   – <code>https://max.ru/u/...</code> — личная ссылка человека: "
     "её читает сам MAX, при успехе привяжет диалог с ним;\n"
     "   – <code>+79991234567</code> — найти человека по номеру телефона;\n"
-    "   – <code>6633015816</code> — id пользователя: диалог с ним;\n"
-    "   – <code>-69369957050939</code> — id группы или канала: привяжет "
+    "   – <code>1234567890</code> — id пользователя: диалог с ним;\n"
+    "   – <code>-10000000000001</code> — id группы или канала: привяжет "
     "сразу, как <code>/bind</code> (вступить по id в MAX нельзя).\n"
     "• <code>/list</code> — только в основной группе (<code>TG_CHAT_ID</code>): "
     "список всех чатов MAX (группы, каналы, личные сообщения и "

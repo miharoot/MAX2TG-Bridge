@@ -99,19 +99,19 @@ class TestReadEventForwarding:
         A strict comparison fails open here: the ✅ would go up for your
         own read marker, reading in Telegram as if the other side had
         read the message when nobody has."""
-        client, sender = _make_client(my_id=427441720)
+        client, sender = _make_client(my_id=100000002)
         sender.set_reaction = AsyncMock()
         await _forward_simple_text(client, sender, chat_id=-100, tg_chat_id="-100999", tg_message_id=42)
 
         await client._on_read_cb(
-            MaxReadEvent(chat_id=-100, user_id="427441720", mark=123)
+            MaxReadEvent(chat_id=-100, user_id="100000002", mark=123)
         )
 
         sender.set_reaction.assert_not_called()
 
     async def test_still_reacts_for_the_other_sides_read(self):
         """The guard must not swallow the case it exists to surface."""
-        client, sender = _make_client(my_id=427441720)
+        client, sender = _make_client(my_id=100000002)
         sender.set_reaction = AsyncMock()
         await _forward_simple_text(client, sender, chat_id=-100, tg_chat_id="-100999", tg_message_id=42)
 

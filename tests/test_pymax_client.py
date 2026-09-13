@@ -309,7 +309,7 @@ async def test_read_message_converts_string_message_id_to_int(adapter):
     pymax as a str."""
     client, raw = adapter
 
-    await client.read_message(418124176, "117250688214045881")
+    await client.read_message(100000001, "117250688214045881")
 
     args, kwargs = raw.read_message.call_args
     assert args[0] == 117250688214045881
@@ -440,7 +440,7 @@ class TestReadMessagePayloadSerialization:
         from pymax.api.messages.payloads import ReadMessagesPayload
 
         payload = ReadMessagesPayload(
-            type=ReadAction.READ_MESSAGE, chat_id=418124176,
+            type=ReadAction.READ_MESSAGE, chat_id=100000001,
             message_id="117250688214045881", mark=1234567890,
         )
         assert payload.to_payload()["messageId"] == "117250688214045881"
@@ -451,7 +451,7 @@ class TestReadMessagePayloadSerialization:
         from pymax.api.messages.payloads import ReadMessagesPayload
 
         payload = ReadMessagesPayload(
-            type=ReadAction.READ_MESSAGE, chat_id=418124176,
+            type=ReadAction.READ_MESSAGE, chat_id=100000001,
             message_id=117250688214045881, mark=1234567890,
         )
         assert payload.to_payload()["messageId"] == 117250688214045881

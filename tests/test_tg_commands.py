@@ -67,14 +67,14 @@ def _replies(update) -> list[str]:
 
 class TestCmdBind:
     async def test_binds_a_chat_id_to_a_new_topic(self):
-        update = _make_update("/bind -75107924425434")
-        ctx = _make_context(args=["-75107924425434"])
+        update = _make_update("/bind -10000000000005")
+        ctx = _make_context(args=["-10000000000005"])
 
         await _cmd_bind(update, ctx)
 
         ctx.bot.create_forum_topic.assert_awaited_once()
         ctx.bot_data[TOPIC_STORE_KEY].set_topic.assert_called_once_with(
-            -75107924425434, TG_CHAT_ID, 10, "-75107924425434",
+            -10000000000005, TG_CHAT_ID, 10, "-10000000000005",
         )
         assert "Готово" in _replies(update)[0]
 
@@ -202,12 +202,12 @@ class TestCmdList:
             chat_types={-42: "CHAT"},
             topics={-42: 70},
             tg_chats={-42: TG_CHAT_ID},
-            tg_titles={TG_CHAT_ID: "MAX2TG_miha"},
+            tg_titles={TG_CHAT_ID: "Мост MAX"},
         )
 
         await _cmd_list(update, ctx)
 
-        assert "MAX2TG_miha\\топик #70" in "\n".join(_replies(update))
+        assert "Мост MAX\\топик #70" in "\n".join(_replies(update))
 
     async def test_an_unreadable_telegram_group_falls_back_to_its_id(self):
         update = _make_update("/list")
@@ -307,16 +307,16 @@ class TestCmdAddWithAnId:
         await _cmd_add(update, ctx)
 
     async def test_a_channel_id_is_bound_without_asking_max_anything(self):
-        update = _make_update("/add -69369957050939")
+        update = _make_update("/add -10000000000001")
         ctx = self._add_context(chats_raw={
-            -69369957050939: {"id": -69369957050939, "type": "CHANNEL", "title": "Малыш"},
+            -10000000000001: {"id": -10000000000001, "type": "CHANNEL", "title": "Городской канал"},
         })
-        ctx.args = ["-69369957050939"]
+        ctx.args = ["-10000000000001"]
 
         await self._run(ctx, update)
 
         ctx.bot.create_forum_topic.assert_awaited_once_with(
-            chat_id=TG_CHAT_ID, name="Малыш")
+            chat_id=TG_CHAT_ID, name="Городской канал")
         ctx.bot_data[MAX_CLIENT_KEY].open_by_link.assert_not_awaited()
 
     async def test_an_unknown_negative_id_still_binds(self):
@@ -333,27 +333,27 @@ class TestCmdAddWithAnId:
     async def test_a_known_positive_chat_id_binds_that_chat(self):
         """A dialog's own id is positive too — the chat we hold wins over
         the person we would otherwise infer from the same digits."""
-        update = _make_update("/add 418124176")
+        update = _make_update("/add 100000001")
         ctx = self._add_context(chats_raw={
-            418124176: {"id": 418124176, "type": "DIALOG", "title": "Наринэ"},
+            100000001: {"id": 100000001, "type": "DIALOG", "title": "Иван"},
         })
-        ctx.args = ["418124176"]
+        ctx.args = ["100000001"]
 
         await self._run(ctx, update)
 
         ctx.bot_data[MAX_CLIENT_KEY].open_dialog_with_user.assert_not_awaited()
         ctx.bot_data[TOPIC_STORE_KEY].set_topic.assert_called_once_with(
-            418124176, TG_CHAT_ID, 10, "Наринэ")
+            100000001, TG_CHAT_ID, 10, "Иван")
 
     async def test_an_unknown_positive_number_is_taken_for_a_person(self):
-        update = _make_update("/add 6633015816")
+        update = _make_update("/add 1234567890")
         ctx = self._add_context()
-        ctx.args = ["6633015816"]
+        ctx.args = ["1234567890"]
 
         await self._run(ctx, update)
 
         ctx.bot_data[MAX_CLIENT_KEY].open_dialog_with_user.assert_awaited_once_with(
-            6633015816)
+            1234567890)
 
     async def test_a_phone_still_goes_to_the_phone_lookup(self):
         update = _make_update("/add +7 999 123-45-67")
@@ -403,20 +403,20 @@ class TestSavedMessages:
         group or channel can arrive with only us in ``participants`` —
         that used to rename it to «Избранное» in /list and in its topic."""
         resolver = self._resolver()
-        resolver.chats_raw[-69411105308916] = {
-            "id": -69411105308916, "type": "CHAT",
+        resolver.chats_raw[-10000000000003] = {
+            "id": -10000000000003, "type": "CHAT",
             "title": "Домовой чат", "participants": {"100": 1},
         }
-        assert resolver.is_saved_messages(-69411105308916) is False
+        assert resolver.is_saved_messages(-10000000000003) is False
 
     def test_a_channel_that_lists_only_me_is_not(self):
         resolver = self._resolver()
-        resolver.chat_types = {-69369957050939: "CHANNEL"}
-        resolver.chats_raw[-69369957050939] = {
-            "id": -69369957050939, "title": "МАДОУ детский сад",
+        resolver.chat_types = {-10000000000001: "CHANNEL"}
+        resolver.chats_raw[-10000000000001] = {
+            "id": -10000000000001, "title": "Городской канал",
             "participants": {"100": 1},
         }
-        assert resolver.is_saved_messages(-69369957050939) is False
+        assert resolver.is_saved_messages(-10000000000001) is False
 
     def test_zero_is_saved_messages_even_without_a_snapshot(self):
         """A dialog's id is the XOR of the two user ids, so the dialog
@@ -630,25 +630,25 @@ class TestDelByTopicId:
         from app.tg_handler import _cmd_del
 
         update = _make_update("/del 144")
-        ctx = self._ctx(topics={(TG_CHAT_ID, 144): -69369957050939})
+        ctx = self._ctx(topics={(TG_CHAT_ID, 144): -10000000000001})
         ctx.args = ["144"]
 
         await _cmd_del(update, ctx)
 
         text = _replies(update)[0]
-        assert "144" in text and "-69369957050939" in text
+        assert "144" in text and "-10000000000001" in text
 
     async def test_a_max_chat_id_works_too(self):
         """What /list prints most prominently is the MAX id, so accept it."""
         from app.tg_handler import _cmd_del
 
-        update = _make_update("/del -69369957050939")
-        ctx = self._ctx(bindings={-69369957050939: 144})
-        ctx.args = ["-69369957050939"]
+        update = _make_update("/del -10000000000001")
+        ctx = self._ctx(bindings={-10000000000001: 144})
+        ctx.args = ["-10000000000001"]
 
         await _cmd_del(update, ctx)
 
-        assert "-69369957050939" in _replies(update)[0]
+        assert "-10000000000001" in _replies(update)[0]
 
     async def test_the_question_names_the_max_chat_beside_its_id(self):
         """Deleting is irreversible; the id alone doesn't say what you're
@@ -656,15 +656,15 @@ class TestDelByTopicId:
         from app.tg_handler import _cmd_del
 
         update = _make_update("/del 144")
-        ctx = self._ctx(topics={(TG_CHAT_ID, 144): -69369957050939})
+        ctx = self._ctx(topics={(TG_CHAT_ID, 144): -10000000000001})
         ctx.args = ["144"]
         resolver = MagicMock()
-        resolver.chat_name = MagicMock(return_value='МАДОУ детский сад')
+        resolver.chat_name = MagicMock(return_value='Городской канал')
         ctx.bot_data[MAX_CLIENT_KEY].resolver = resolver
 
         await _cmd_del(update, ctx)
 
-        assert "<b>МАДОУ детский сад</b> (<code>-69369957050939</code>)" in _replies(update)[0]
+        assert "<b>Городской канал</b> (<code>-10000000000001</code>)" in _replies(update)[0]
 
     async def test_an_id_of_no_topic_here_is_reported(self):
         from app.tg_handler import _cmd_del

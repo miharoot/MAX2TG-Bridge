@@ -34,7 +34,7 @@ def _parse_chat_routes(raw: str | None) -> dict[str, int]:
     """Parse MAX_CHAT_ROUTES — a JSON object mapping Max chat IDs (as strings,
     the JSON key type) to target Telegram chat IDs, e.g.:
 
-        MAX_CHAT_ROUTES={"-75107924425434": -1002233445566, "123456": -1009988776655}
+        MAX_CHAT_ROUTES={"-10000000000005": -1002233445566, "123456": -1009988776655}
 
     Chats not listed here fall back to TG_CHAT_ID once a message arrives, or
     can be bound later at runtime with /bind inside the desired group.

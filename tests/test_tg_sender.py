@@ -308,7 +308,7 @@ class TestStartWaitsForTheNetwork:
 
         sender, _ = _sender(tmp_path)
         me = MagicMock()
-        me.username = "MAX2TG2MAXbot"
+        me.username = "bridge_bot"
         sender._bot.initialize = AsyncMock()
         sender._bot.get_me = AsyncMock(
             side_effect=[NetworkError("proxy refused"), NetworkError("proxy refused"), me])

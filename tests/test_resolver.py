@@ -380,7 +380,7 @@ class TestResolveChat:
             resolver.chat_types[chat_id] = "CHAT"
 
         resolver._ws_fetch_chat = fake_fetch
-        result = await resolver.resolve_chat(-68192506787240)
+        result = await resolver.resolve_chat(-10000000000002)
 
         assert result == "Дружная команда"
 

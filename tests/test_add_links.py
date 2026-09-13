@@ -1,7 +1,7 @@
 """Resolving max.ru links for /add (app/pymax_client.py).
 
 The shape of a link says less than it looks like it does. MAX gives
-public groups and channels a handle link — https://max.ru/id6633015816_gos
+public groups and channels a handle link — https://max.ru/id1234567890_gos
 is one, belonging to a *channel*, not to a person — so digits in a link
 are no evidence of a user id. What settles it is the chat data we already
 hold, then MAX itself.
@@ -48,10 +48,10 @@ def _client_with(chats_raw=None):
 
 
 CHANNEL = {
-    "id": -69369957050939,
+    "id": -10000000000001,
     "type": "CHANNEL",
-    "title": 'МАДОУ детский сад №43 "Малыш"',
-    "link": "https://max.ru/id6633015816_gos",
+    "title": 'Городской канал',
+    "link": "https://max.ru/id1234567890_gos",
     "participants": {"100": 0},
 }
 
@@ -62,32 +62,32 @@ class TestAChatWeAlreadyHave:
     does not exist while the channel stayed unbound."""
 
     async def test_a_handle_link_binds_the_chat_it_belongs_to(self):
-        client = _client_with({-69369957050939: CHANNEL})
+        client = _client_with({-10000000000001: CHANNEL})
 
-        result = await client.open_by_link("https://max.ru/id6633015816_gos")
+        result = await client.open_by_link("https://max.ru/id1234567890_gos")
 
-        assert result["chatId"] == -69369957050939
-        assert result["chat"]["title"] == 'МАДОУ детский сад №43 "Малыш"'
+        assert result["chatId"] == -10000000000001
+        assert result["chat"]["title"] == 'Городской канал'
 
     async def test_it_needs_neither_joining_nor_asking(self):
         """We have the chat because we're in it — there is nothing to
         join and nothing to look up."""
-        client = _client_with({-69369957050939: CHANNEL})
+        client = _client_with({-10000000000001: CHANNEL})
 
-        await client.open_by_link("https://max.ru/id6633015816_gos")
+        await client.open_by_link("https://max.ru/id1234567890_gos")
 
         client._client.join_group.assert_not_awaited()
         client._client.join_channel.assert_not_awaited()
 
     async def test_a_link_written_differently_still_finds_it(self):
-        client = _client_with({-69369957050939: CHANNEL})
+        client = _client_with({-10000000000001: CHANNEL})
 
-        result = await client.open_by_link("http://web.max.ru/id6633015816_gos/")
+        result = await client.open_by_link("http://web.max.ru/id1234567890_gos/")
 
-        assert result["chatId"] == -69369957050939
+        assert result["chatId"] == -10000000000001
 
     async def test_an_unrelated_link_is_not_matched(self):
-        client = _client_with({-69369957050939: CHANNEL})
+        client = _client_with({-10000000000001: CHANNEL})
         chat = MagicMock()
         chat.id = -1
         client._client.join_group = AsyncMock(return_value=chat)
@@ -101,24 +101,24 @@ class TestAChatWeAlreadyHave:
         client = _client_with({
             -1: {"id": -1, "title": "без ссылки"},
             -2: "not even a dict",
-            -69369957050939: CHANNEL,
+            -10000000000001: CHANNEL,
         })
 
-        result = await client.open_by_link("https://max.ru/id6633015816_gos")
+        result = await client.open_by_link("https://max.ru/id1234567890_gos")
 
-        assert result["chatId"] == -69369957050939
+        assert result["chatId"] == -10000000000001
 
 
 class TestJoinLinks:
     async def test_a_join_link_goes_through_pymax(self):
         client = _client_with()
         chat = MagicMock()
-        chat.id = -75107924425434
+        chat.id = -10000000000005
         client._client.join_group = AsyncMock(return_value=chat)
 
         result = await client.open_by_link("https://max.ru/join/abcdef")
 
-        assert result["chatId"] == -75107924425434
+        assert result["chatId"] == -10000000000005
         client._client.join_group.assert_awaited_once()
 
 
@@ -138,49 +138,49 @@ class TestJoinRefusedByMax:
 
     async def test_a_chat_we_are_already_in_is_bound_despite_the_refused_join(self):
         client = self._client_that_cannot_join(
-            link_info_chat={"id": -68192506787240, "type": "CHAT",
-                            "title": "Сотрудники", "participants": {"100": 0}},
+            link_info_chat={"id": -10000000000002, "type": "CHAT",
+                            "title": "Рабочий чат", "participants": {"100": 0}},
         )
 
         result = await client.open_by_link("https://max.ru/join/sometoken")
 
-        assert result["chatId"] == -68192506787240
+        assert result["chatId"] == -10000000000002
         client._client._app.invoke.assert_awaited_once()
 
     async def test_the_error_names_the_chat_so_there_is_a_next_step(self):
         """Knowing which chat the link points at turns "can't join" into
         "join it in MAX, then bind this id"."""
         client = self._client_that_cannot_join(
-            link_info_chat={"id": -68192506787240, "type": "CHAT",
+            link_info_chat={"id": -10000000000002, "type": "CHAT",
                             "participants": {"999": 0}},
         )
 
         result = await client.open_by_link("https://max.ru/join/sometoken")
 
         message = result["_max_error"]["message"]
-        assert "-68192506787240" in message
+        assert "-10000000000002" in message
         assert "<" not in message   # /add reports errors without parse_mode
 
     async def test_the_error_names_the_chat_by_title_too(self):
         """An id alone doesn't say which chat it is — MAX sends the title
         in the same answer, so it goes next to the id."""
         client = self._client_that_cannot_join(
-            link_info_chat={"id": -78048322421481, "type": "CHAT",
-                            "title": "Родители 2 младшая группа",
+            link_info_chat={"id": -10000000000004, "type": "CHAT",
+                            "title": "Соседский чат",
                             "participants": {"999": 0}},
         )
 
         result = await client.open_by_link("https://max.ru/join/sometoken")
 
         message = result["_max_error"]["message"]
-        assert "Родители 2 младшая группа" in message
-        assert "-78048322421481" in message
+        assert "Соседский чат" in message
+        assert "-10000000000004" in message
 
     async def test_a_chat_we_are_not_in_is_never_bound_without_joining(self):
         """/add joins; resolving is not joining. A topic bound to a chat
         we never entered could never receive a message."""
         client = self._client_that_cannot_join(
-            link_info_chat={"id": -68192506787240, "type": "CHAT",
+            link_info_chat={"id": -10000000000002, "type": "CHAT",
                             "title": "Чужой чат", "participants": {"999": 0}},
         )
 
@@ -255,17 +255,17 @@ class TestOpeningADialogWithAPerson:
         binding on the guess produced a topic wired to nothing."""
         client = self._client_for_dialog(user=None)
 
-        result = await client.open_dialog_with_user(6633015816)
+        result = await client.open_dialog_with_user(1234567890)
 
         assert "chatId" not in result
-        assert "6633015816" in result["_max_error"]["message"]
+        assert "1234567890" in result["_max_error"]["message"]
 
     async def test_a_name_we_already_have_is_proof_enough(self):
-        client = self._client_for_dialog(cached_name="Наринэ Ермилова")
+        client = self._client_for_dialog(cached_name="Иван Петров")
 
         result = await client.open_dialog_with_user(42)
 
-        assert result["chat"]["title"] == "Наринэ Ермилова"
+        assert result["chat"]["title"] == "Иван Петров"
         client._client.get_user.assert_not_awaited()
 
     async def test_it_waits_until_max_has_told_us_who_we_are(self):
@@ -294,7 +294,7 @@ class TestOpeningADialogWithAPerson:
 class TestAProfileLinkIsOnlyAHint:
     @pytest.mark.parametrize("link,expected", [
         ("https://max.ru/id42", 42),
-        ("https://max.ru/id6633015816_gos", 6633015816),
+        ("https://max.ru/id1234567890_gos", 1234567890),
         ("https://web.max.ru/id42/", 42),
         ("https://max.ru/join/abc", None),
         ("https://max.ru/username", None),
@@ -306,13 +306,13 @@ class TestAProfileLinkIsOnlyAHint:
     async def test_a_person_is_tried_only_after_the_chat_paths_fail(self):
         """The channel handle that started this: both link and dialog
         shapes match it, and only the chat reading is right."""
-        client = _client_with({-69369957050939: CHANNEL})
+        client = _client_with({-10000000000001: CHANNEL})
         client._client.get_user = AsyncMock(return_value=MagicMock())
         client._client.get_chat_id = MagicMock(side_effect=lambda a, b: a ^ b)
 
-        result = await client.open_by_link("https://max.ru/id6633015816_gos")
+        result = await client.open_by_link("https://max.ru/id1234567890_gos")
 
-        assert result["chatId"] == -69369957050939   # the channel, not a dialog
+        assert result["chatId"] == -10000000000001   # the channel, not a dialog
         client._client.get_user.assert_not_awaited()
 
     async def test_an_unknown_link_falls_through_to_the_person(self):
@@ -341,7 +341,7 @@ class TestAProfileLinkIsOnlyAHint:
         client._client.get_user = AsyncMock(return_value=None)
         client.resolver.users = {}
 
-        result = await client.open_by_link("https://max.ru/id6633015816_gos")
+        result = await client.open_by_link("https://max.ru/id1234567890_gos")
 
         assert "не найдено" in result["_max_error"]["message"]
 
@@ -393,12 +393,12 @@ class TestAPersonalLink:
 
     async def test_a_chat_in_the_answer_still_wins_its_own_path(self):
         client = self._client_answering(
-            {"chat": {"id": -68192506787240, "participants": {"100": 0}}},
+            {"chat": {"id": -10000000000002, "participants": {"100": 0}}},
         )
 
         result = await client.open_by_link("https://max.ru/u/sometoken")
 
-        assert result["chatId"] == -68192506787240
+        assert result["chatId"] == -10000000000002
 
 
 class TestAddingSomeoneByPhone:
@@ -419,7 +419,7 @@ class TestAddingSomeoneByPhone:
         ("+7 999 123-45-67", "+79991234567"),
         ("+7 (999) 123-45-67", "+79991234567"),
         ("79991234567", None),      # no +: that's a user id, not a phone
-        ("6633015816", None),
+        ("1234567890", None),
         ("+123", None),
         ("", None),
     ])

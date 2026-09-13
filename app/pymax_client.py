@@ -635,7 +635,7 @@ def _is_allowed_download_url(url: str) -> bool:
 
 # Some max.ru links carry digits that *may* be a user id
 # (https://max.ru/id123456789). May, not do: a public group or channel
-# handle looks exactly the same — https://max.ru/id6633015816_gos is a
+# handle looks exactly the same — https://max.ru/id1234567890_gos is a
 # channel — so this is a hint to check with MAX, never a conclusion. What
 # settles it is whether MAX knows a user by that id; see
 # PyMaxClient.open_dialog_with_user, which refuses to bind without that.
@@ -1264,7 +1264,7 @@ class PyMaxClient:
         Three steps, in the order they're tried:
 
         1. **A chat we already have.** MAX gives every public group and
-           channel a handle link (``max.ru/id6633015816_gos``) and ships
+           channel a handle link (``max.ru/id1234567890_gos``) and ships
            it with the chat, so a link we already hold needs no request
            and no joining — we're in it, that's why we have it. This also
            keeps such a handle from being mistaken for something else:
@@ -1415,7 +1415,7 @@ class PyMaxClient:
         So the one thing worth asking the server is whether the person
         exists, and that answer is required, not decorative: the digits
         in a link are just as likely to belong to a public channel
-        (max.ru/id6633015816_gos is one), and MAX answers a lookup for
+        (max.ru/id1234567890_gos is one), and MAX answers a lookup for
         those with an empty list. Binding on a guess produced a topic
         wired to a chat that could never receive anything.
 

@@ -171,9 +171,9 @@ class TestTopicTitleForMessage:
         resolver = MagicMock()
         resolver.is_saved_messages.return_value = False   # an ordinary dialog
         title, force = await _topic_title_for_message(
-            _msg(), resolver, raw_sender="Наринэ Ермилова", is_dm=True,
+            _msg(), resolver, raw_sender="Иван Петров", is_dm=True,
         )
-        assert title == "Наринэ Ермилова"
+        assert title == "Иван Петров"
         assert force is False
         resolver.resolve_chat.assert_not_called()
 
@@ -181,7 +181,7 @@ class TestTopicTitleForMessage:
         resolver = MagicMock()
         resolver.chat_name.return_value = "Рабочий чат"
         title, force = await _topic_title_for_message(
-            _msg(), resolver, raw_sender="Наринэ Ермилова", is_dm=False,
+            _msg(), resolver, raw_sender="Иван Петров", is_dm=False,
         )
         assert title == "Рабочий чат"
         assert force is True
@@ -193,18 +193,18 @@ class TestTopicTitleForMessage:
         the numeric chat ID — the old code then used the *sender's* name as
         the topic title. It must now do a live lookup instead."""
         resolver = MagicMock()
-        resolver.chat_name.return_value = "-68192506787240"  # unknown → numeric fallback
+        resolver.chat_name.return_value = "-10000000000002"  # unknown → numeric fallback
         resolver.resolve_chat = AsyncMock(return_value="Дружная команда")
 
         title, force = await _topic_title_for_message(
-            _msg(chat_id=-68192506787240), resolver,
-            raw_sender="Наринэ Ермилова", is_dm=False,
+            _msg(chat_id=-10000000000002), resolver,
+            raw_sender="Иван Петров", is_dm=False,
         )
 
         assert title == "Дружная команда"
-        assert title != "Наринэ Ермилова"
+        assert title != "Иван Петров"
         assert force is True
-        resolver.resolve_chat.assert_awaited_once_with(-68192506787240)
+        resolver.resolve_chat.assert_awaited_once_with(-10000000000002)
 
     async def test_unresolvable_new_group_falls_back_to_chat_id_not_sender(self):
         """If the live lookup also fails, fall back to the numeric chat ID
@@ -214,11 +214,11 @@ class TestTopicTitleForMessage:
         resolver.resolve_chat = AsyncMock(return_value="-555")  # still unresolved
 
         title, force = await _topic_title_for_message(
-            _msg(chat_id=-555), resolver, raw_sender="Наринэ Ермилова", is_dm=False,
+            _msg(chat_id=-555), resolver, raw_sender="Иван Петров", is_dm=False,
         )
 
         assert title == "-555"
-        assert title != "Наринэ Ермилова"
+        assert title != "Иван Петров"
         assert force is False
 
 
@@ -520,9 +520,9 @@ class TestSavedMessagesTitle:
         resolver = MagicMock()
         resolver.is_saved_messages = MagicMock(return_value=False)
         msg = MagicMock()
-        msg.chat_id = 418124176
+        msg.chat_id = 100000001
 
         title, confirmed = await _topic_title_for_message(
-            msg, resolver, "Наринэ Ермилова", True)
+            msg, resolver, "Иван Петров", True)
 
-        assert title == "Наринэ Ермилова"
+        assert title == "Иван Петров"
