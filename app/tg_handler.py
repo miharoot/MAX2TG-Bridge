@@ -250,6 +250,11 @@ async def _surface_send_result(resp, *, bot, tg_chat_id, tg_message_id, notify,
             )
 
     if max_client is not None and max_chat_id is not None:
+        # Your own reply is now the last thing in the topic, so a read
+        # marker coming back from MAX belongs on it — before this, the ✅
+        # went on the last message the *other* side had sent, or nowhere
+        # at all when they had not sent one since the last restart.
+        await max_client.remember_tg_anchor(max_chat_id, tg_chat_id, tg_message_id)
         last_id = max_client.last_message_ids.get(max_chat_id)
         if last_id:
             ok = await max_client.read_message(max_chat_id, last_id)

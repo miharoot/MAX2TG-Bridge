@@ -162,16 +162,20 @@ class TelegramSender:
         hard error. The failure is logged at warning level: at debug it
         was invisible in the normal log, so a reaction Telegram refused
         looked exactly like a read marker that never arrived.
+
+        Goes through the same ``_retry`` as every other Telegram call. It
+        used to hit the API once: a single connect timeout on the proxy —
+        the ordinary way this bridge's network misbehaves — dropped the ✅
+        for good, with the read marker never repeated to try again.
         """
-        try:
-            await self._bot.set_message_reaction(
-                chat_id=chat_id, message_id=message_id, reaction=emoji,
-            )
-            return True
-        except Exception:
+        result = await self._retry(lambda: self._bot.set_message_reaction(
+            chat_id=chat_id, message_id=message_id, reaction=emoji,
+        ))
+        if result is None:
             log.warning("Could not set reaction %r on message %s in %s",
-                        emoji, message_id, chat_id, exc_info=True)
+                        emoji, message_id, chat_id)
             return False
+        return bool(result)
 
     # ── forum topics ───────────────────────────────────────────────
 

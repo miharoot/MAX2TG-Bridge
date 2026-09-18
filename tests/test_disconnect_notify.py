@@ -45,6 +45,11 @@ class FakeClient:
         return False
 
     my_id = None
+    last_message_ids: dict = {}
+    last_tg_message: dict = {}
+
+    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id):
+        self.last_tg_message[max_chat_id] = (tg_chat_id, int(tg_message_id))
 
 
 def _make_client(sender=None):

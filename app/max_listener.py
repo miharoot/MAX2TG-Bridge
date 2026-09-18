@@ -563,12 +563,13 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
     # восстановлено" show up with no matching "⚠️ потеряно" before it.
     _last_disconnect_notif_time: datetime | None = None
     _disconnect_notice_pending = False
-    # Tracks the most recent Telegram message we forwarded for each Max
-    # chat: max_chat_id -> (tg_chat_id, tg_message_id). Used to mirror MAX
-    # "read" events as a ✅ reaction on that message (see @client.on_read
-    # below) — same idea as the existing 👀 reaction already put on
-    # Telegram→MAX replies once MAX confirms delivery.
-    _last_tg_message: dict[Any, tuple[str | int, int]] = {}
+    # The most recent Telegram message in each Max chat's topic:
+    # max_chat_id -> (tg_chat_id, tg_message_id). Used to mirror MAX "read"
+    # events as a ✅ reaction on that message (see @client.on_read below) —
+    # same idea as the existing 👀 reaction already put on Telegram→MAX
+    # replies once MAX confirms delivery. Lives on the client rather than
+    # in this closure because the reply side (app/tg_handler.py) records
+    # into it too, and because it is restored from the outbox at startup.
 
     def _can_notify_disconnect() -> bool:
         if _last_disconnect_notif_time is None:
@@ -601,8 +602,38 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             await sender.broadcast(f"✅ <b>Max:</b> подключён | чатов: {chat_count}")
         _first_connect = False
 
+        await _restore_read_state()
+
         if getattr(_settings, "catchup_enabled", False):
             asyncio.create_task(_catch_up_missed())
+
+    async def _restore_read_state() -> None:
+        """Bring back what the read markers need across a restart.
+
+        Both halves used to live only in memory, and both are consulted
+        long after the message they point at: the id a reply marks the MAX
+        chat read up to, and the Telegram message a MAX read marker ticks
+        with ✅. After a restart a reply marked nothing and an arriving
+        read marker had nothing to tick — the two symptoms this restores.
+
+        Never overwrites what this run already knows: a live message that
+        arrived before this ran is newer than anything in the database.
+        """
+        try:
+            seen_ids = await client.outbox.seen_message_ids()
+            anchors = await client.outbox.last_tg_messages()
+        except Exception:
+            log.exception("Could not restore the read-marker state from the outbox")
+            return
+        for chat_id, message_id in seen_ids.items():
+            client.last_message_ids.setdefault(_as_chat_key(chat_id), message_id)
+        for chat_id, anchor in anchors.items():
+            client.last_tg_message.setdefault(_as_chat_key(chat_id), anchor)
+        log.info(
+            "Restored read state: %d chats with a known MAX message id, "
+            "%d with a Telegram message to mark",
+            len(seen_ids), len(anchors),
+        )
 
     async def _catch_up_missed() -> None:
         """Forward what MAX received while the bridge was down.
@@ -631,11 +662,7 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             return
         total = 0
         for chat_id, mark in marks.items():
-            key: Any = chat_id
-            try:
-                key = int(chat_id)
-            except (TypeError, ValueError):
-                pass
+            key = _as_chat_key(chat_id)
             if sender.topic_store.get_topic(key) is None:
                 continue
             try:
@@ -722,12 +749,12 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             log.info("MAX read event: chat=%s is our own read marker — no ✅",
                      event.chat_id)
             return
-        last = _last_tg_message.get(event.chat_id)
+        last = client.last_tg_message.get(event.chat_id)
         if last is None:
             log.info(
                 "MAX read event: chat=%s has no forwarded Telegram message to "
                 "mark (known: %s) — no ✅",
-                event.chat_id, sorted(map(str, _last_tg_message)) or "нет",
+                event.chat_id, sorted(map(str, client.last_tg_message)) or "нет",
             )
             return
         tg_chat_id, tg_message_id = last
@@ -756,6 +783,15 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         )
         await sender.send(f"👍 <i>Реакция на сообщение: {parts}</i>",
                           message_thread_id=thread_id, chat_id=tg_chat_id)
+
+    def _as_chat_key(chat_id: Any) -> Any:
+        """MAX chat ids come back from the database as text; everywhere
+        else they are ints. Keep one shape, so a restored entry matches the
+        key a live event looks up."""
+        try:
+            return int(chat_id)
+        except (TypeError, ValueError):
+            return chat_id
 
     async def _ingest_max_message(msg: MaxMessage) -> None:
         """Persist a MAX message, then deliver it to Telegram.
@@ -789,6 +825,11 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             # outbox, so the retry loop owns it from here — a catch-up
             # must not queue it a second time.
             await client.outbox.mark_seen(msg.chat_id, msg.timestamp, msg.message_id)
+            # What a reply from Telegram marks this chat read up to. The
+            # live path records it in app/pymax_client.py as events arrive;
+            # a message pulled from history never passed through there.
+            if msg.message_id:
+                client.last_message_ids[msg.chat_id] = msg.message_id
 
     @client.on_message
     async def handle_message(msg: MaxMessage):
@@ -908,7 +949,7 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
                 last_message = await sender.send(f"{header_text}\n{escape(msg.text)}", message_thread_id=thread_id, chat_id=target_chat_id)
             log.info("Forwarded link type=%s → TG", link_type)
             if last_message is not None:
-                _last_tg_message[msg.chat_id] = (target_chat_id, last_message.message_id)
+                await client.remember_tg_anchor(msg.chat_id, target_chat_id, last_message.message_id)
             return
 
         meaningful_attaches = [
@@ -935,7 +976,7 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
                 grouped = None
             if grouped is not None and grouped is not False:
                 log.info("Forwarded %d attachments as media group", len(meaningful_attaches))
-                _last_tg_message[msg.chat_id] = (target_chat_id, grouped.message_id)
+                await client.remember_tg_anchor(msg.chat_id, target_chat_id, grouped.message_id)
                 return
             if grouped is False:
                 fail_msg = await sender.send(
@@ -943,7 +984,7 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
                     message_thread_id=thread_id, chat_id=target_chat_id,
                 )
                 if fail_msg is not None:
-                    _last_tg_message[msg.chat_id] = (target_chat_id, fail_msg.message_id)
+                    await client.remember_tg_anchor(msg.chat_id, target_chat_id, fail_msg.message_id)
                 return
 
             text_sent = False
@@ -981,7 +1022,7 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             log.info("Forwarded text → TG")
 
         if last_message is not None:
-            _last_tg_message[msg.chat_id] = (target_chat_id, last_message.message_id)
+            await client.remember_tg_anchor(msg.chat_id, target_chat_id, last_message.message_id)
 
     # Exposed for the background retry loop (see app/outbox_retry.py) to
     # re-attempt a MAX→TG message that failed and is still sitting in the

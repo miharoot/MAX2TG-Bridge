@@ -21,6 +21,8 @@ class _FakePyMaxClient:
         self._on_disconnect_cb = None
         self._on_read_cb = None
         self._on_reaction_cb = None
+        self.last_message_ids: dict = {}
+        self.last_tg_message: dict = {}
 
     def on_ready(self, func):
         self._on_ready_cb = func
@@ -48,6 +50,16 @@ class _FakePyMaxClient:
 
     def is_bridge_echo(self, msg: MaxMessage) -> bool:
         return False
+
+    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id):
+        """Same contract as PyMaxClient: where a later MAX read marker
+        puts its ✅, in memory and (for the real one) in the outbox."""
+        if tg_message_id is None or tg_chat_id is None:
+            return
+        self.last_tg_message[max_chat_id] = (tg_chat_id, int(tg_message_id))
+        box = getattr(self, "outbox", None)
+        if box is not None:
+            await box.set_last_tg_message(max_chat_id, tg_chat_id, tg_message_id)
 
 
 def _make_client(sender=None):

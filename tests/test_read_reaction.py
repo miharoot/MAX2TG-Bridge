@@ -20,6 +20,8 @@ class _FakePyMaxClient:
         self._on_disconnect_cb = None
         self._on_read_cb = None
         self._on_reaction_cb = None
+        self.last_message_ids: dict = {}
+        self.last_tg_message: dict = {}
 
     def on_ready(self, func):
         self._on_ready_cb = func
@@ -47,6 +49,16 @@ class _FakePyMaxClient:
 
     def is_bridge_echo(self, msg: MaxMessage) -> bool:
         return False
+
+    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id):
+        """Same contract as PyMaxClient: where a later MAX read marker
+        puts its ✅, in memory and (for the real one) in the outbox."""
+        if tg_message_id is None or tg_chat_id is None:
+            return
+        self.last_tg_message[max_chat_id] = (tg_chat_id, int(tg_message_id))
+        box = getattr(self, "outbox", None)
+        if box is not None:
+            await box.set_last_tg_message(max_chat_id, tg_chat_id, tg_message_id)
 
 
 def _make_client(sender=None, my_id=None):
@@ -118,6 +130,69 @@ class TestReadEventForwarding:
         await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id="26619816", mark=123))
 
         sender.set_reaction.assert_awaited_once_with("-100999", 42, "✅")
+
+    async def test_the_anchor_survives_a_restart(self):
+        """A read marker usually arrives long after the message it covers,
+        often past a restart. With the anchor only in memory, the ✅ was
+        dropped for want of anything to put it on."""
+        from app.max_listener import configure_pymax_client
+        from app.outbox import Outbox
+
+        box = Outbox(":memory:")
+        await box.set_last_tg_message(-100, "-10000000000001", 42)
+
+        # A fresh process: new client, nothing in memory, same outbox.
+        sender = AsyncMock()
+        sender.set_reaction = AsyncMock(return_value=True)
+        client = _FakePyMaxClient(my_id=1)
+        client.last_tg_message = {}
+        configure_pymax_client(client, sender)
+        client.outbox = box
+        await client._on_ready_cb({"chats": []})
+
+        await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
+
+        sender.set_reaction.assert_awaited_once_with("-10000000000001", 42, "✅")
+        await box.close()
+
+    async def test_a_live_anchor_is_not_overwritten_by_the_stored_one(self):
+        """Whatever this run already saw is newer than the database."""
+        from app.max_listener import configure_pymax_client
+        from app.outbox import Outbox
+
+        box = Outbox(":memory:")
+        await box.set_last_tg_message(-100, "-10000000000001", 42)
+
+        sender = AsyncMock()
+        sender.set_reaction = AsyncMock(return_value=True)
+        client = _FakePyMaxClient(my_id=1)
+        client.last_tg_message = {-100: ("-10000000000001", 99)}
+        configure_pymax_client(client, sender)
+        client.outbox = box
+        await client._on_ready_cb({"chats": []})
+
+        await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
+
+        sender.set_reaction.assert_awaited_once_with("-10000000000001", 99, "✅")
+        await box.close()
+
+    async def test_the_message_id_for_a_reply_survives_a_restart(self):
+        """The other half: a reply typed right after a restart marks the
+        MAX chat read up to the last message the outbox recorded."""
+        from app.max_listener import configure_pymax_client
+        from app.outbox import Outbox
+
+        box = Outbox(":memory:")
+        await box.mark_seen(-100, 500, "msg-7")
+
+        client = _FakePyMaxClient(my_id=1)
+        client.last_message_ids = {}
+        configure_pymax_client(client, AsyncMock())
+        client.outbox = box
+        await client._on_ready_cb({"chats": []})
+
+        assert client.last_message_ids[-100] == "msg-7"
+        await box.close()
 
     async def test_every_read_event_is_logged(self, caplog):
         """The log is the only way to tell "MAX never sent a read marker"

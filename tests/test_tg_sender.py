@@ -354,3 +354,35 @@ class TestStartWaitsForTheNetwork:
         assert delays[0] == TG_START_RETRY_STEP      # 10s, then 20s, 30s…
         assert delays == sorted(delays)
         assert max(delays) == TG_START_RETRY_MAX
+
+
+class TestSetReaction:
+    """A ✅ mirroring a MAX read marker. The marker is never repeated, so a
+    single dropped attempt loses it for good — hence the same retry every
+    other Telegram call goes through."""
+
+    async def test_a_timeout_is_retried_and_can_succeed(self, tmp_path, monkeypatch):
+        from telegram.error import TimedOut
+
+        sender, _ = _sender(tmp_path)
+        monkeypatch.setattr("app.tg_sender.asyncio.sleep", AsyncMock())
+        sender._bot.set_message_reaction = AsyncMock(side_effect=[TimedOut(), True])
+
+        assert await sender.set_reaction(DEFAULT, 42, "✅") is True
+        assert sender._bot.set_message_reaction.await_count == 2
+
+    async def test_it_gives_up_after_the_last_attempt(self, tmp_path, monkeypatch):
+        from telegram.error import TimedOut
+
+        sender, _ = _sender(tmp_path)
+        monkeypatch.setattr("app.tg_sender.asyncio.sleep", AsyncMock())
+        sender._bot.set_message_reaction = AsyncMock(side_effect=TimedOut())
+
+        assert await sender.set_reaction(DEFAULT, 42, "✅") is False
+
+    async def test_a_single_call_is_enough_when_telegram_answers(self, tmp_path):
+        sender, _ = _sender(tmp_path)
+        sender._bot.set_message_reaction = AsyncMock(return_value=True)
+
+        assert await sender.set_reaction(DEFAULT, 42, "✅") is True
+        sender._bot.set_message_reaction.assert_awaited_once()

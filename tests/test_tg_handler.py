@@ -86,6 +86,10 @@ def _make_max_client(last_message_ids=None, send_message_return=None,
     else:
         max_client.send_message = AsyncMock(return_value=send_message_return)
     max_client.read_message = AsyncMock(return_value=read_message_return)
+    # Where a later ✅ from MAX should land — recorded on every confirmed
+    # reply now, so it has to be awaitable here too.
+    max_client.remember_tg_anchor = AsyncMock()
+    max_client.last_tg_message = {}
     max_client.outbox = MagicMock()
     max_client.outbox.add = AsyncMock(return_value=1)
     max_client.outbox.remove = AsyncMock()
@@ -815,6 +819,47 @@ class TestDownloadTgFile:
         assert file_obj.get_file.await_count == 2
 
 
+class TestReadAnchorOnReply:
+    """Your reply is the last thing in the topic, so a read marker coming
+    back from MAX belongs on it. Before this the ✅ went onto the last
+    message the *other* side had sent — or nowhere, when they had not sent
+    one since the last restart."""
+
+    async def test_a_confirmed_reply_becomes_the_anchor(self):
+        from app.tg_handler import _surface_send_result
+
+        max_client = MagicMock()
+        max_client.last_message_ids = {}
+        max_client.read_message = AsyncMock()
+        max_client.remember_tg_anchor = AsyncMock()
+
+        await _surface_send_result(
+            {"id": 1}, bot=MagicMock(), tg_chat_id=DEFAULT_TG_CHAT_ID,
+            tg_message_id=77, notify=AsyncMock(),
+            max_client=max_client, max_chat_id=-42,
+        )
+
+        max_client.remember_tg_anchor.assert_awaited_once_with(
+            -42, DEFAULT_TG_CHAT_ID, 77)
+
+    async def test_a_rejected_message_leaves_the_anchor_alone(self):
+        """MAX refused it, so nothing of yours is in that chat to be read."""
+        from app.tg_handler import _surface_send_result
+
+        max_client = MagicMock()
+        max_client.last_message_ids = {}
+        max_client.remember_tg_anchor = AsyncMock()
+
+        ok = await _surface_send_result(
+            {"_max_error": {"message": "нет"}}, bot=MagicMock(),
+            tg_chat_id=DEFAULT_TG_CHAT_ID, tg_message_id=77, notify=AsyncMock(),
+            max_client=max_client, max_chat_id=-42,
+        )
+
+        assert ok is False
+        max_client.remember_tg_anchor.assert_not_awaited()
+
+
 class TestReadMarkerLogging:
     """Why no "прочитано" appeared on the MAX side. Before these lines the
     quiet cases — no message id known yet, MAX refusing the marker — left
@@ -833,6 +878,7 @@ class TestReadMarkerLogging:
         max_client = MagicMock()
         max_client.last_message_ids = {}
         max_client.read_message = AsyncMock()
+        max_client.remember_tg_anchor = AsyncMock()
 
         with _capture_tg_handler() as records:
             ok = await _surface_send_result(
@@ -848,6 +894,7 @@ class TestReadMarkerLogging:
         max_client = MagicMock()
         max_client.last_message_ids = {-42: "m1"}
         max_client.read_message = AsyncMock(return_value=False)
+        max_client.remember_tg_anchor = AsyncMock()
 
         with _capture_tg_handler() as records:
             await _surface_send_result(
@@ -861,6 +908,7 @@ class TestReadMarkerLogging:
         max_client = MagicMock()
         max_client.last_message_ids = {-42: "m1"}
         max_client.read_message = AsyncMock(return_value=True)
+        max_client.remember_tg_anchor = AsyncMock()
 
         with _capture_tg_handler() as records:
             await _surface_send_result(

@@ -162,9 +162,65 @@ class Outbox:
                     )
                     """
                 )
+                # The Telegram message a MAX read marker should land its
+                # ✅ on: the last thing that appeared in that chat's topic,
+                # whichever side put it there. In the database because the
+                # peer usually reads minutes or hours later, often past a
+                # restart — kept only in memory, the ✅ had nothing to
+                # attach to and was silently dropped.
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS last_tg_message (
+                        chat_id       TEXT PRIMARY KEY,
+                        tg_chat_id    TEXT NOT NULL,
+                        tg_message_id INTEGER NOT NULL,
+                        updated_at    REAL NOT NULL
+                    )
+                    """
+                )
                 await conn.commit()
                 self._conn = conn
         return self._conn
+
+    async def set_last_tg_message(self, chat_id: Any, tg_chat_id: Any,
+                                  tg_message_id: Any) -> None:
+        """Remember where a ✅ for this MAX chat should go."""
+        if tg_message_id is None or tg_chat_id is None:
+            return
+        conn = await self._get_conn()
+        await conn.execute(
+            "INSERT INTO last_tg_message (chat_id, tg_chat_id, tg_message_id, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET "
+            "    tg_chat_id = excluded.tg_chat_id, "
+            "    tg_message_id = excluded.tg_message_id, "
+            "    updated_at = excluded.updated_at",
+            (str(chat_id), str(tg_chat_id), int(tg_message_id), time.time()),
+        )
+        await conn.commit()
+
+    async def last_tg_messages(self) -> dict[str, tuple[str, int]]:
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT chat_id, tg_chat_id, tg_message_id FROM last_tg_message"
+        ) as cur:
+            rows = await cur.fetchall()
+        return {str(chat_id): (str(tg_chat_id), int(tg_message_id))
+                for chat_id, tg_chat_id, tg_message_id in rows}
+
+    async def seen_message_ids(self) -> dict[str, str]:
+        """The last forwarded MAX message id per chat.
+
+        What a read marker sent back to MAX is addressed to, so it has to
+        survive a restart: held only in memory, a reply typed before the
+        chat said anything new had nothing to mark the chat read up to.
+        """
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT chat_id, last_id FROM seen WHERE last_id IS NOT NULL"
+        ) as cur:
+            rows = await cur.fetchall()
+        return {str(chat_id): str(last_id) for chat_id, last_id in rows}
 
     async def mark_sent_by_bridge(self, chat_id: Any, message_id: Any) -> None:
         """Remember that this MAX message came from the bridge.

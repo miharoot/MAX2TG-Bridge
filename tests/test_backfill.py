@@ -109,6 +109,51 @@ class TestSentByBridgeMarks:
         await box.close()
 
 
+class TestReadMarkerState:
+    """What the read markers need after a restart: the MAX message id a
+    reply marks the chat read up to, and the Telegram message a MAX read
+    marker ticks with ✅. Both used to live only in memory."""
+
+    async def test_the_last_forwarded_message_id_survives(self, tmp_path):
+        box = Outbox(str(tmp_path / "outbox.db"))
+        await box.mark_seen(-42, 100, "msg-1")
+        await box.mark_seen(-42, 200, "msg-2")
+
+        assert await box.seen_message_ids() == {"-42": "msg-2"}
+        await box.close()
+
+    async def test_a_mark_without_an_id_is_not_offered(self, tmp_path):
+        """_seed_seen_marks can store a time with no id; there is nothing
+        to mark a chat read up to in that case."""
+        box = Outbox(str(tmp_path / "outbox.db"))
+        await box.mark_seen(-42, 100)
+
+        assert await box.seen_message_ids() == {}
+        await box.close()
+
+    async def test_the_tg_anchor_is_stored_and_read_back(self, tmp_path):
+        box = Outbox(str(tmp_path / "outbox.db"))
+        await box.set_last_tg_message(-42, "-10000000000001", 7)
+
+        assert await box.last_tg_messages() == {"-42": ("-10000000000001", 7)}
+        await box.close()
+
+    async def test_a_newer_anchor_replaces_the_old_one(self, tmp_path):
+        box = Outbox(str(tmp_path / "outbox.db"))
+        await box.set_last_tg_message(-42, "-10000000000001", 7)
+        await box.set_last_tg_message(-42, "-10000000000001", 9)
+
+        assert await box.last_tg_messages() == {"-42": ("-10000000000001", 9)}
+        await box.close()
+
+    async def test_an_anchor_without_a_message_is_ignored(self, tmp_path):
+        box = Outbox(str(tmp_path / "outbox.db"))
+        await box.set_last_tg_message(-42, "-10000000000001", None)
+
+        assert await box.last_tg_messages() == {}
+        await box.close()
+
+
 class TestFetchRecentMessages:
     def _client(self, raw_messages):
         from app.pymax_client import PyMaxClient
@@ -261,6 +306,17 @@ class TestIngestHistory:
 
         assert await client.backfill_chat(-42, 10) == 0
         sender.send.assert_not_awaited()
+        await client.outbox.close()
+
+    async def test_a_history_message_becomes_what_a_reply_marks_read(self):
+        """The live path records the id as events arrive; a message pulled
+        from history never passes through there, so a reply typed after a
+        catch-up had nothing to mark the chat read up to."""
+        client, _ = self._client([self._msg(1, 100), self._msg(2, 200)])
+
+        await client.backfill_chat(-42, 10)
+
+        assert client.last_message_ids[-42] == "2"
         await client.outbox.close()
 
     async def test_the_bridge_own_message_is_not_mirrored_back(self):
