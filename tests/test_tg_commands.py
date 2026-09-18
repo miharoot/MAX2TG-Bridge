@@ -986,6 +986,91 @@ class TestListRefreshesFromMax:
         assert -10000000000003 in resolver.chats_raw
 
 
+class TestCmdRead:
+    """/read marks the topic's MAX chat read without replying to it.
+    Telegram tells a bot nothing about what you have read, so without this
+    the only thing that ever moved the MAX read marker was a reply."""
+
+    def _ctx(self, *, bound=True, last_message_ids=None, read_ok=True):
+        ctx = _make_context(args=[])
+        store = ctx.bot_data[TOPIC_STORE_KEY]
+        store.chat_for_topic = MagicMock(
+            return_value=-10000000000001 if bound else None)
+
+        max_client = ctx.bot_data[MAX_CLIENT_KEY]
+        max_client.resolver = MagicMock()
+        max_client.resolver.chat_name = MagicMock(return_value="Рабочий чат")
+        max_client.last_message_ids = (
+            {-10000000000001: "msg-9"} if last_message_ids is None
+            else last_message_ids)
+        max_client.read_message = AsyncMock(return_value=read_ok)
+        return ctx
+
+    def _update(self):
+        update = _make_update("/read")
+        update.message.message_thread_id = 144
+        update.message.is_topic_message = True
+        return update
+
+    async def test_it_marks_the_chat_read_up_to_the_last_known_message(self):
+        from app.tg_handler import _cmd_read
+
+        update, ctx = self._update(), self._ctx()
+
+        await _cmd_read(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].read_message.assert_awaited_once_with(
+            -10000000000001, "msg-9")
+        assert "прочитанным" in _replies(update)[-1]
+
+    async def test_a_chat_with_no_known_message_says_so(self):
+        """The marker addresses a message id, not a chat — with nothing
+        known there is nothing to send."""
+        from app.tg_handler import _cmd_read
+
+        update, ctx = self._update(), self._ctx(last_message_ids={})
+
+        await _cmd_read(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].read_message.assert_not_awaited()
+        assert "Нечего отмечать" in _replies(update)[0]
+
+    async def test_a_refusal_from_max_is_reported(self):
+        from app.tg_handler import _cmd_read
+
+        update, ctx = self._update(), self._ctx(read_ok=False)
+
+        await _cmd_read(update, ctx)
+
+        assert "не принял" in _replies(update)[-1]
+
+    async def test_outside_a_topic_it_says_so(self):
+        from app.tg_handler import _cmd_read
+
+        update = _make_update("/read")
+        update.message.message_thread_id = None
+        ctx = self._ctx()
+
+        await _cmd_read(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].read_message.assert_not_awaited()
+        assert "внутри топика" in _replies(update)[0]
+
+    async def test_a_topic_bound_to_nothing_is_refused(self):
+        from app.tg_handler import _cmd_read
+
+        update, ctx = self._update(), self._ctx(bound=False)
+
+        await _cmd_read(update, ctx)
+
+        ctx.bot_data[MAX_CLIENT_KEY].read_message.assert_not_awaited()
+
+    def test_help_mentions_it(self):
+        from app.tg_handler import HELP_TEXT
+
+        assert "/read" in HELP_TEXT
+
+
 class TestHelpMentionsTheReactions:
     """The two reactions are the only status the bridge shows in a topic,
     and neither is self-explanatory — /help has to say which is which, and

@@ -1253,6 +1253,10 @@ HELP_TEXT = (
     "сообщения этого чата (сколько — <code>MAX_BACKFILL_LIMIT</code>). "
     "Работает, только если включена <code>MAX_BACKFILL</code>; уже "
     "пересланное придёт повторно.\n"
+    "• <code>/read</code> — внутри топика: отметить чат прочитанным в MAX, "
+    "не отвечая в нём. Telegram не сообщает боту, что ты прочитал "
+    "переписку, поэтому обычно отметка уходит только вместе с ответом — "
+    "эта команда делает то же самое отдельно.\n"
     "• <code>/del</code> — удалить текущий топик и связь с MAX-чатом "
     "(спросит подтверждение). В самом MAX ничего не меняется. Можно и не "
     "заходя в топик: <code>/del 144</code> — по номеру топика или по id "
@@ -1858,6 +1862,60 @@ async def _cmd_catchup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def _cmd_read(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark this topic's MAX chat read, without replying to it.
+
+    Telegram gives a bot no way to know you have read anything — there is
+    no such event — so until now the only thing that moved the MAX read
+    marker was a reply going the other way. Read a conversation in
+    Telegram and answer later (or not at all), and the person on the MAX
+    side kept seeing it as unread. This is that missing gesture, made
+    explicit: one command, same effect as opening the chat in a MAX
+    client.
+    """
+    target = _resolve_topic_target(update, context)
+    message = update.message
+    if message is None:
+        return
+    _log_command(update, "read")
+    if not target:
+        await message.reply_text(
+            "Команда работает только внутри топика, связанного с чатом MAX."
+        )
+        return
+    _, max_chat_id, max_client = target
+    if not max_client:
+        await message.reply_text("⚠️ Max клиент не подключён.")
+        return
+
+    last_id = max_client.last_message_ids.get(max_chat_id)
+    if not last_id:
+        # Nothing has arrived from this chat since the bridge last knew of
+        # it, so there is no message to mark the chat read up to — the
+        # marker addresses a message id, not a chat.
+        await message.reply_text(
+            f"Нечего отмечать: из {_max_chat_label(context, max_chat_id)} "
+            "пока не приходило ни одного сообщения, о котором знает мост.",
+            parse_mode="HTML",
+        )
+        return
+
+    ok = await max_client.read_message(max_chat_id, last_id)
+    if ok:
+        log.info("Marked MAX chat_id=%s as read up to message_id=%s (/read)",
+                 max_chat_id, last_id)
+        await message.reply_text(
+            f"Отметил {_max_chat_label(context, max_chat_id)} прочитанным "
+            "в MAX.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.reply_text(
+            "⚠️ MAX не принял отметку «прочитано» — чат там остался "
+            "непрочитанным."
+        )
+
+
 async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show profile of the Max peer linked to the current topic."""
     target = _resolve_topic_target(update, context)
@@ -2044,6 +2102,7 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
     app.add_handler(CommandHandler("intro", _cmd_intro, filters=chat_filter))
     app.add_handler(CommandHandler("catchup", _cmd_catchup, filters=chat_filter))
+    app.add_handler(CommandHandler("read", _cmd_read, filters=chat_filter))
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))
     app.add_handler(CommandHandler("del_max", _cmd_del_max, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
