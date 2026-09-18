@@ -3,13 +3,26 @@ import io
 import logging
 
 from telegram import Bot, InputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo
-from telegram.constants import ParseMode
-from telegram.error import InvalidToken, NetworkError, RetryAfter, TimedOut
+from telegram.constants import ParseMode, ReactionEmoji
+from telegram.error import BadRequest, InvalidToken, NetworkError, RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
 
 from app.topics import TopicStore
 
 log = logging.getLogger(__name__)
+
+# Reactions the bridge puts on Telegram messages: one confirming MAX
+# accepted a reply sent from a topic, one mirroring "the other side read
+# this" back from a MAX read marker. Both must come from Telegram's own
+# fixed set (telegram.constants.ReactionEmoji) — a bot cannot invent one.
+# ✅ stood in the read slot for a long time and never once worked: it is
+# not in that set, python-telegram-bot therefore sent it as a custom-emoji
+# id, and Telegram answered BadRequest ("custom_emoji_id must be a valid
+# number") every time, invisibly, because the failure was logged at debug
+# level.
+DELIVERED_REACTION = "🕊"
+READ_RECEIPT_REACTION = "👀"
+_ALLOWED_REACTIONS = frozenset(e.value for e in ReactionEmoji)
 
 TG_MAX_LENGTH = 4096
 TG_CAPTION_MAX = 1024
@@ -153,9 +166,9 @@ class TelegramSender:
     async def set_reaction(self, chat_id: str | int, message_id: int, emoji: str) -> bool:
         """Best-effort: put a single emoji reaction on a Telegram message.
 
-        Used to mirror a MAX "read" event (✅) onto the last message we
+        Used to mirror a MAX "read" event onto the last message we
         forwarded into that chat's topic — matching the existing pattern
-        where a Telegram→MAX reply gets a 👀 reaction once MAX confirms
+        where a Telegram→MAX reply gets a delivery reaction once MAX confirms
         delivery. Returns False on any failure — e.g. the message is too
         old for Telegram to accept a reaction on, or the bot lacks
         permission — since a missed reaction shouldn't be treated as a
@@ -165,12 +178,34 @@ class TelegramSender:
 
         Goes through the same ``_retry`` as every other Telegram call. It
         used to hit the API once: a single connect timeout on the proxy —
-        the ordinary way this bridge's network misbehaves — dropped the ✅
-        for good, with the read marker never repeated to try again.
+        the ordinary way this bridge's network misbehaves — dropped the
+        reaction for good, and MAX never repeats a read marker.
         """
-        result = await self._retry(lambda: self._bot.set_message_reaction(
-            chat_id=chat_id, message_id=message_id, reaction=emoji,
-        ))
+        if emoji not in _ALLOWED_REACTIONS:
+            # Telegram takes only its own fixed set from a bot;
+            # python-telegram-bot quietly turns anything else into a
+            # custom-emoji id and the API rejects it. Said plainly here,
+            # because as a BadRequest it read like a network problem.
+            log.error(
+                "Telegram does not accept %r as a reaction from a bot — it is "
+                "not in telegram.constants.ReactionEmoji, so the reaction on "
+                "message %s in %s was not attempted",
+                emoji, message_id, chat_id,
+            )
+            return False
+        try:
+            result = await self._retry(
+                lambda: self._bot.set_message_reaction(
+                    chat_id=chat_id, message_id=message_id, reaction=emoji,
+                ),
+                permanent=(BadRequest,),
+            )
+        except BadRequest as exc:
+            # The message is too old, deleted, or the chat forbids this
+            # reaction — repeating changes none of that.
+            log.warning("Telegram refused reaction %r on message %s in %s: %s",
+                        emoji, message_id, chat_id, exc)
+            return False
         if result is None:
             log.warning("Could not set reaction %r on message %s in %s",
                         emoji, message_id, chat_id)
@@ -257,10 +292,16 @@ class TelegramSender:
             return True
         return False
 
-    async def _retry(self, coro_factory):
+    async def _retry(self, coro_factory, permanent: tuple = ()):
+        """``permanent`` names errors that repeating cannot fix — they are
+        re-raised for the caller instead of costing three attempts and
+        three stack traces. Empty by default, so every existing caller
+        keeps retrying exactly as before."""
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 return await coro_factory()
+            except permanent:
+                raise
             except RetryAfter as e:
                 log.warning("Telegram rate limit, retry after %ss", e.retry_after)
                 await asyncio.sleep(e.retry_after)

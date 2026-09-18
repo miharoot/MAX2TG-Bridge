@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from app.pymax_client import MaxMessage, MaxReactionEvent, MaxReadEvent
 from app.max_listener import configure_pymax_client
+from app.tg_sender import READ_RECEIPT_REACTION
 from app.outbox import Outbox
 
 
@@ -93,7 +94,7 @@ class TestReadEventForwarding:
 
         await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
 
-        sender.set_reaction.assert_called_once_with("-100999", 42, "✅")
+        sender.set_reaction.assert_called_once_with("-100999", 42, READ_RECEIPT_REACTION)
 
     async def test_ignores_own_read_marker_moving(self):
         """When YOU read the chat (e.g. on your phone), user_id == my_id —
@@ -129,7 +130,7 @@ class TestReadEventForwarding:
 
         await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id="26619816", mark=123))
 
-        sender.set_reaction.assert_awaited_once_with("-100999", 42, "✅")
+        sender.set_reaction.assert_awaited_once_with("-100999", 42, READ_RECEIPT_REACTION)
 
     async def test_the_anchor_survives_a_restart(self):
         """A read marker usually arrives long after the message it covers,
@@ -152,7 +153,7 @@ class TestReadEventForwarding:
 
         await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
 
-        sender.set_reaction.assert_awaited_once_with("-10000000000001", 42, "✅")
+        sender.set_reaction.assert_awaited_once_with("-10000000000001", 42, READ_RECEIPT_REACTION)
         await box.close()
 
     async def test_a_live_anchor_is_not_overwritten_by_the_stored_one(self):
@@ -173,7 +174,7 @@ class TestReadEventForwarding:
 
         await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
 
-        sender.set_reaction.assert_awaited_once_with("-10000000000001", 99, "✅")
+        sender.set_reaction.assert_awaited_once_with("-10000000000001", 99, READ_RECEIPT_REACTION)
         await box.close()
 
     async def test_the_message_id_for_a_reply_survives_a_restart(self):
@@ -274,7 +275,7 @@ class TestReadEventForwarding:
 
         await client._on_read_cb(MaxReadEvent(chat_id=-200, user_id=2, mark=1))
 
-        sender.set_reaction.assert_called_once_with("-100999", 99, "✅")
+        sender.set_reaction.assert_called_once_with("-100999", 99, READ_RECEIPT_REACTION)
 
     async def test_reacts_on_album_when_the_album_was_the_last_message(self):
         """Regression test: forwarding a message whose attachments went
@@ -293,7 +294,7 @@ class TestReadEventForwarding:
 
         await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
 
-        sender.set_reaction.assert_called_once_with("-100999", 77, "✅")
+        sender.set_reaction.assert_called_once_with("-100999", 77, READ_RECEIPT_REACTION)
 
     async def test_reacts_on_single_attachment_not_grouped_into_an_album(self):
         """A single (non-groupable) attachment goes through the
@@ -317,7 +318,7 @@ class TestReadEventForwarding:
 
         await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
 
-        sender.set_reaction.assert_called_once_with("-100999", 88, "✅")
+        sender.set_reaction.assert_called_once_with("-100999", 88, READ_RECEIPT_REACTION)
 
 
 class TestReactionEventForwarding:

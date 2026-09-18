@@ -163,10 +163,11 @@ class Outbox:
                     """
                 )
                 # The Telegram message a MAX read marker should land its
-                # ✅ on: the last thing that appeared in that chat's topic,
+                # read receipt on: the last thing that appeared in that
+                # chat's topic,
                 # whichever side put it there. In the database because the
                 # peer usually reads minutes or hours later, often past a
-                # restart — kept only in memory, the ✅ had nothing to
+                # restart — kept only in memory, the reaction had nothing to
                 # attach to and was silently dropped.
                 await conn.execute(
                     """
@@ -184,7 +185,7 @@ class Outbox:
 
     async def set_last_tg_message(self, chat_id: Any, tg_chat_id: Any,
                                   tg_message_id: Any) -> None:
-        """Remember where a ✅ for this MAX chat should go."""
+        """Remember where a read receipt for this MAX chat should go."""
         if tg_message_id is None or tg_chat_id is None:
             return
         conn = await self._get_conn()

@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.tg_sender import TelegramSender
+from app.tg_sender import READ_RECEIPT_REACTION, TelegramSender
 from app.topics import TopicStore
 
 DEFAULT = "-100999"
@@ -209,18 +209,18 @@ class TestSetReaction:
         sender, _ = _sender(tmp_path)
         sender._bot.set_message_reaction = AsyncMock()
 
-        ok = await sender.set_reaction(chat_id="-100999", message_id=42, emoji="✅")
+        ok = await sender.set_reaction(chat_id="-100999", message_id=42, emoji=READ_RECEIPT_REACTION)
 
         assert ok is True
         sender._bot.set_message_reaction.assert_awaited_once_with(
-            chat_id="-100999", message_id=42, reaction="✅",
+            chat_id="-100999", message_id=42, reaction=READ_RECEIPT_REACTION,
         )
 
     async def test_returns_false_on_failure_without_raising(self, tmp_path):
         sender, _ = _sender(tmp_path)
         sender._bot.set_message_reaction = AsyncMock(side_effect=RuntimeError("too old"))
 
-        ok = await sender.set_reaction(chat_id="-100999", message_id=42, emoji="✅")
+        ok = await sender.set_reaction(chat_id="-100999", message_id=42, emoji=READ_RECEIPT_REACTION)
 
         assert ok is False
 
@@ -368,7 +368,7 @@ class TestSetReaction:
         monkeypatch.setattr("app.tg_sender.asyncio.sleep", AsyncMock())
         sender._bot.set_message_reaction = AsyncMock(side_effect=[TimedOut(), True])
 
-        assert await sender.set_reaction(DEFAULT, 42, "✅") is True
+        assert await sender.set_reaction(DEFAULT, 42, READ_RECEIPT_REACTION) is True
         assert sender._bot.set_message_reaction.await_count == 2
 
     async def test_it_gives_up_after_the_last_attempt(self, tmp_path, monkeypatch):
@@ -378,11 +378,46 @@ class TestSetReaction:
         monkeypatch.setattr("app.tg_sender.asyncio.sleep", AsyncMock())
         sender._bot.set_message_reaction = AsyncMock(side_effect=TimedOut())
 
-        assert await sender.set_reaction(DEFAULT, 42, "✅") is False
+        assert await sender.set_reaction(DEFAULT, 42, READ_RECEIPT_REACTION) is False
 
     async def test_a_single_call_is_enough_when_telegram_answers(self, tmp_path):
         sender, _ = _sender(tmp_path)
         sender._bot.set_message_reaction = AsyncMock(return_value=True)
 
-        assert await sender.set_reaction(DEFAULT, 42, "✅") is True
+        assert await sender.set_reaction(DEFAULT, 42, READ_RECEIPT_REACTION) is True
+        sender._bot.set_message_reaction.assert_awaited_once()
+
+
+class TestReactionEmojiIsOneTelegramAccepts:
+    """A bot may only use Telegram's own fixed set. ✅ is not in it, and
+    for a long time every read receipt was rejected with a BadRequest that
+    the log never showed."""
+
+    async def test_an_emoji_outside_the_set_is_not_even_attempted(self, tmp_path):
+        sender, _ = _sender(tmp_path)
+        sender._bot.set_message_reaction = AsyncMock()
+
+        assert await sender.set_reaction(DEFAULT, 42, "✅") is False
+        sender._bot.set_message_reaction.assert_not_awaited()
+
+    async def test_both_reactions_the_bridge_uses_are_in_the_set(self):
+        from telegram.constants import ReactionEmoji
+
+        from app.tg_sender import DELIVERED_REACTION
+
+        allowed = {e.value for e in ReactionEmoji}
+        assert DELIVERED_REACTION in allowed
+        assert READ_RECEIPT_REACTION in allowed
+
+    async def test_a_refusal_from_telegram_is_not_repeated(self, tmp_path, monkeypatch):
+        """BadRequest means the message is gone, too old, or the chat
+        forbids it — three attempts change none of that."""
+        from telegram.error import BadRequest
+
+        sender, _ = _sender(tmp_path)
+        monkeypatch.setattr("app.tg_sender.asyncio.sleep", AsyncMock())
+        sender._bot.set_message_reaction = AsyncMock(
+            side_effect=BadRequest("MESSAGE_ID_INVALID"))
+
+        assert await sender.set_reaction(DEFAULT, 42, READ_RECEIPT_REACTION) is False
         sender._bot.set_message_reaction.assert_awaited_once()

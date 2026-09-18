@@ -11,7 +11,7 @@ from app.config import Settings
 from app.outbox import Outbox
 from app.pymax_client import MaxMessage, MaxReactionEvent, MaxReadEvent, PyMaxClient
 from app.resolver import SAVED_MESSAGES_TITLE, ContactResolver
-from app.tg_sender import TelegramSender
+from app.tg_sender import READ_RECEIPT_REACTION, TelegramSender
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +108,7 @@ async def _try_send_media_group(
     """Group compatible MAX attachments into one Telegram album.
 
     Returns the sent Telegram ``Message`` on success (so callers can track
-    it the same way as any other forwarded message, for ✅ read-receipt
+    it the same way as any other forwarded message, for read-receipt
     mirroring), ``False`` if we had everything downloaded but Telegram
     itself failed to send the album, or ``None`` if grouping wasn't
     attempted at all (fewer than 2 attaches, unsupported mix of types, or
@@ -565,8 +565,8 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
     _disconnect_notice_pending = False
     # The most recent Telegram message in each Max chat's topic:
     # max_chat_id -> (tg_chat_id, tg_message_id). Used to mirror MAX "read"
-    # events as a ✅ reaction on that message (see @client.on_read below) —
-    # same idea as the existing 👀 reaction already put on Telegram→MAX
+    # events as a reaction on that message (see @client.on_read below) —
+    # same idea as the delivery reaction already put on Telegram→MAX
     # replies once MAX confirms delivery. Lives on the client rather than
     # in this closure because the reply side (app/tg_handler.py) records
     # into it too, and because it is restored from the outbox at startup.
@@ -613,7 +613,8 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         Both halves used to live only in memory, and both are consulted
         long after the message they point at: the id a reply marks the MAX
         chat read up to, and the Telegram message a MAX read marker ticks
-        with ✅. After a restart a reply marked nothing and an arriving
+        with a reaction. After a restart a reply marked nothing and an
+        arriving
         read marker had nothing to tick — the two symptoms this restores.
 
         Never overwrites what this run already knows: a live message that
@@ -723,15 +724,15 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
 
     @client.on_read
     async def handle_read(event: MaxReadEvent):
-        """Mirror a MAX read-marker move as a ✅ reaction on the last
+        """Mirror a MAX read-marker move as a reaction on the last
         message we forwarded into that chat's topic. Ignored when it's our
         own read marker moving (e.g. you read the chat on your phone) —
         only the *other* side reading is interesting to see in Telegram.
 
         Every step says what it did in the log: until this was here, a
         read marker that never arrived, one skipped as ours, one with no
-        message to pin the ✅ to and one Telegram refused all looked the
-        same from outside — nothing in the log at all.
+        message to pin the reaction to and one Telegram refused all looked
+        the same from outside — nothing in the log at all.
         """
         log.info(
             "MAX read event: chat=%s user=%s mark=%s set_as_unread=%s my_id=%s",
@@ -739,28 +740,30 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             event.set_as_unread, client.my_id,
         )
         if event.set_as_unread:
-            log.info("MAX read event: chat=%s marked UNREAD — no ✅", event.chat_id)
+            log.info("MAX read event: chat=%s marked UNREAD — no reaction",
+                     event.chat_id)
             return
         # Compared as strings: MAX ids travel as ints in some payloads and
         # as strings in others, and a type mismatch here fails open — the
-        # ✅ would then be posted for your *own* read marker moving, which
-        # reads in Telegram as "they read it" when nobody has.
+        # reaction would then be posted for your *own* read marker moving,
+        # which reads in Telegram as "they read it" when nobody has.
         if client.my_id is not None and str(event.user_id) == str(client.my_id):
-            log.info("MAX read event: chat=%s is our own read marker — no ✅",
+            log.info("MAX read event: chat=%s is our own read marker — no reaction",
                      event.chat_id)
             return
         last = client.last_tg_message.get(event.chat_id)
         if last is None:
             log.info(
                 "MAX read event: chat=%s has no forwarded Telegram message to "
-                "mark (known: %s) — no ✅",
+                "mark (known: %s) — no reaction",
                 event.chat_id, sorted(map(str, client.last_tg_message)) or "нет",
             )
             return
         tg_chat_id, tg_message_id = last
-        ok = await sender.set_reaction(tg_chat_id, tg_message_id, "✅")
-        log.info("MAX read event: chat=%s → ✅ on Telegram message %s in %s: %s",
-                 event.chat_id, tg_message_id, tg_chat_id,
+        ok = await sender.set_reaction(tg_chat_id, tg_message_id,
+                                       READ_RECEIPT_REACTION)
+        log.info("MAX read event: chat=%s → %s on Telegram message %s in %s: %s",
+                 event.chat_id, READ_RECEIPT_REACTION, tg_message_id, tg_chat_id,
                  "поставлена" if ok else "НЕ поставлена")
 
     @client.on_reaction

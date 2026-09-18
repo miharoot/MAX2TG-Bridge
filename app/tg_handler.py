@@ -24,6 +24,7 @@ from app import outbox
 from app.outbox import PermanentDeliveryFailure
 from app.pymax_client import PyMaxClient, _normalized_phone
 from app.resolver import SAVED_MESSAGES_TITLE
+from app.tg_sender import DELIVERED_REACTION
 from app.topics import TopicStore
 
 log = logging.getLogger(__name__)
@@ -241,19 +242,21 @@ async def _surface_send_result(resp, *, bot, tg_chat_id, tg_message_id, notify,
     if tg_message_id is not None:
         try:
             await bot.set_message_reaction(chat_id=tg_chat_id, message_id=tg_message_id,
-                                            reaction="👀")
+                                            reaction=DELIVERED_REACTION)
         except Exception:
             log.warning(
-                "Could not set 👀 reaction on confirmed message (chat=%s, message_id=%s): "
-                "likely missing permission or an unsupported reaction for this chat",
-                tg_chat_id, tg_message_id, exc_info=True,
+                "Could not set the %s delivery reaction on confirmed message "
+                "(chat=%s, message_id=%s): likely missing permission or an "
+                "unsupported reaction for this chat",
+                DELIVERED_REACTION, tg_chat_id, tg_message_id, exc_info=True,
             )
 
     if max_client is not None and max_chat_id is not None:
         # Your own reply is now the last thing in the topic, so a read
-        # marker coming back from MAX belongs on it — before this, the ✅
-        # went on the last message the *other* side had sent, or nowhere
-        # at all when they had not sent one since the last restart.
+        # marker coming back from MAX belongs on it — before this, the
+        # read receipt went on the last message the *other* side had sent,
+        # or nowhere at all when they had not sent one since the last
+        # restart.
         await max_client.remember_tg_anchor(max_chat_id, tg_chat_id, tg_message_id)
         last_id = max_client.last_message_ids.get(max_chat_id)
         if last_id:

@@ -947,7 +947,7 @@ class PyMaxClient:
         self._outbound_cids: OrderedDict[tuple[Any, str], float] = OrderedDict()
         self.resolver = None
         self.last_message_ids: dict[Any, str] = {}
-        # Where a ✅ for a MAX chat goes: the last Telegram message in that
+        # Where a read receipt for a MAX chat goes: the last Telegram message
         # chat's topic, from either side — a message forwarded from MAX or
         # a reply typed in Telegram. Seeded from the outbox at startup (see
         # max_listener), so a read marker arriving after a restart still
@@ -1205,12 +1205,12 @@ class PyMaxClient:
         return _model_dict(message) or {"ok": True}
 
     async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id) -> None:
-        """Record the Telegram message a later MAX read marker should tick.
+        """Record the Telegram message a later MAX read marker reacts to.
 
         Both directions call this — a MAX message forwarded into the topic
         (app/max_listener.py) and a reply sent from it (app/tg_handler.py)
-        — so the ✅ lands on whatever was said last, not on the last thing
-        the other side happened to send.
+        — so the read receipt lands on whatever was said last, not on the
+        last thing the other side happened to send.
         """
         if tg_message_id is None or tg_chat_id is None:
             return
@@ -1222,9 +1222,9 @@ class PyMaxClient:
             await box.set_last_tg_message(max_chat_id, tg_chat_id, tg_message_id)
         except Exception:
             # The in-memory half still works for this run; losing the
-            # persisted half only costs a ✅ after the next restart.
+            # persisted half only costs a read receipt after the next restart.
             log.exception(
-                "Could not persist the ✅ anchor for MAX chat %s (Telegram "
+                "Could not persist the read-receipt anchor for MAX chat %s (Telegram "
                 "message %s in %s)", max_chat_id, tg_message_id, tg_chat_id,
             )
 
