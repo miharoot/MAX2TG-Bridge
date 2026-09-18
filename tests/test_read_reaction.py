@@ -119,6 +119,67 @@ class TestReadEventForwarding:
 
         sender.set_reaction.assert_awaited_once_with("-100999", 42, "✅")
 
+    async def test_every_read_event_is_logged(self, caplog):
+        """The log is the only way to tell "MAX never sent a read marker"
+        apart from "it arrived and we dropped it" — so every event says
+        so, with the ids needed to see which branch took it."""
+        client, sender = _make_client(my_id=1)
+        sender.set_reaction = AsyncMock()
+
+        with caplog.at_level("INFO", logger="app.max_listener"):
+            await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
+
+        assert "MAX read event" in caplog.text
+        assert "chat=-100" in caplog.text
+
+    async def test_a_missing_anchor_says_so(self):
+        """Nothing forwarded into that topic yet in this process, so there
+        is no message to put the ✅ on — the single most common reason a
+        read marker looks lost."""
+        client, sender = _make_client(my_id=1)
+        sender.set_reaction = AsyncMock()
+
+        with _capture("app.max_listener") as records:
+            await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
+
+        assert any("no forwarded Telegram message" in r for r in records)
+
+    async def test_a_refused_reaction_is_logged(self):
+        """Telegram can refuse the reaction (message too old, no rights).
+        Silently returning False made that indistinguishable from an event
+        that never arrived."""
+        client, sender = _make_client(my_id=1)
+        sender.set_reaction = AsyncMock(return_value=False)
+        await _forward_simple_text(client, sender, chat_id=-100,
+                                   tg_chat_id="-100999", tg_message_id=42)
+
+        with _capture("app.max_listener") as records:
+            await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
+
+        assert any("НЕ поставлена" in r for r in records)
+
+    async def test_a_successful_reaction_is_logged(self):
+        client, sender = _make_client(my_id=1)
+        sender.set_reaction = AsyncMock(return_value=True)
+        await _forward_simple_text(client, sender, chat_id=-100,
+                                   tg_chat_id="-100999", tg_message_id=42)
+
+        with _capture("app.max_listener") as records:
+            await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=2, mark=123))
+
+        assert any("поставлена" in r for r in records)
+
+    async def test_our_own_read_marker_says_why_it_was_skipped(self):
+        client, sender = _make_client(my_id=1)
+        sender.set_reaction = AsyncMock()
+        await _forward_simple_text(client, sender, chat_id=-100,
+                                   tg_chat_id="-100999", tg_message_id=42)
+
+        with _capture("app.max_listener") as records:
+            await client._on_read_cb(MaxReadEvent(chat_id=-100, user_id=1, mark=123))
+
+        assert any("our own read marker" in r for r in records)
+
     async def test_ignores_set_as_unread(self):
         client, sender = _make_client(my_id=1)
         sender.set_reaction = AsyncMock()
@@ -271,3 +332,30 @@ async def _forward_media_group(client, sender, chat_id, tg_chat_id, album_messag
         ],
     )
     await client._on_message_cb(msg)
+
+
+class _capture:
+    """Collect formatted records from one logger, whatever the root level
+    is — caplog's propagation handling differs between pytest versions and
+    these assertions are about our own logger only."""
+
+    def __init__(self, name):
+        import logging
+
+        self._logger = logging.getLogger(name)
+        self._records: list[str] = []
+        self._handler = logging.Handler()
+        self._handler.emit = lambda record: self._records.append(record.getMessage())
+        self._old_level = self._logger.level
+
+    def __enter__(self):
+        import logging
+
+        self._logger.setLevel(logging.INFO)
+        self._logger.addHandler(self._handler)
+        return self._records
+
+    def __exit__(self, *exc):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._old_level)
+        return False

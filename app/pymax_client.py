@@ -1062,6 +1062,12 @@ class PyMaxClient:
 
         @self._client.on_message_read()
         async def _handle_message_read(event, pymax_client):
+            # Logged before the mapping, and with the raw payload keys, so
+            # the log answers both "did MAX send a read marker at all" and
+            # "does this build read the right fields out of it" — the
+            # mapped MaxReadEvent alone cannot tell those two apart.
+            log.info("PyMax read marker: %s (raw keys: %s)",
+                     _model_dict(event), sorted(_model_dict(event)))
             if self._on_read_cb:
                 await self._on_read_cb(MaxReadEvent(
                     chat_id=getattr(event, "chat_id", None),

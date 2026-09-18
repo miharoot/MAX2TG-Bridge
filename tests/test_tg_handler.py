@@ -813,3 +813,83 @@ class TestDownloadTgFile:
 
         assert data == b"ok"
         assert file_obj.get_file.await_count == 2
+
+
+class TestReadMarkerLogging:
+    """Why no "прочитано" appeared on the MAX side. Before these lines the
+    quiet cases — no message id known yet, MAX refusing the marker — left
+    nothing in the log at all, which reads the same as a marker that was
+    never attempted."""
+
+    def _args(self, **overrides):
+        args = dict(bot=MagicMock(), tg_chat_id=DEFAULT_TG_CHAT_ID,
+                    tg_message_id=None, notify=AsyncMock())
+        args.update(overrides)
+        return args
+
+    async def test_a_chat_with_no_known_message_id_says_so(self):
+        from app.tg_handler import _surface_send_result
+
+        max_client = MagicMock()
+        max_client.last_message_ids = {}
+        max_client.read_message = AsyncMock()
+
+        with _capture_tg_handler() as records:
+            ok = await _surface_send_result(
+                {"id": 1}, max_client=max_client, max_chat_id=-42, **self._args())
+
+        assert ok is True
+        max_client.read_message.assert_not_awaited()
+        assert any("no message id known yet" in r for r in records)
+
+    async def test_a_refused_marker_is_logged(self):
+        from app.tg_handler import _surface_send_result
+
+        max_client = MagicMock()
+        max_client.last_message_ids = {-42: "m1"}
+        max_client.read_message = AsyncMock(return_value=False)
+
+        with _capture_tg_handler() as records:
+            await _surface_send_result(
+                {"id": 1}, max_client=max_client, max_chat_id=-42, **self._args())
+
+        assert any("MAX refused the read marker" in r for r in records)
+
+    async def test_a_sent_marker_is_still_logged(self):
+        from app.tg_handler import _surface_send_result
+
+        max_client = MagicMock()
+        max_client.last_message_ids = {-42: "m1"}
+        max_client.read_message = AsyncMock(return_value=True)
+
+        with _capture_tg_handler() as records:
+            await _surface_send_result(
+                {"id": 1}, max_client=max_client, max_chat_id=-42, **self._args())
+
+        max_client.read_message.assert_awaited_once_with(-42, "m1")
+        assert any("as read up to message_id=m1" in r for r in records)
+
+
+class _capture_tg_handler:
+    """Collect app.tg_handler records regardless of the root log level."""
+
+    def __init__(self):
+        import logging
+
+        self._logger = logging.getLogger("app.tg_handler")
+        self._records: list[str] = []
+        self._handler = logging.Handler()
+        self._handler.emit = lambda record: self._records.append(record.getMessage())
+        self._old_level = self._logger.level
+
+    def __enter__(self):
+        import logging
+
+        self._logger.setLevel(logging.INFO)
+        self._logger.addHandler(self._handler)
+        return self._records
+
+    def __exit__(self, *exc):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._old_level)
+        return False

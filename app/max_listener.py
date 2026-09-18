@@ -699,20 +699,42 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         """Mirror a MAX read-marker move as a ✅ reaction on the last
         message we forwarded into that chat's topic. Ignored when it's our
         own read marker moving (e.g. you read the chat on your phone) —
-        only the *other* side reading is interesting to see in Telegram."""
+        only the *other* side reading is interesting to see in Telegram.
+
+        Every step says what it did in the log: until this was here, a
+        read marker that never arrived, one skipped as ours, one with no
+        message to pin the ✅ to and one Telegram refused all looked the
+        same from outside — nothing in the log at all.
+        """
+        log.info(
+            "MAX read event: chat=%s user=%s mark=%s set_as_unread=%s my_id=%s",
+            event.chat_id, event.user_id, event.mark,
+            event.set_as_unread, client.my_id,
+        )
         if event.set_as_unread:
+            log.info("MAX read event: chat=%s marked UNREAD — no ✅", event.chat_id)
             return
         # Compared as strings: MAX ids travel as ints in some payloads and
         # as strings in others, and a type mismatch here fails open — the
         # ✅ would then be posted for your *own* read marker moving, which
         # reads in Telegram as "they read it" when nobody has.
         if client.my_id is not None and str(event.user_id) == str(client.my_id):
+            log.info("MAX read event: chat=%s is our own read marker — no ✅",
+                     event.chat_id)
             return
         last = _last_tg_message.get(event.chat_id)
         if last is None:
+            log.info(
+                "MAX read event: chat=%s has no forwarded Telegram message to "
+                "mark (known: %s) — no ✅",
+                event.chat_id, sorted(map(str, _last_tg_message)) or "нет",
+            )
             return
         tg_chat_id, tg_message_id = last
-        await sender.set_reaction(tg_chat_id, tg_message_id, "✅")
+        ok = await sender.set_reaction(tg_chat_id, tg_message_id, "✅")
+        log.info("MAX read event: chat=%s → ✅ on Telegram message %s in %s: %s",
+                 event.chat_id, tg_message_id, tg_chat_id,
+                 "поставлена" if ok else "НЕ поставлена")
 
     @client.on_reaction
     async def handle_reaction(event: MaxReactionEvent):

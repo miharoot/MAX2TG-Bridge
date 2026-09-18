@@ -258,6 +258,27 @@ async def _surface_send_result(resp, *, bot, tg_chat_id, tg_message_id, notify,
                     "Marked MAX chat_id=%s as read up to message_id=%s (reply in topic)",
                     max_chat_id, last_id,
                 )
+            else:
+                log.warning(
+                    "MAX refused the read marker for chat_id=%s up to "
+                    "message_id=%s — chat stays unread on the MAX side",
+                    max_chat_id, last_id,
+                )
+        else:
+            # last_message_ids only fills from live incoming messages and
+            # lives in memory, so a chat that has been quiet since the
+            # process started has nothing to mark. Said out loud, because
+            # the silent version of this looks exactly like a read marker
+            # that was sent and ignored.
+            log.info(
+                "No read marker for MAX chat_id=%s: no message id known yet "
+                "in this process (known for chats: %s)",
+                max_chat_id,
+                sorted(map(str, max_client.last_message_ids)) or "нет",
+            )
+    else:
+        log.info("No read marker sent: max_client=%s max_chat_id=%s",
+                 "есть" if max_client is not None else "нет", max_chat_id)
     return True
 
 

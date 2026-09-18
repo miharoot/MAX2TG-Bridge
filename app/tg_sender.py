@@ -156,10 +156,12 @@ class TelegramSender:
         Used to mirror a MAX "read" event (✅) onto the last message we
         forwarded into that chat's topic — matching the existing pattern
         where a Telegram→MAX reply gets a 👀 reaction once MAX confirms
-        delivery. Returns False (and logs at debug level) on any failure —
-        e.g. the message is too old for Telegram to accept a reaction on,
-        or the bot lacks permission — since a missed reaction shouldn't be
-        treated as a hard error.
+        delivery. Returns False on any failure — e.g. the message is too
+        old for Telegram to accept a reaction on, or the bot lacks
+        permission — since a missed reaction shouldn't be treated as a
+        hard error. The failure is logged at warning level: at debug it
+        was invisible in the normal log, so a reaction Telegram refused
+        looked exactly like a read marker that never arrived.
         """
         try:
             await self._bot.set_message_reaction(
@@ -167,8 +169,8 @@ class TelegramSender:
             )
             return True
         except Exception:
-            log.debug("Could not set reaction %r on message %s in %s",
-                     emoji, message_id, chat_id, exc_info=True)
+            log.warning("Could not set reaction %r on message %s in %s",
+                        emoji, message_id, chat_id, exc_info=True)
             return False
 
     # ── forum topics ───────────────────────────────────────────────
