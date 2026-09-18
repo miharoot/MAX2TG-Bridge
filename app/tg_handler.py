@@ -24,7 +24,7 @@ from app import outbox
 from app.outbox import PermanentDeliveryFailure
 from app.pymax_client import PyMaxClient, _normalized_phone
 from app.resolver import SAVED_MESSAGES_TITLE
-from app.tg_sender import DELIVERED_REACTION
+from app.tg_sender import DELIVERED_REACTION, READ_RECEIPT_REACTION
 from app.topics import TopicStore
 
 log = logging.getLogger(__name__)
@@ -1273,6 +1273,11 @@ HELP_TEXT = (
     "Учти: Telegram не сообщает боту, когда ты именно <i>прочитал</i> "
     "сообщение (такого события у ботов нет) — отметка ставится по "
     "факту ответа, а не по факту открытия топика.\n\n"
+    "Что означают реакции, которые бот ставит в топике:\n"
+    "• " + DELIVERED_REACTION + " — MAX принял твоё сообщение из топика "
+    "(появляется на нём самом сразу после доставки).\n"
+    "• " + READ_RECEIPT_REACTION + " — собеседник прочитал переписку в "
+    "MAX; ставится на последнее сообщение топика.\n\n"
     "Если кто-то новый пишет тебе в MAX — топик создастся автоматически "
     "и в нём сразу появится карточка собеседника.\n\n"
     "«Избранное» (чат с самим собой в MAX) — обычный чат в этом списке: "

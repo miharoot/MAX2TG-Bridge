@@ -984,3 +984,19 @@ class TestListRefreshesFromMax:
         await _cmd_list(update, ctx)
 
         assert -10000000000003 in resolver.chats_raw
+
+
+class TestHelpMentionsTheReactions:
+    """The two reactions are the only status the bridge shows in a topic,
+    and neither is self-explanatory — /help has to say which is which, and
+    say it from the same constants the code reacts with, so a changed
+    emoji cannot leave the help lying."""
+
+    def test_it_explains_both_reactions(self):
+        from app.tg_handler import HELP_TEXT
+        from app.tg_sender import DELIVERED_REACTION, READ_RECEIPT_REACTION
+
+        assert DELIVERED_REACTION in HELP_TEXT
+        assert READ_RECEIPT_REACTION in HELP_TEXT
+        assert "MAX принял" in HELP_TEXT
+        assert "собеседник прочитал" in HELP_TEXT.lower() or "прочитал переписку" in HELP_TEXT
