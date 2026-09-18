@@ -289,6 +289,35 @@ async def test_send_message_delegates_to_pymax(adapter):
     assert resp["id"] == 123
 
 
+async def test_send_message_records_the_id_as_bridge_sent(adapter):
+    """So a catch-up after a reconnect can tell this message apart from
+    one typed by hand in a MAX client and not mirror it back into
+    Telegram."""
+    from app.outbox import Outbox
+
+    client, _ = adapter
+    client.outbox = Outbox(":memory:")
+
+    await client.send_message(20, "hello")
+
+    assert await client.outbox.was_sent_by_bridge(20, 123) is True
+    await client.outbox.close()
+
+
+async def test_send_message_survives_an_unwritable_outbox(adapter):
+    """Losing the send over a bookkeeping failure would be worse than the
+    duplicate it guards against."""
+    from unittest.mock import MagicMock
+
+    client, _ = adapter
+    client.outbox = MagicMock()
+    client.outbox.mark_sent_by_bridge = AsyncMock(side_effect=RuntimeError("disk"))
+
+    resp = await client.send_message(20, "hello")
+
+    assert resp["id"] == 123
+
+
 async def test_read_message_delegates_to_pymax(adapter):
     client, raw = adapter
 

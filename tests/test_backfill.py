@@ -55,6 +55,60 @@ class TestSeenMarks:
         await box.close()
 
 
+class TestSentByBridgeMarks:
+    """MAX message ids the bridge produced itself. A catch-up needs them
+    to tell its own relayed message apart from one typed by hand in a MAX
+    client — history looks identical either way."""
+
+    async def test_a_sent_id_is_remembered(self, tmp_path):
+        box = Outbox(str(tmp_path / "outbox.db"))
+        await box.mark_sent_by_bridge(-42, "msg-1")
+
+        assert await box.was_sent_by_bridge(-42, "msg-1") is True
+        await box.close()
+
+    async def test_an_unknown_id_is_not_ours(self, tmp_path):
+        box = Outbox(str(tmp_path / "outbox.db"))
+        await box.mark_sent_by_bridge(-42, "msg-1")
+
+        assert await box.was_sent_by_bridge(-42, "msg-2") is False
+        assert await box.was_sent_by_bridge(-43, "msg-1") is False
+        await box.close()
+
+    async def test_a_missing_id_is_ignored(self, tmp_path):
+        box = Outbox(str(tmp_path / "outbox.db"))
+        await box.mark_sent_by_bridge(-42, None)
+
+        assert await box.was_sent_by_bridge(-42, None) is False
+        await box.close()
+
+    async def test_the_same_id_can_be_recorded_twice(self, tmp_path):
+        """A redelivery from the outbox retry loop can send the same
+        message again; the second record must not raise."""
+        box = Outbox(str(tmp_path / "outbox.db"))
+        await box.mark_sent_by_bridge(-42, "msg-1")
+        await box.mark_sent_by_bridge(-42, "msg-1")
+
+        assert await box.was_sent_by_bridge(-42, "msg-1") is True
+        await box.close()
+
+    async def test_stale_ids_are_pruned(self, tmp_path):
+        import time as _time
+
+        box = Outbox(str(tmp_path / "outbox.db"))
+        await box.mark_sent_by_bridge(-42, "old")
+        conn = await box._get_conn()
+        await conn.execute("UPDATE sent_by_bridge SET created_at = ?",
+                           (_time.time() - 30 * 24 * 60 * 60,))
+        await conn.commit()
+
+        await box.mark_sent_by_bridge(-42, "new")
+
+        assert await box.was_sent_by_bridge(-42, "old") is False
+        assert await box.was_sent_by_bridge(-42, "new") is True
+        await box.close()
+
+
 class TestFetchRecentMessages:
     def _client(self, raw_messages):
         from app.pymax_client import PyMaxClient
@@ -204,6 +258,42 @@ class TestIngestHistory:
 
     async def test_an_empty_history_forwards_nothing(self):
         client, sender = self._client([])
+
+        assert await client.backfill_chat(-42, 10) == 0
+        sender.send.assert_not_awaited()
+        await client.outbox.close()
+
+    async def test_the_bridge_own_message_is_not_mirrored_back(self):
+        """A Telegram message relayed into MAX comes back in history like
+        any other. Forwarding it put it back into its own topic minutes
+        (or a reconnect) later — the bug this guards."""
+        client, sender = self._client(
+            [self._msg(1, 100, "из телеграма"), self._msg(2, 200, "из макса")])
+        await client.outbox.mark_sent_by_bridge(-42, "1")
+
+        count = await client.backfill_chat(-42, 10)
+
+        assert count == 1
+        assert sender.send.await_count == 1
+        assert "из макса" in sender.send.await_args.args[0]
+        await client.outbox.close()
+
+    async def test_a_skipped_own_message_still_moves_the_mark(self):
+        """Otherwise every reconnect fetches it again, and a chat the
+        bridge is the only one talking in never advances at all."""
+        client, _ = self._client([self._msg(1, 100, "из телеграма")])
+        await client.outbox.mark_sent_by_bridge(-42, "1")
+
+        await client.backfill_chat(-42, 10)
+
+        assert await client.outbox.seen_mark(-42) == 100
+        await client.outbox.close()
+
+    async def test_a_live_echo_is_skipped_too(self):
+        """is_bridge_echo covers a send made by this process before the
+        history copy was ever recorded."""
+        client, sender = self._client([self._msg(1, 100, "из телеграма")])
+        client.is_bridge_echo = lambda msg: True
 
         assert await client.backfill_chat(-42, 10) == 0
         sender.send.assert_not_awaited()

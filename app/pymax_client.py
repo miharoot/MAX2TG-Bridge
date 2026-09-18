@@ -1184,7 +1184,27 @@ class PyMaxClient:
         sent_cid = getattr(message, "cid", None)
         if sent_cid is not None:
             self._mark_outbound_cid(chat_id, sent_cid)
+        # The cid only ever matches the live echo of this send. MAX also
+        # hands the message back in chat history, where it looks exactly
+        # like one typed by hand in a MAX client — so the id goes to the
+        # outbox database, which a catch-up consults (see
+        # max_listener._ingest_history) and which survives a restart.
+        await self._remember_sent_message(chat_id, getattr(message, "id", None))
         return _model_dict(message) or {"ok": True}
+
+    async def _remember_sent_message(self, chat_id, message_id) -> None:
+        box = getattr(self, "outbox", None)
+        if box is None or message_id is None:
+            return
+        try:
+            await box.mark_sent_by_bridge(chat_id, message_id)
+        except Exception:
+            # Worst case a catch-up mirrors this message back into
+            # Telegram once; losing the send over it would be worse.
+            log.exception(
+                "Could not record MAX message %s in chat %s as bridge-sent",
+                message_id, chat_id,
+            )
 
     async def read_message(self, chat_id, message_id) -> bool:
         """Mark the MAX chat as read up to (and including) message_id —

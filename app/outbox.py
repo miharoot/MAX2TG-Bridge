@@ -33,6 +33,10 @@ MAX_TO_TG = "max_to_tg"
 TG_TO_MAX_TEXT = "tg_to_max_text"
 TG_TO_MAX_MEDIA = "tg_to_max_media"
 
+# How long a bridge-sent MAX message id is worth keeping: long enough to
+# outlive any catch-up window, short enough that the table stays small.
+SENT_BY_BRIDGE_TTL_SEC = 7 * 24 * 60 * 60
+
 
 class PermanentDeliveryFailure(Exception):
     """The target refused this message itself, not the attempt.
@@ -142,9 +146,58 @@ class Outbox:
                     )
                     """
                 )
+                # MAX message ids the bridge itself produced (a
+                # Telegram message relayed into MAX). MAX hands them back
+                # in chat history, where nothing else distinguishes them
+                # from a message typed by hand in a MAX client — without
+                # this, a catch-up after a reconnect forwards the
+                # bridge's own messages back into Telegram.
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS sent_by_bridge (
+                        chat_id    TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        PRIMARY KEY (chat_id, message_id)
+                    )
+                    """
+                )
                 await conn.commit()
                 self._conn = conn
         return self._conn
+
+    async def mark_sent_by_bridge(self, chat_id: Any, message_id: Any) -> None:
+        """Remember that this MAX message came from the bridge.
+
+        Kept in the database rather than in memory because the catch-up
+        that needs it runs right after a restart, when any in-process
+        record of what was sent is already gone.
+        """
+        if message_id is None:
+            return
+        conn = await self._get_conn()
+        await conn.execute(
+            "INSERT OR REPLACE INTO sent_by_bridge (chat_id, message_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (str(chat_id), str(message_id), time.time()),
+        )
+        # Only ever consulted for messages recent enough to still show up
+        # in a catch-up, so old rows are dead weight.
+        await conn.execute(
+            "DELETE FROM sent_by_bridge WHERE created_at < ?",
+            (time.time() - SENT_BY_BRIDGE_TTL_SEC,),
+        )
+        await conn.commit()
+
+    async def was_sent_by_bridge(self, chat_id: Any, message_id: Any) -> bool:
+        if message_id is None:
+            return False
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT 1 FROM sent_by_bridge WHERE chat_id = ? AND message_id = ?",
+            (str(chat_id), str(message_id)),
+        ) as cur:
+            return await cur.fetchone() is not None
 
     async def mark_seen(self, chat_id: Any, message_time: Any,
                         message_id: Any = None) -> None:

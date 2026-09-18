@@ -792,9 +792,40 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         if not messages:
             return 0
         log.info("%s: %d messages from MAX chat %s", what, len(messages), chat_id)
+        forwarded = 0
         for msg in messages:
+            # A message the bridge itself relayed into MAX comes back in
+            # history like any other; forwarding it would put a Telegram
+            # message back into its own topic. The seen mark still moves
+            # past it — the messages arrive oldest first, so nothing
+            # unforwarded is jumped over, and the next catch-up starts
+            # after it instead of fetching it again.
+            if await _sent_by_bridge(msg):
+                log.info("%s: skipped the bridge's own message id=%s in MAX chat %s",
+                         what, msg.message_id, chat_id)
+                await client.outbox.mark_seen(msg.chat_id, msg.timestamp, msg.message_id)
+                continue
             await _ingest_max_message(msg)
-        return len(messages)
+            forwarded += 1
+        return forwarded
+
+    async def _sent_by_bridge(msg: MaxMessage) -> bool:
+        """True if the bridge sent this MAX message itself.
+
+        ``is_bridge_echo`` only knows the live echo of a send made by this
+        process; the outbox table also covers a history copy and survives
+        a restart.
+        """
+        if client.is_bridge_echo(msg):
+            return True
+        if not msg.message_id:
+            return False
+        try:
+            return await client.outbox.was_sent_by_bridge(msg.chat_id, msg.message_id)
+        except Exception:
+            log.exception("Could not check whether MAX message %s in chat %s "
+                          "was sent by the bridge", msg.message_id, msg.chat_id)
+            return False
 
     client.backfill_chat = _ingest_history
 
