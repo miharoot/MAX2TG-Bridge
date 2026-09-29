@@ -57,6 +57,7 @@ Read-события (`on_message_read`) и реакции (`on_reaction_update`)
   - `pymax.exceptions.ApiError.__init__` (`_patch_api_error_not_ready_matching`) — обходит баг, из-за которого встроенный retry на `attachment.not.ready` не срабатывал для реальных кодов вида `errors.process.attachment.video.not.ready`.
   - `pymax.dispatch.mapping.EVENT_MAP[Opcode.NOTIF_ATTACH]` (`_patch_voice_ready_resolution`) — обходит баг классификации: уведомление о готовности голосового содержит и `videoId`, и `audioId`, но резолвер проверяет video-сигнал первым и всегда ошибочно принимает голосовое за видео, из-за чего wait в `_process_attachment_error` никогда не резолвится и падает по таймауту (60с).
   Оба патча идемпотентны и безвредны, если апстрим это когда-нибудь починит — можно оставить или убрать.
+- `UploadService.upload_photo` тоже заменён целиком (`_patch_photo_upload_id_lookup`): MAX перестал класть `photoIds` в URL загрузки фото (теперь это просто `…/uploadImage?r=<token>`), а pymax 2.4.1 читает этот параметр до загрузки и падает с `Photo upload URL does not contain photoIds` — фото из Telegram не уходили вовсе. Патч берёт id из URL, если он там есть, а иначе единственную запись из ответа загрузки (`_photo_token_from_response`); несколько записей без id — явная ошибка, а не угадывание. Идемпотентен, остальное — дословная копия апстрима.
 
 ## Git
 
