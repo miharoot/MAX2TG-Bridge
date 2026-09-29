@@ -676,6 +676,131 @@ class _AsyncReturn:
         return self._value
 
 
+class TestPhotoUploadIdPatch:
+    """MAX stopped putting ``photoIds`` in the photo upload URL — it is
+    now just ``…/uploadImage?r=<token>``. pymax reads that parameter
+    before uploading anything, so every photo from Telegram died with
+    "Photo upload URL does not contain photoIds" and the bridge reported
+    it into the topic."""
+
+    class _FakePhoto:
+        name = "image.jpg"
+
+        def validate_photo(self):
+            return ("jpg", "image/jpeg")
+
+        async def read(self):
+            return b"bytes"
+
+    class _FakeResponse:
+        payload: dict = {}
+
+        def __init__(self, status=200):
+            self.status = status
+
+        async def json(self):
+            return type(self).payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _FakeSession:
+        status = 200
+        last_url = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def post(self, url, data=None, headers=None):
+            type(self).last_url = url
+            return TestPhotoUploadIdPatch._FakeResponse(type(self).status)
+
+    def _service(self, url):
+        from types import SimpleNamespace
+
+        app = SimpleNamespace(
+            invoke=AsyncMock(return_value=SimpleNamespace(payload={"url": url})),
+            config=SimpleNamespace(proxy=None, upload_timeout=30),
+        )
+        return SimpleNamespace(app=app)
+
+    async def _upload(self, monkeypatch, *, url, photos, status=200):
+        from app.pymax_client import _patch_photo_upload_id_lookup
+
+        _patch_photo_upload_id_lookup()
+        self._FakeResponse.payload = {"photos": photos}
+        self._FakeSession.status = status
+        monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
+
+        from pymax.api.uploads.service import UploadService
+
+        return await UploadService.upload_photo(self._service(url), self._FakePhoto())
+
+    async def test_a_url_without_photo_ids_still_uploads(self, monkeypatch):
+        """The regression: nothing in the URL to key the answer by, one
+        photo in the answer — that is the photo we just sent."""
+        result = await self._upload(
+            monkeypatch,
+            url="https://iu.oneme.ru/uploadImage?r=AFzp8WiMnXAD",
+            photos={"9911": {"token": "photo-token"}},
+        )
+
+        assert result.photo_token == "photo-token"
+
+    async def test_an_old_style_url_still_picks_by_its_id(self, monkeypatch):
+        """MAX may go back to sending photoIds; when it does, that id
+        decides — even with several entries in the answer."""
+        result = await self._upload(
+            monkeypatch,
+            url="https://iu.oneme.ru/uploadImage?photoIds=222&r=AFzp8WiMnXAD",
+            photos={"111": {"token": "wrong"}, "222": {"token": "right"}},
+        )
+
+        assert result.photo_token == "right"
+
+    async def test_several_photos_and_no_id_is_an_error_not_a_guess(self, monkeypatch):
+        from pymax.exceptions import UploadError
+
+        with pytest.raises(UploadError) as exc:
+            await self._upload(
+                monkeypatch,
+                url="https://iu.oneme.ru/uploadImage?r=AFzp8WiMnXAD",
+                photos={"111": {"token": "a"}, "222": {"token": "b"}},
+            )
+
+        assert "111" in str(exc.value) and "222" in str(exc.value)
+
+    async def test_a_failed_upload_is_still_reported(self, monkeypatch):
+        from pymax.exceptions import UploadError
+
+        with pytest.raises(UploadError):
+            await self._upload(
+                monkeypatch,
+                url="https://iu.oneme.ru/uploadImage?r=AFzp8WiMnXAD",
+                photos={"9911": {"token": "photo-token"}},
+                status=500,
+            )
+
+    def test_patching_twice_is_harmless(self):
+        from app.pymax_client import _patch_photo_upload_id_lookup
+
+        _patch_photo_upload_id_lookup()
+        _patch_photo_upload_id_lookup()
+
+        from pymax.api.uploads.service import UploadService
+
+        assert UploadService.upload_photo is not None
+
+
 class TestVoiceUploadUserAgentPatch:
     """pymax's upload_voice() hands MSG_SEND a video-pipeline token for
     an AUDIO attach, so MAX answers errors.process.attachment.video.

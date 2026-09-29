@@ -606,6 +606,164 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
     )
 
 
+_PATCHED_PHOTO_UPLOAD_ID = False
+
+
+def _photo_token_from_response(photos: dict, photo_id: str | None, url: str) -> str:
+    """The upload token for the photo just sent, whatever key MAX filed it under.
+
+    pymax addresses the answer by an id it reads out of the upload URL's
+    ``photoIds`` parameter. MAX stopped putting that parameter there — the
+    URL is now just ``…/uploadImage?r=<token>`` — so the lookup raised
+    KeyError before a single byte was uploaded, and every photo from
+    Telegram failed with "Photo upload URL does not contain photoIds".
+
+    The id was never needed for a single-photo upload: the response is a
+    map of one entry, and that entry is the photo we just sent. So use the
+    id when the URL still carries one, and otherwise take the only entry.
+    Several entries with no id to pick by is the one case left unresolved,
+    and it says so rather than guessing.
+    """
+    if photo_id is not None and photo_id in photos:
+        return photos[photo_id].token
+    if len(photos) == 1:
+        return next(iter(photos.values())).token
+    raise _upload_error(
+        "Photo upload response has no entry to take a token from "
+        f"(photo_id={photo_id!r}, keys={sorted(photos)}, url={url})"
+    )
+
+
+def _upload_error(message: str):
+    from pymax.exceptions import UploadError
+
+    return UploadError(message)
+
+
+async def _upload_photo_without_photo_ids_in_url(self, photo, profile: bool = False):
+    """Replacement for pymax's ``UploadService.upload_photo``.
+
+    Faithful copy of pymax 2.4.1's version (maxapi-python), down to log
+    messages and error handling, with one change: the photo id is no
+    longer required to be present in the upload URL. MAX now answers
+    PHOTO_UPLOAD with ``https://…/uploadImage?r=<token>`` and no
+    ``photoIds`` parameter, and upstream reads that parameter before
+    uploading anything — so the upload died on a KeyError and the bridge
+    reported "Photo upload URL does not contain photoIds" for every photo
+    sent from Telegram. See ``_photo_token_from_response``.
+    """
+    from http import HTTPStatus
+    from urllib.parse import parse_qs, quote, urlparse
+
+    import aiohttp
+    from pydantic import ValidationError
+    from pymax.api.response import payload_item
+    from pymax.api.uploads.models import PhotoUploadResponse
+    from pymax.api.uploads.payloads import AttachPhotoPayload, UploadPayload
+    from pymax.protocol import Opcode
+
+    logger = log
+
+    logger.info("Uploading photo")
+
+    payload = UploadPayload(profile=profile).to_payload()
+
+    try:
+        data = await self.app.invoke(Opcode.PHOTO_UPLOAD, payload=payload)
+    except Exception as e:
+        logger.exception("Failed to request photo upload URL")
+        raise _upload_error("Failed to request photo upload URL") from e
+
+    try:
+        url = payload_item(data, "url", str)
+    except Exception as e:
+        logger.exception("Failed to parse photo upload URL from response")
+        raise _upload_error("Failed to parse photo upload URL from response") from e
+
+    if not url:
+        logger.error("No upload URL received")
+        raise _upload_error("No upload URL received")
+
+    # Optional since MAX stopped sending it; still honoured when present.
+    try:
+        photo_id = str(parse_qs(urlparse(url).query)["photoIds"][0])
+    except (KeyError, IndexError):
+        photo_id = None
+
+    try:
+        photo_data = photo.validate_photo()
+    except Exception as e:
+        logger.exception("Photo validation crashed")
+        raise _upload_error("Photo validation crashed") from e
+
+    if not photo_data:
+        logger.error("Photo validation failed")
+        raise _upload_error("Photo validation failed")
+
+    try:
+        photo_bytes = await photo.read()
+    except Exception as e:
+        logger.exception("Failed to read photo bytes")
+        raise _upload_error("Failed to read photo bytes") from e
+
+    form = aiohttp.FormData()
+    form.add_field(
+        name="file",
+        value=photo_bytes,
+        filename=f"image.{quote(photo_data[0])}",
+        content_type=photo_data[1],
+    )
+
+    from pymax.exceptions import UploadError
+
+    try:
+        async with (
+            aiohttp.ClientSession(proxy=self.app.config.proxy) as session,
+            session.post(url=url, data=form) as response,
+        ):
+            if response.status != HTTPStatus.OK:
+                logger.error("Photo upload failed with status %s", response.status)
+                raise _upload_error(f"Photo upload failed with status {response.status}")
+            try:
+                result = await response.json()
+            except Exception as e:
+                logger.exception("Failed to decode photo upload response JSON")
+                raise _upload_error("Failed to decode photo upload response JSON") from e
+    except UploadError:
+        raise
+    except aiohttp.ClientError as e:
+        logger.exception("HTTP error during photo upload")
+        raise _upload_error("HTTP error during photo upload") from e
+    except asyncio.TimeoutError as e:
+        logger.exception("Timed out during photo upload")
+        raise _upload_error("Timed out during photo upload") from e
+    except Exception as e:
+        logger.exception("Unexpected error during photo upload")
+        raise _upload_error("Unexpected error during photo upload") from e
+
+    try:
+        model = PhotoUploadResponse.model_validate(result)
+    except ValidationError as e:
+        logger.exception("Invalid photo upload response model")
+        raise _upload_error("Invalid photo upload response model") from e
+
+    token = _photo_token_from_response(model.photos or {}, photo_id, url)
+    logger.debug("Photo upload complete photo_id=%s", photo_id)
+    return AttachPhotoPayload(photo_token=token)
+
+
+def _patch_photo_upload_id_lookup() -> None:
+    """Idempotent — safe to call multiple times."""
+    global _PATCHED_PHOTO_UPLOAD_ID
+    if _PATCHED_PHOTO_UPLOAD_ID:
+        return
+    from pymax.api.uploads.service import UploadService
+
+    UploadService.upload_photo = _upload_photo_without_photo_ids_in_url
+    _PATCHED_PHOTO_UPLOAD_ID = True
+    log.debug("Patched pymax photo upload to stop requiring photoIds in the URL")
+
+
 def _patch_voice_upload_user_agent() -> None:
     """Idempotent — safe to call multiple times."""
     global _PATCHED_VOICE_UPLOAD_USER_AGENT
@@ -924,6 +1082,7 @@ class PyMaxClient:
         _patch_voice_ready_resolution()
         _patch_attachment_wait_timeout()
         _patch_voice_upload_user_agent()
+        _patch_photo_upload_id_lookup()
         self.settings = settings
         self.max_download_bytes = settings.max_download_mb * 1024 * 1024
         self.chat_ids: list[int] = []
