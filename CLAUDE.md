@@ -26,7 +26,7 @@
 
 Используются нативные `Photo`, `Video`, `Voice` и `File`. Голосовые TG → MAX перед загрузкой перекодируются через ffmpeg (`imageio-ffmpeg` в зависимостях) — см. патч `upload_voice` в «Известных ограничениях». Telegram-альбом собирается по `media_group_id` и отправляется одним сообщением MAX. MAX-вложения группируются в Telegram media group до 10 элементов. Чаты из `MAX_CHAT_IDS`, отсутствующие в incremental sync, догружаются через PyMax.
 
-Read-события (`on_message_read`) и реакции (`on_reaction_update`) из PyMax смэплены на `MaxReadEvent`/`MaxReactionEvent` в `app/pymax_client.py` — отметки «прочитано» ставятся ✅-реакцией на последнее пересланное сообщение, реакции идут отдельной строкой в топике.
+Read-события (`on_message_read`) и реакции (`on_reaction_update`) из PyMax смэплены на `MaxReadEvent`/`MaxReactionEvent` в `app/pymax_client.py` — прочтение собеседником отмечается реакцией 👀 на последнем сообщении топика (после ответа из Telegram это само отправленное сообщение), а доставку ответа в MAX подтверждает 🕊 на нём; реакции на сообщения MAX идут отдельной строкой в топике. Оба эмодзи — константы `READ_RECEIPT_REACTION`/`DELIVERED_REACTION` в `app/tg_sender.py`, и брать их можно только из набора Telegram (`telegram.constants.ReactionEmoji`): ✅ в него не входит, и с ним отметка не ставилась никогда. Якорь для 👀 и id последнего сообщения чата хранятся в БД outbox и переживают рестарт. Отметка «прочитано» в сторону MAX уходит вместе с ответом из топика или по `/read` — событий о прочтении Telegram ботам не присылает.
 
 Текст Telegram → MAX пока plain text: публичный `pymax.send_message()` не принимает старые entities напрямую.
 
