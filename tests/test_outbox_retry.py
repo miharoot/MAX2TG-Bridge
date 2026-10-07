@@ -39,7 +39,8 @@ class TestBackoffSeconds:
         # Long enough that a refusing target isn't hammered with repeated
         # downloads and uploads, short enough that a message doesn't sit
         # around long after delivery became possible again. The item is
-        # never dropped, only throttled.
+        # not dropped for failing, only throttled — the one exception being
+        # OUTBOX_MAX_AGE (see TestExpiry).
         assert MIN_BACKOFF == 120
         assert MAX_BACKOFF == 600
 
@@ -267,3 +268,147 @@ class TestAPermanentRefusalLeavesTheQueue:
         client.outbox.mark_failed.assert_not_awaited()
         posted = bot.send_message.await_args.kwargs["text"]
         assert "повторять не буду" in posted
+
+
+
+class TestRefusalSchedule:
+    """MAX refusing the same message again and again: the ordinary backoff
+    (2, 4, 8 min, then every 10 min) for the first hour, then every 20 min,
+    from 3 h every hour, from 6 h every 6 hours, from a day once a day."""
+
+    H = 3600
+
+    def test_the_first_hour_keeps_the_ordinary_backoff(self):
+        from app.outbox_retry import _refusal_wait
+
+        assert _refusal_wait(0) is None
+        assert _refusal_wait(self.H - 1) is None
+
+    def test_after_an_hour_every_twenty_minutes(self):
+        from app.outbox_retry import _refusal_wait
+
+        assert _refusal_wait(self.H) == 20 * 60
+        assert _refusal_wait(3 * self.H - 1) == 20 * 60
+
+    def test_after_three_hours_every_hour(self):
+        from app.outbox_retry import _refusal_wait
+
+        assert _refusal_wait(3 * self.H) == self.H
+        assert _refusal_wait(6 * self.H - 1) == self.H
+
+    def test_after_six_hours_every_six_hours(self):
+        from app.outbox_retry import _refusal_wait
+
+        assert _refusal_wait(6 * self.H) == 6 * self.H
+        assert _refusal_wait(24 * self.H - 1) == 6 * self.H
+
+    def test_after_a_day_once_a_day(self):
+        from app.outbox_retry import _refusal_wait
+
+        assert _refusal_wait(24 * self.H) == 24 * self.H
+        assert _refusal_wait(6 * 24 * self.H) == 24 * self.H
+
+    def test_the_ordinary_backoff_itself_is_unchanged(self):
+        assert _backoff_seconds(1) == 120
+        assert _backoff_seconds(2) == 240
+        assert _backoff_seconds(3) == 480
+        assert _backoff_seconds(4) == MAX_BACKOFF == 600
+
+    def test_a_refused_item_waits_on_the_refusal_schedule(self):
+        from app.outbox_retry import _wait_before_retry
+
+        now = 100 * self.H
+        item = _make_item(TG_TO_MAX_TEXT, {}, attempts=40)
+        item.refused_since = now - 10 * self.H
+
+        assert _wait_before_retry(item, now) == 6 * self.H
+
+    def test_an_item_that_is_not_refused_keeps_the_ordinary_backoff(self):
+        from app.outbox_retry import _wait_before_retry
+
+        item = _make_item(TG_TO_MAX_TEXT, {}, attempts=40)
+
+        assert _wait_before_retry(item, time.time()) == MAX_BACKOFF
+
+    async def test_a_refusal_on_retry_is_recorded_not_dropped(self):
+        client = _make_client()
+        client.outbox.mark_refused = AsyncMock(return_value=0.0)
+        client.send_message = AsyncMock(return_value={"_max_error": {
+            "message": "Что-то не так [error.some.code]",
+            "localizedMessage": "Что-то не так",
+            "code": "error.some.code",
+        }})
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        sender = MagicMock()
+        sender.bot = bot
+        item = _make_item(TG_TO_MAX_TEXT, {
+            "max_chat_id": 100000001, "tg_chat_id": -10000000000001,
+            "thread_id": 5, "tg_message_id": 7, "text": "привет",
+        }, item_id=9)
+
+        await _retry_one(client, sender, None, item,
+                         tg_handler.redeliver_tg_to_max_text,
+                         tg_handler.redeliver_tg_to_max_media)
+
+        client.outbox.mark_refused.assert_awaited_once()
+        assert client.outbox.mark_refused.await_args.args[:2] == (9, "error.some.code")
+        client.outbox.remove.assert_not_awaited()
+        client.outbox.mark_failed.assert_not_awaited()
+
+
+class TestExpiry:
+    """Whatever is still undelivered a week after it was queued is dropped
+    — refusal or outage alike."""
+
+    def _sender(self):
+        sender = MagicMock()
+        sender.bot = MagicMock()
+        sender.bot.send_message = AsyncMock()
+        return sender
+
+    async def test_a_week_old_message_from_telegram_is_dropped_and_reported(self):
+        from app.outbox_retry import OUTBOX_MAX_AGE, _expire_if_too_old
+
+        client, sender = _make_client(), self._sender()
+        item = _make_item(TG_TO_MAX_TEXT, {
+            "max_chat_id": 100000001, "tg_chat_id": -10000000000001,
+            "thread_id": 5, "tg_message_id": 7, "text": "привет",
+        }, item_id=12)
+        item.created_at = 1000.0
+
+        dropped = await _expire_if_too_old(client, sender, item,
+                                           now=1000.0 + OUTBOX_MAX_AGE)
+
+        assert dropped is True
+        client.outbox.remove.assert_awaited_once_with(12)
+        kwargs = sender.bot.send_message.await_args.kwargs
+        assert kwargs["chat_id"] == -10000000000001
+        assert kwargs["message_thread_id"] == 5
+        assert "«привет»" in kwargs["text"] and "7 дней" in kwargs["text"]
+
+    async def test_a_younger_message_is_kept(self):
+        from app.outbox_retry import OUTBOX_MAX_AGE, _expire_if_too_old
+
+        client, sender = _make_client(), self._sender()
+        item = _make_item(TG_TO_MAX_TEXT, {"tg_chat_id": -10000000000001})
+        item.created_at = 1000.0
+
+        dropped = await _expire_if_too_old(client, sender, item,
+                                           now=1000.0 + OUTBOX_MAX_AGE - 1)
+
+        assert dropped is False
+        client.outbox.remove.assert_not_awaited()
+
+    async def test_a_message_from_max_is_dropped_without_posting(self):
+        """Telegram being unreachable may be why it is still queued, so the
+        log is the only place for the notice."""
+        from app.outbox_retry import OUTBOX_MAX_AGE, _expire_if_too_old
+
+        client, sender = _make_client(), self._sender()
+        item = _make_item(MAX_TO_TG, {"chat_id": -10000000000001}, item_id=3)
+        item.created_at = 0.0
+
+        assert await _expire_if_too_old(client, sender, item, now=OUTBOX_MAX_AGE) is True
+        client.outbox.remove.assert_awaited_once_with(3)
+        sender.bot.send_message.assert_not_awaited()

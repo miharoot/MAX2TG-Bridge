@@ -321,6 +321,30 @@ async def test_an_unknown_api_error_stays_retryable(adapter):
     assert not resp["_max_error"].get("permanent")
 
 
+async def test_an_api_error_carries_its_code(adapter):
+    """The outbox tells one refusal from another by this code — and a
+    refusal from a network failure by its presence."""
+    client, raw = adapter
+    raw.send_message = AsyncMock(side_effect=ApiError(
+        opcode=64, error="error.something.new", message="nope",
+        localized_message="Не вышло",
+    ))
+
+    resp = await client.send_message(20, "hello")
+
+    assert resp["_max_error"]["code"] == "error.something.new"
+    assert resp["_max_error"]["localizedMessage"] == "Не вышло"
+
+
+async def test_a_non_api_failure_has_no_code(adapter):
+    client, raw = adapter
+    raw.send_message = AsyncMock(side_effect=ConnectionError("connection lost"))
+
+    resp = await client.send_message(20, "hello")
+
+    assert "code" not in resp["_max_error"]
+
+
 async def test_send_message_records_the_id_as_bridge_sent(adapter):
     """So a catch-up after a reconnect can tell this message apart from
     one typed by hand in a MAX client and not mirror it back into

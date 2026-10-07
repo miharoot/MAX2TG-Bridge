@@ -159,6 +159,41 @@ class TestOnTopicMessage:
         assert "повторять не буду" in reply
         assert "Возможности профиля ограничены" in reply
 
+    async def test_a_refusal_from_max_is_recorded_as_one(self):
+        """MAX answered with an error code: still retried, but on the slower
+        refusal schedule — so it is marked as a refusal, not a plain fail."""
+        max_client = _make_max_client(send_message_return={"_max_error": {
+            "message": "Что-то не так [error.some.code]",
+            "localizedMessage": "Что-то не так",
+            "code": "error.some.code",
+        }})
+        max_client.outbox.mark_refused = AsyncMock(return_value=0.0)
+
+        update = _make_update()
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
+
+        await _on_topic_message(update, ctx)
+
+        max_client.outbox.mark_refused.assert_awaited_once()
+        max_client.outbox.mark_failed.assert_not_awaited()
+        max_client.outbox.remove.assert_not_awaited()
+
+    async def test_an_error_without_a_code_stays_a_plain_failure(self):
+        """No code means MAX did not answer — a network-side failure keeps
+        the ordinary retry schedule."""
+        max_client = _make_max_client(send_message_return={"_max_error": {
+            "message": "connection lost",
+        }})
+        max_client.outbox.mark_refused = AsyncMock()
+
+        update = _make_update()
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
+
+        await _on_topic_message(update, ctx)
+
+        max_client.outbox.mark_failed.assert_awaited_once()
+        max_client.outbox.mark_refused.assert_not_awaited()
+
     async def test_logs_warning_when_reaction_fails(self, caplog):
         """A failed 👀 reaction (e.g. missing Telegram permission) must be
         visible at warning level, not silently swallowed at debug."""

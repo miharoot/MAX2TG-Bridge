@@ -127,3 +127,75 @@ class TestPersistenceAcrossConnections:
         assert len(items) == 1
         assert items[0].payload == {"durable": True}
         await ob2.close()
+
+
+class TestRefusalStreak:
+    """How long MAX has been refusing an item with the same error — what
+    slows its retries down (see app/outbox_retry.py)."""
+
+    async def test_the_first_refusal_starts_the_clock(self, ob):
+        item_id = await ob.add(TG_TO_MAX_TEXT, {"x": 1})
+
+        refused_for = await ob.mark_refused(item_id, "error.some.code", "нет")
+
+        assert refused_for == 0
+        [item] = await ob.pending()
+        assert item.refused_since is not None
+        assert item.attempts == 1
+
+    async def test_the_same_refusal_keeps_the_clock_running(self, ob, monkeypatch):
+        item_id = await ob.add(TG_TO_MAX_TEXT, {"x": 1})
+        monkeypatch.setattr("app.outbox.time.time", lambda: 1000.0)
+        await ob.mark_refused(item_id, "error.some.code", "нет")
+        monkeypatch.setattr("app.outbox.time.time", lambda: 1000.0 + 3600)
+
+        refused_for = await ob.mark_refused(item_id, "error.some.code", "нет")
+
+        assert refused_for == 3600
+
+    async def test_a_different_refusal_starts_it_over(self, ob, monkeypatch):
+        item_id = await ob.add(TG_TO_MAX_TEXT, {"x": 1})
+        monkeypatch.setattr("app.outbox.time.time", lambda: 1000.0)
+        await ob.mark_refused(item_id, "error.first", "нет")
+        monkeypatch.setattr("app.outbox.time.time", lambda: 1000.0 + 3600)
+
+        assert await ob.mark_refused(item_id, "error.second", "нет") == 0
+
+    async def test_any_other_failure_ends_the_streak(self, ob):
+        """A network failure says nothing about whether MAX would take it
+        now — back to the ordinary, quicker schedule."""
+        item_id = await ob.add(TG_TO_MAX_TEXT, {"x": 1})
+        await ob.mark_refused(item_id, "error.some.code", "нет")
+
+        await ob.mark_failed(item_id, "timeout")
+
+        [item] = await ob.pending()
+        assert item.refused_since is None
+
+    async def test_an_older_database_gets_the_new_columns(self, tmp_path):
+        """Existing installs have an outbox table without them; opening it
+        must add them instead of failing on the first refusal."""
+        import sqlite3
+
+        path = tmp_path / "outbox.db"
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "direction TEXT NOT NULL, payload TEXT NOT NULL, attempts INTEGER "
+            "NOT NULL DEFAULT 0, created_at REAL NOT NULL, last_attempt_at REAL, "
+            "last_error TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO outbox (direction, payload, created_at) VALUES (?, ?, ?)",
+            (TG_TO_MAX_TEXT, "{}", 1.0),
+        )
+        conn.commit()
+        conn.close()
+
+        box = Outbox(str(path))
+        [item] = await box.pending()
+        await box.mark_refused(item.id, "error.some.code", "нет")
+
+        [item] = await box.pending()
+        assert item.refused_since is not None
+        await box.close()

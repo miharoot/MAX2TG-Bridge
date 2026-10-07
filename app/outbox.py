@@ -7,7 +7,12 @@ send_message returning without an error. If delivery fails for any
 reason (no connection, the other side down, the process crashing
 mid-send), the row stays and a background retry loop
 (see app/outbox_retry.py) keeps re-attempting it with backoff until it
-succeeds. Nothing is dropped just because a connection hiccuped.
+succeeds. Nothing is dropped just because a connection hiccuped. Only two
+things take a row out undelivered: a refusal MAX is known to mean for good
+(PermanentDeliveryFailure — reported into the topic once), and age — a row
+still undelivered a week after it was queued is dropped (OUTBOX_MAX_AGE in
+app/outbox_retry.py). A refusal MAX may not mean for good (RefusedByMax)
+stays queued, only on a slower schedule.
 
 This intentionally gives *at-least-once* delivery, not exactly-once: if
 the process crashes in the narrow window after a message was
@@ -53,6 +58,23 @@ class PermanentDeliveryFailure(Exception):
     """
 
 
+class RefusedByMax(Exception):
+    """MAX answered, and the answer was an error.
+
+    Not necessarily final — it may be a hiccup on MAX's side — so the
+    message stays queued and is never dropped for it. But unlike a network
+    failure it says the server was reached and turned the message down, so
+    a refusal that keeps coming back is retried less and less often (see
+    app/outbox_retry.py) instead of every ten minutes for as long as the
+    bridge runs. Codes known to be final at once are PermanentDeliveryFailure.
+    """
+
+    def __init__(self, code: str, desc: str):
+        super().__init__(desc)
+        self.code = code
+        self.desc = desc
+
+
 @dataclass
 class OutboxItem:
     id: int
@@ -62,6 +84,10 @@ class OutboxItem:
     created_at: float
     last_attempt_at: float | None
     last_error: str | None
+    # Since when MAX has been refusing this item with the same error, or
+    # None if the last failure (if any) was something else. Drives the
+    # slower retry schedule for refusals in app/outbox_retry.py.
+    refused_since: float | None = None
 
 
 class Outbox:
@@ -169,6 +195,14 @@ class Outbox:
                 # peer usually reads minutes or hours later, often past a
                 # restart — kept only in memory, the reaction had nothing to
                 # attach to and was silently dropped.
+                # Since when MAX has been refusing an item, and with what —
+                # added later, so an existing database gets the columns here.
+                async with conn.execute("PRAGMA table_info(outbox)") as cur:
+                    columns = {row[1] for row in await cur.fetchall()}
+                if "refused_since" not in columns:
+                    await conn.execute("ALTER TABLE outbox ADD COLUMN refused_since REAL")
+                if "refusal_code" not in columns:
+                    await conn.execute("ALTER TABLE outbox ADD COLUMN refusal_code TEXT")
                 await conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS last_tg_message (
@@ -310,20 +344,49 @@ class Outbox:
         await conn.commit()
 
     async def mark_failed(self, item_id: int, error: str) -> None:
+        """A failure that is not MAX refusing the message — the network,
+        a timeout, the process. It also ends any refusal streak (see
+        mark_refused), so the item goes back to the ordinary, quicker
+        retry schedule: MAX may well take it once it is reachable again."""
         conn = await self._get_conn()
         await conn.execute(
             "UPDATE outbox SET attempts = attempts + 1, last_attempt_at = ?, "
-            "last_error = ? WHERE id = ?",
+            "last_error = ?, refused_since = NULL, refusal_code = NULL WHERE id = ?",
             (time.time(), (error or "")[:500], item_id),
         )
         await conn.commit()
+
+    async def mark_refused(self, item_id: int, code: str, error: str) -> float:
+        """MAX itself refused this item; returns for how long, in seconds.
+
+        The clock runs from the first of an unbroken run of refusals with
+        this same code. A different code starts it over, and so does any
+        other kind of failure (mark_failed) — only the same answer from
+        MAX, every time, slows the retries down.
+        """
+        now = time.time()
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT refused_since, refusal_code FROM outbox WHERE id = ?", (item_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        since = now
+        if row is not None and row[0] is not None and row[1] == code:
+            since = float(row[0])
+        await conn.execute(
+            "UPDATE outbox SET attempts = attempts + 1, last_attempt_at = ?, "
+            "last_error = ?, refused_since = ?, refusal_code = ? WHERE id = ?",
+            (now, (error or "")[:500], since, code, item_id),
+        )
+        await conn.commit()
+        return now - since
 
     async def pending(self) -> list[OutboxItem]:
         conn = await self._get_conn()
         conn.row_factory = aiosqlite.Row
         rows = await conn.execute_fetchall(
             "SELECT id, direction, payload, attempts, created_at, last_attempt_at, "
-            "last_error FROM outbox ORDER BY id"
+            "last_error, refused_since FROM outbox ORDER BY id"
         )
         items = []
         corrupt: list[int] = []
@@ -341,6 +404,7 @@ class Outbox:
                 id=r["id"], direction=r["direction"], payload=payload,
                 attempts=r["attempts"], created_at=r["created_at"],
                 last_attempt_at=r["last_attempt_at"], last_error=r["last_error"],
+                refused_since=r["refused_since"],
             ))
         for item_id in corrupt:
             await self.remove(item_id)

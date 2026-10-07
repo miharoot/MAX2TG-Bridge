@@ -1368,7 +1368,16 @@ class PyMaxClient:
                         "permanent": True,
                     }}
                 log.exception("PyMax send_message failed for chat %s", chat_id)
-                return {"_max_error": {"message": str(exc)}}
+                err = {"message": str(exc)}
+                code = getattr(exc, "error", None) if isinstance(exc, ApiError) else None
+                if code:
+                    # MAX itself answered with this — not the network. The
+                    # outbox retries such a refusal on a slower schedule
+                    # (see app/outbox_retry.py), so it needs the code to
+                    # tell one refusal from another.
+                    err["code"] = str(code)
+                    err["localizedMessage"] = getattr(exc, "localized_message", None)
+                return {"_max_error": err}
             else:
                 break
         else:

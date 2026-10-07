@@ -21,7 +21,7 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 from app import outbox
-from app.outbox import PermanentDeliveryFailure
+from app.outbox import PermanentDeliveryFailure, RefusedByMax
 from app.pymax_client import PyMaxClient, _normalized_phone
 from app.resolver import SAVED_MESSAGES_TITLE
 from app.tg_sender import DELIVERED_REACTION, READ_RECEIPT_REACTION
@@ -235,6 +235,11 @@ async def _surface_send_result(resp, *, bot, tg_chat_id, tg_message_id, notify,
             )
             raise PermanentDeliveryFailure(desc)
         await notify(f"⚠️ MAX: {desc}")
+        if err.get("code"):
+            # MAX answered and refused — as opposed to not answering at
+            # all. Still retried, but on a slower schedule the longer the
+            # same refusal lasts (see app/outbox_retry.py).
+            raise RefusedByMax(str(err["code"]), desc)
         return False
     if not resp:
         await notify("⚠️ Таймаут от MAX — сообщение не подтверждено.")
@@ -345,6 +350,9 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 max_chat_id, exc,
             )
             await max_client.outbox.remove(item_id)
+            return
+        except RefusedByMax as exc:
+            await max_client.outbox.mark_refused(item_id, exc.code, str(exc))
             return
         if ok:
             await max_client.outbox.remove(item_id)
@@ -594,6 +602,9 @@ async def _send_topic_media_messages(messages, max_chat_id, max_client, max_uplo
                 max_chat_id, exc,
             )
             await max_client.outbox.remove(item_id)
+            return
+        except RefusedByMax as exc:
+            await max_client.outbox.mark_refused(item_id, exc.code, str(exc))
             return
         if ok:
             await max_client.outbox.remove(item_id)
