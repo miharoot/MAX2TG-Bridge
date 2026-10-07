@@ -11,7 +11,7 @@ from app.config import Settings
 from app.outbox import Outbox
 from app.pymax_client import MaxMessage, MaxReactionEvent, MaxReadEvent, PyMaxClient
 from app.resolver import SAVED_MESSAGES_TITLE, ContactResolver
-from app.tg_sender import READ_RECEIPT_REACTION, TelegramSender
+from app.tg_sender import READ_RECEIPT_REACTION, TelegramSender, TopicGone
 
 log = logging.getLogger(__name__)
 
@@ -784,8 +784,14 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         parts = " ".join(
             f"{c.get('reaction', '?')}×{c.get('count', 1)}" for c in event.counters
         )
-        await sender.send(f"👍 <i>Реакция на сообщение: {parts}</i>",
-                          message_thread_id=thread_id, chat_id=tg_chat_id)
+        try:
+            await sender.send(f"👍 <i>Реакция на сообщение: {parts}</i>",
+                              message_thread_id=thread_id, chat_id=tg_chat_id)
+        except TopicGone:
+            # Not worth a new topic on its own — the next message from this
+            # chat recreates it (see _deliver_max_message).
+            log.warning("Reaction for MAX chat %s not posted: its topic %s is gone",
+                        event.chat_id, thread_id)
 
     def _as_chat_key(chat_id: Any) -> Any:
         """MAX chat ids come back from the database as text; everywhere
@@ -845,16 +851,21 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         await _ingest_max_message(msg)
 
     async def _ingest_history(chat_id: Any, limit: int, *,
-                              since: int | None = None, what: str = "догрузка") -> int:
+                              since: int | None = None, before: int | None = None,
+                              what: str = "догрузка") -> int:
         """Pull recent MAX messages into Telegram, oldest first.
 
         ``since`` keeps a catch-up to what arrived after the last forwarded
         message; without it (a freshly bound topic) the last ``limit``
-        messages are taken as they are.
+        messages are taken as they are. ``before`` stops short of a message
+        the caller is about to deliver itself (a recreated topic, see
+        _deliver_max_message), so it doesn't arrive twice.
         """
         messages = await client.fetch_recent_messages(chat_id, limit)
         if since is not None:
             messages = [m for m in messages if (m.timestamp or 0) > since]
+        if before is not None:
+            messages = [m for m in messages if (m.timestamp or 0) < before]
         if not messages:
             return 0
         log.info("%s: %d messages from MAX chat %s", what, len(messages), chat_id)
@@ -896,6 +907,55 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
     client.backfill_chat = _ingest_history
 
     async def _deliver_max_message(msg: MaxMessage):
+        """Deliver one MAX message, replacing its topic if it was deleted.
+
+        A topic deleted by hand in Telegram stays on file here, and every
+        message for that chat used to be dropped against it without a word
+        (see TopicGone). Now the first one to hit it gets a new topic — same
+        group, same title — with the profile card and the chat's recent
+        history pulled in before it, then is delivered there itself. If the
+        new topic fails as well, the error propagates and the outbox keeps
+        the message for a later attempt.
+        """
+        dead_thread = sender.topic_store.get_topic(msg.chat_id)
+        try:
+            await _deliver_max_message_once(msg)
+            return
+        except TopicGone:
+            if dead_thread is None:
+                raise   # General can't be deleted; nothing of ours to replace
+        log.warning("Topic %s for MAX chat %s is gone from Telegram; recreating it",
+                    dead_thread, msg.chat_id)
+        new_thread, created = await sender.recreate_topic(msg.chat_id, dead_thread)
+        if new_thread is None:
+            raise TopicGone(f"could not recreate the deleted topic for MAX chat {msg.chat_id}")
+        # A read receipt must not go looking for a message in the dead topic.
+        client.last_tg_message.pop(msg.chat_id, None)
+        if created:
+            await _fill_recreated_topic(msg, new_thread)
+        await _deliver_max_message_once(msg)
+
+    async def _fill_recreated_topic(msg: MaxMessage, thread_id: int) -> None:
+        """Profile card and recent history for a topic that replaced a
+        deleted one — what a fresh topic gets, so the conversation doesn't
+        restart from a single message. History stops short of ``msg``,
+        which the caller delivers right after."""
+        from app.tg_handler import post_topic_intro
+
+        target_chat_id = sender.resolve_chat_id(msg.chat_id)
+        try:
+            await post_topic_intro(sender.bot, target_chat_id, client, msg.chat_id, thread_id)
+        except Exception:
+            log.exception("Could not post the profile card into recreated topic %s", thread_id)
+        limit = getattr(_settings, "backfill_limit", 0) or 20
+        try:
+            await _ingest_history(msg.chat_id, limit, before=msg.timestamp,
+                                  what="восстановление топика")
+        except Exception:
+            # The message itself still goes out; only the context is missing.
+            log.exception("Could not pull history into recreated topic %s", thread_id)
+
+    async def _deliver_max_message_once(msg: MaxMessage):
         log.info(
             "New message: chat=%s sender=%s is_self=%s text=%r attaches=%d",
             msg.chat_id,
@@ -1022,6 +1082,13 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
                 body = (f"<i>{control}</i>" if control
                         else "<i>[нетекстовое сообщение]</i>")
             last_message = await sender.send(f"{header_text}\n{body}", message_thread_id=thread_id, chat_id=target_chat_id)
+            if last_message is None:
+                # send() gives up quietly after its retries. Returning from
+                # here as if it had worked took the message out of the
+                # outbox — raise instead, so it stays queued for a retry.
+                raise RuntimeError(
+                    f"Telegram did not accept the message from MAX chat {msg.chat_id}"
+                )
             log.info("Forwarded text → TG")
 
         if last_message is not None:

@@ -24,6 +24,30 @@ DELIVERED_REACTION = "🕊"
 READ_RECEIPT_REACTION = "👀"
 _ALLOWED_REACTIONS = frozenset(e.value for e in ReactionEmoji)
 
+# How Telegram words "that forum topic no longer exists" — someone deleted
+# it by hand in Telegram, while the bridge still has it on file.
+_TOPIC_GONE_MARKERS = ("thread not found", "topic_deleted", "topic_id_invalid")
+
+
+class TopicGone(BadRequest):
+    """The forum topic a message was sent to has been deleted in Telegram.
+
+    Raised instead of the usual "three attempts, then None": repeating
+    cannot bring a topic back, and returning None made the caller believe
+    the message was delivered — every message for that chat was then
+    silently dropped for as long as the dead binding stayed on file.
+    A BadRequest subclass, so callers that already tolerate a BadRequest
+    keep doing so.
+    """
+
+
+def _is_topic_gone(exc: BaseException) -> bool:
+    if not isinstance(exc, BadRequest):
+        return False
+    text = str(getattr(exc, "message", "") or exc).lower()
+    return any(marker in text for marker in _TOPIC_GONE_MARKERS)
+
+
 TG_MAX_LENGTH = 4096
 TG_CAPTION_MAX = 1024
 TG_TOPIC_NAME_MAX = 128
@@ -268,6 +292,38 @@ class TelegramSender:
                      title, target_chat_id, thread_id, max_chat_id)
             return thread_id
 
+    async def recreate_topic(self, max_chat_id, dead_thread_id: int) -> tuple[int | None, bool]:
+        """Replace a forum topic that was deleted in Telegram.
+
+        The new topic goes into the same group under the same title as the
+        dead one — dropping the binding and letting ensure_topic start over
+        would have moved a chat bound with /bind into another group back to
+        the default one. Returns ``(thread_id, created)``: ``created`` is
+        False when another delivery already replaced it (two messages for
+        the same chat can hit the dead topic at once), and thread_id is
+        None if Telegram refused to create one.
+        """
+        async with self._topic_lock:
+            current = self._topics.get_topic(max_chat_id)
+            if current is not None and current != dead_thread_id:
+                return current, False
+            target_chat_id = self._topics.get_chat_id(max_chat_id)
+            if target_chat_id is None:
+                target_chat_id = self.resolve_chat_id(max_chat_id)
+            title = (self._topics.get_title(max_chat_id) or str(max_chat_id))[:TG_TOPIC_NAME_MAX]
+            try:
+                topic = await self._bot.create_forum_topic(chat_id=target_chat_id, name=title)
+            except Exception:
+                log.exception("Failed to recreate the deleted forum topic for Max chat %s in %s",
+                              max_chat_id, target_chat_id)
+                return None, False
+            thread_id = topic.message_thread_id
+            self._topics.set_topic(max_chat_id, int(target_chat_id), thread_id, title)
+            log.warning("Forum topic %s for Max chat %s was deleted in Telegram — "
+                        "recreated it as %r (chat=%s thread=%s)",
+                        dead_thread_id, max_chat_id, title, target_chat_id, thread_id)
+            return thread_id, True
+
     # ── helpers ────────────────────────────────────────────────────
 
     def _truncate_caption(self, text: str) -> str:
@@ -308,7 +364,9 @@ class TelegramSender:
             except TimedOut:
                 log.warning("Telegram timeout (attempt %d/%d)", attempt, MAX_RETRIES)
                 await asyncio.sleep(2 * attempt)
-            except Exception:
+            except Exception as exc:
+                if _is_topic_gone(exc):
+                    raise TopicGone(str(exc)) from exc
                 log.exception("Failed to send to Telegram (attempt %d/%d)", attempt, MAX_RETRIES)
                 if attempt == MAX_RETRIES:
                     return None
