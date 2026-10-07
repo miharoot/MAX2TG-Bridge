@@ -331,10 +331,21 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await max_client.outbox.mark_failed(item_id, str(exc))
             return
 
-        ok = await _surface_send_result(
-            resp, bot=context.bot, tg_chat_id=tg_chat_id, tg_message_id=message.message_id,
-            notify=message.reply_text, max_client=max_client, max_chat_id=max_chat_id,
-        )
+        try:
+            ok = await _surface_send_result(
+                resp, bot=context.bot, tg_chat_id=tg_chat_id, tg_message_id=message.message_id,
+                notify=message.reply_text, max_client=max_client, max_chat_id=max_chat_id,
+            )
+        except PermanentDeliveryFailure as exc:
+            # Already reported into the topic. Left in the outbox, the
+            # retry sweep would send it again — and post the same refusal
+            # again — every ten minutes for as long as the bridge runs.
+            log.warning(
+                "MAX permanently refused a message for chat %s, dropping it: %s",
+                max_chat_id, exc,
+            )
+            await max_client.outbox.remove(item_id)
+            return
         if ok:
             await max_client.outbox.remove(item_id)
         else:

@@ -434,6 +434,24 @@ async def _request_voice_upload_slot(app):
         raise UploadError("Invalid voice upload response model") from e
 
 
+# MAX error codes that refuse the message itself rather than the moment.
+# Sending it again can only get the same answer, so the outbox must drop
+# it instead of retrying: error.user.restricted.send ("Начать диалог не
+# получится. Возможности профиля ограничены") was retried every ten
+# minutes for hours, each attempt posting the same warning into the
+# topic. Kept to codes actually seen — an unknown error stays a plain
+# failure and keeps its place in the queue, because guessing wrong in
+# that direction loses a message.
+_PERMANENT_SEND_ERRORS = frozenset({
+    "error.user.restricted.send",
+})
+
+
+def _permanent_send_error(exc: Exception) -> bool:
+    """True if MAX refused this message for good (see _PERMANENT_SEND_ERRORS)."""
+    return isinstance(exc, ApiError) and str(getattr(exc, "error", "") or "") in _PERMANENT_SEND_ERRORS
+
+
 class VoiceRejectedByMax(UploadError):
     """MAX's server rejected the uploaded audio *itself* — as opposed to
     it merely not having finished processing yet.
@@ -1341,6 +1359,14 @@ class PyMaxClient:
                 )
                 continue
             except Exception as exc:
+                if _permanent_send_error(exc):
+                    log.error("MAX refused the message for chat %s for good: %s",
+                              chat_id, exc)
+                    return {"_max_error": {
+                        "message": str(exc),
+                        "localizedMessage": getattr(exc, "localized_message", None),
+                        "permanent": True,
+                    }}
                 log.exception("PyMax send_message failed for chat %s", chat_id)
                 return {"_max_error": {"message": str(exc)}}
             else:

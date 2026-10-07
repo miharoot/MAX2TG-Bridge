@@ -136,6 +136,29 @@ class TestOnTopicMessage:
         max_client.outbox.remove.assert_awaited_once_with(1)
         max_client.outbox.mark_failed.assert_not_awaited()
 
+    async def test_a_permanent_refusal_is_dropped_not_queued(self):
+        """MAX refusing the message itself (e.g. the recipient's profile
+        is restricted) used to stay in the outbox and be resent — and the
+        refusal re-posted into the topic — every ten minutes, forever."""
+        max_client = _make_max_client(send_message_return={
+            "_max_error": {
+                "message": "User is restricted [error.user.restricted.send]",
+                "localizedMessage": "Начать диалог не получится. Возможности профиля ограничены",
+                "permanent": True,
+            },
+        })
+
+        update = _make_update()
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
+
+        await _on_topic_message(update, ctx)
+
+        max_client.outbox.remove.assert_awaited_once_with(1)
+        max_client.outbox.mark_failed.assert_not_awaited()
+        reply = update.message.reply_text.await_args.args[0]
+        assert "повторять не буду" in reply
+        assert "Возможности профиля ограничены" in reply
+
     async def test_logs_warning_when_reaction_fails(self, caplog):
         """A failed 👀 reaction (e.g. missing Telegram permission) must be
         visible at warning level, not silently swallowed at debug."""

@@ -289,6 +289,38 @@ async def test_send_message_delegates_to_pymax(adapter):
     assert resp["id"] == 123
 
 
+async def test_a_restricted_recipient_is_a_permanent_refusal(adapter):
+    """error.user.restricted.send refuses the message, not the moment:
+    retrying can only get the same answer."""
+    client, raw = adapter
+    raw.send_message = AsyncMock(side_effect=ApiError(
+        opcode=64,
+        error="error.user.restricted.send",
+        message="User is restricted",
+        localized_message="Начать диалог не получится. Возможности профиля ограничены",
+        title="Начать диалог не получится. Возможности профиля ограничены",
+    ))
+
+    resp = await client.send_message(20, "hello")
+
+    err = resp["_max_error"]
+    assert err["permanent"] is True
+    assert err["localizedMessage"] == "Начать диалог не получится. Возможности профиля ограничены"
+
+
+async def test_an_unknown_api_error_stays_retryable(adapter):
+    """Only codes known to be final are dropped: misjudging the other way
+    loses a message for good."""
+    client, raw = adapter
+    raw.send_message = AsyncMock(side_effect=ApiError(
+        opcode=64, error="error.something.new", message="nope",
+    ))
+
+    resp = await client.send_message(20, "hello")
+
+    assert not resp["_max_error"].get("permanent")
+
+
 async def test_send_message_records_the_id_as_bridge_sent(adapter):
     """So a catch-up after a reconnect can tell this message apart from
     one typed by hand in a MAX client and not mirror it back into

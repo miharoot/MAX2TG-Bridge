@@ -235,3 +235,35 @@ class TestRetryOneUnknownDirection:
 
         client.outbox.remove.assert_awaited_once_with(1)
         client.outbox.mark_failed.assert_not_awaited()
+
+
+class TestAPermanentRefusalLeavesTheQueue:
+    """A message MAX refused for good — the recipient's profile is
+    restricted — sat in the outbox and was resent every ten minutes, each
+    time posting the same refusal into the topic. On the next sweep it must
+    be reported once more and dropped."""
+
+    async def test_a_restricted_recipient_is_dropped_on_retry(self):
+        client = _make_client()
+        client.send_message = AsyncMock(return_value={"_max_error": {
+            "message": "User is restricted [error.user.restricted.send]",
+            "localizedMessage": "Начать диалог не получится. Возможности профиля ограничены",
+            "permanent": True,
+        }})
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        sender = MagicMock()
+        sender.bot = bot
+        item = _make_item(TG_TO_MAX_TEXT, {
+            "max_chat_id": 100000001, "tg_chat_id": -10000000000001,
+            "thread_id": 5, "tg_message_id": 7, "text": "привет",
+        }, item_id=308, attempts=59)
+
+        await _retry_one(client, sender, None, item,
+                         tg_handler.redeliver_tg_to_max_text,
+                         tg_handler.redeliver_tg_to_max_media)
+
+        client.outbox.remove.assert_awaited_once_with(308)
+        client.outbox.mark_failed.assert_not_awaited()
+        posted = bot.send_message.await_args.kwargs["text"]
+        assert "повторять не буду" in posted
