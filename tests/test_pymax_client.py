@@ -1332,3 +1332,29 @@ class TestSendMessageAttachmentRetry:
         raw.send_message.assert_awaited_once()
         assert "_max_error" in resp
         assert "connection lost" in resp["_max_error"]["message"]
+
+
+
+class TestDownloadAllowlist:
+    """Attachments are fetched only from MAX's own hosts (SSRF guard)."""
+
+    @pytest.mark.parametrize("url", [
+        "https://i.oneme.ru/i?r=x",
+        "https://maxvd298.okcdn.ru/?expires=1",
+        "https://max3-17.vkuser.net/?expires=1",
+    ])
+    def test_maxs_media_hosts_are_allowed(self, url):
+        from app.pymax_client import _is_allowed_download_url
+
+        assert _is_allowed_download_url(url)
+
+    @pytest.mark.parametrize("url", [
+        "http://max3-17.vkuser.net/?expires=1",       # not https
+        "https://vkuser.net.evil.example/",           # suffix only in the middle
+        "https://evilvkuser.net/",                    # no dot before the suffix
+        "https://example.com/",
+    ])
+    def test_anything_else_is_refused(self, url):
+        from app.pymax_client import _is_allowed_download_url
+
+        assert not _is_allowed_download_url(url)

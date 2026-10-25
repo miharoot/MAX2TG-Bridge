@@ -797,7 +797,10 @@ _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chro
 _BROWSER_HEADERS = {"User-Agent": _USER_AGENT, "Accept-Encoding": "gzip, deflate"}
 _HTTP_HEADERS = {**_BROWSER_HEADERS, "Origin": "https://web.max.ru", "Referer": "https://web.max.ru/", "Accept": "*/*"}
 _ALLOWED_DOWNLOAD_HOSTS = frozenset({"i.oneme.ru", "oneme.ru", "web.max.ru", "max.ru"})
-_ALLOWED_DOWNLOAD_SUFFIXES = (".oneme.ru", ".max.ru", ".okcdn.ru")
+# Where MAX serves attachments from. vkuser.net is VK's media CDN (MAX is a
+# VK product): seen live handing out a forwarded video, which the bridge
+# then refused to fetch and the video never reached Telegram.
+_ALLOWED_DOWNLOAD_SUFFIXES = (".oneme.ru", ".max.ru", ".okcdn.ru", ".vkuser.net")
 
 
 def _is_allowed_download_url(url: str) -> bool:
