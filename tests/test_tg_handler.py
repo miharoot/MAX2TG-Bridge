@@ -3,6 +3,8 @@
 import socket
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from telegram.error import TimedOut
 
 from app.tg_handler import (
@@ -875,6 +877,96 @@ class TestDownloadTgFile:
 
         assert data == b"ok"
         assert file_obj.get_file.await_count == 2
+
+
+class TestDownloadByIdFailures:
+    """The video seen live: Telegram cut the download off mid-body
+    ("peer closed connection without sending complete message body"),
+    the bridge said "не удалось загрузить файл в MAX" as if that were
+    final — and the outbox delivered it two minutes later anyway."""
+
+    async def test_a_dropped_connection_is_retried(self, monkeypatch):
+        from telegram.error import NetworkError
+
+        from app.tg_handler import _download_tg_file_by_id
+
+        tg_file = MagicMock()
+        tg_file.file_size = 2
+        tg_file.download_as_bytearray = AsyncMock(side_effect=[
+            NetworkError("httpx.RemoteProtocolError: peer closed connection"),
+            bytearray(b"ok"),
+        ])
+        bot = MagicMock()
+        bot.get_file = AsyncMock(return_value=tg_file)
+        monkeypatch.setattr("app.tg_handler.asyncio.sleep", AsyncMock())
+
+        assert await _download_tg_file_by_id(bot, "file-id", 10) == b"ok"
+
+    async def test_an_oversized_file_is_unavailable_for_good(self):
+        from app.tg_handler import TgFileUnavailable, _download_tg_file_by_id
+
+        tg_file = MagicMock()
+        tg_file.file_size = 101
+        bot = MagicMock()
+        bot.get_file = AsyncMock(return_value=tg_file)
+
+        with pytest.raises(TgFileUnavailable):
+            await _download_tg_file_by_id(bot, "file-id", 100)
+
+    async def test_a_refusal_from_the_bot_api_is_unavailable_for_good(self):
+        """Bots may fetch files up to 20 MB only; asking again won't help."""
+        from telegram.error import BadRequest
+
+        from app.tg_handler import TgFileUnavailable, _download_tg_file_by_id
+
+        bot = MagicMock()
+        bot.get_file = AsyncMock(side_effect=BadRequest("File is too big"))
+
+        with pytest.raises(TgFileUnavailable):
+            await _download_tg_file_by_id(bot, "file-id", 100)
+        bot.get_file.assert_awaited_once()
+
+
+class TestMediaDeliveryWarnings:
+    def _client(self):
+        max_client = MagicMock()
+        max_client.send_message = AsyncMock(return_value={"ok": True})
+        return max_client
+
+    async def _deliver(self, monkeypatch, *, upload, warn_transient=True):
+        from app.tg_handler import _deliver_tg_media
+
+        monkeypatch.setattr("app.tg_handler._upload_media_by_spec", upload)
+        notify = AsyncMock()
+        result = await _deliver_tg_media(
+            MagicMock(), self._client(), -42, 100, "", [],
+            [{"kind": "video", "file_id": "x"}],
+            notify=notify, tg_chat_id=DEFAULT_TG_CHAT_ID, tg_message_id=7,
+            warn_transient=warn_transient,
+        )
+        return result, notify
+
+    async def test_a_passing_failure_says_it_will_retry(self, monkeypatch):
+        result, notify = await self._deliver(monkeypatch, upload=AsyncMock(return_value=None))
+
+        assert result is False
+        assert "повторю попытку" in notify.await_args.args[0]
+
+    async def test_a_retry_does_not_repeat_the_warning(self, monkeypatch):
+        result, notify = await self._deliver(
+            monkeypatch, upload=AsyncMock(return_value=None), warn_transient=False)
+
+        assert result is False
+        notify.assert_not_awaited()
+
+    async def test_a_file_that_can_never_go_is_dropped(self, monkeypatch):
+        from app.outbox import PermanentDeliveryFailure
+        from app.tg_handler import TgFileUnavailable
+
+        upload = AsyncMock(side_effect=TgFileUnavailable("файл 60.0 МБ больше лимита 50.0 МБ"))
+
+        with pytest.raises(PermanentDeliveryFailure):
+            await self._deliver(monkeypatch, upload=upload)
 
 
 class TestReadAnchorOnReply:

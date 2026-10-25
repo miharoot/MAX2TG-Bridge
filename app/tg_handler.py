@@ -9,7 +9,7 @@ from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import MessageEntityType
-from telegram.error import TimedOut
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -362,6 +362,13 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         max_client.outbox.finish(item_id)
 
 
+class TgFileUnavailable(Exception):
+    """A Telegram file that can never be fetched: over the size limit, or
+    refused by the Bot API itself (which serves bots files up to 20 MB
+    only). Retrying cannot change either, so the message is dropped with
+    this reason instead of being retried for a week."""
+
+
 async def _download_tg_file(file_obj, max_bytes: int = DEFAULT_MAX_UPLOAD_BYTES) -> bytes | None:
     """Pull bytes from a Telegram File object via the Bot API."""
     file_size = getattr(file_obj, "file_size", None)
@@ -376,12 +383,15 @@ async def _download_tg_file(file_obj, max_bytes: int = DEFAULT_MAX_UPLOAD_BYTES)
                 log.warning("Downloaded Telegram file is too large: %s bytes > %s bytes", len(data), max_bytes)
                 return None
             return data
-        except TimedOut:
-            log.warning(
-                "Telegram file download timeout (attempt %d/%d)",
-                attempt,
-                TG_FILE_RETRIES,
-            )
+        except BadRequest:
+            log.exception("Telegram refused the file download")
+            return None
+        except NetworkError as exc:
+            # A timeout, or the proxy dropping the connection mid-body —
+            # seen live as "peer closed connection without sending complete
+            # message body". Both pass; a refusal is BadRequest, above.
+            log.warning("Telegram file download failed (attempt %d/%d): %s",
+                        attempt, TG_FILE_RETRIES, exc)
             if attempt < TG_FILE_RETRIES:
                 await asyncio.sleep(2 * attempt)
         except Exception:
@@ -401,24 +411,37 @@ async def _download_tg_file_by_id(bot, file_id: str, max_bytes: int) -> bytes | 
             file_size = getattr(tg_file, "file_size", None)
             if file_size is not None and file_size > max_bytes:
                 log.warning("Telegram file is too large: %s bytes > %s bytes", file_size, max_bytes)
-                return None
+                raise TgFileUnavailable(
+                    f"файл {_mb(file_size)} больше лимита {_mb(max_bytes)}")
             data = bytes(await tg_file.download_as_bytearray())
             if len(data) > max_bytes:
                 log.warning("Downloaded Telegram file is too large: %s bytes > %s bytes", len(data), max_bytes)
-                return None
+                raise TgFileUnavailable(
+                    f"файл {_mb(len(data))} больше лимита {_mb(max_bytes)}")
             return data
-        except TimedOut:
-            log.warning(
-                "Telegram file download timeout (attempt %d/%d)",
-                attempt,
-                TG_FILE_RETRIES,
-            )
+        except TgFileUnavailable:
+            raise
+        except BadRequest as exc:
+            # The Bot API refused this file outright — most often "File is
+            # too big" (bots may fetch files up to 20 MB only).
+            log.warning("Telegram refused the file download: %s", exc)
+            raise TgFileUnavailable(f"Telegram не отдаёт этот файл боту ({exc})") from exc
+        except NetworkError as exc:
+            # A timeout, or the proxy dropping the connection mid-body —
+            # seen live as "peer closed connection without sending complete
+            # message body". Retried here before the whole message is.
+            log.warning("Telegram file download failed (attempt %d/%d): %s",
+                        attempt, TG_FILE_RETRIES, exc)
             if attempt < TG_FILE_RETRIES:
                 await asyncio.sleep(2 * attempt)
         except Exception:
             log.exception("Failed to download Telegram file by id")
             return None
     return None
+
+
+def _mb(n: int) -> str:
+    return f"{n / (1024 * 1024):.1f} МБ"
 
 
 def _duration_ms(duration) -> int | None:
@@ -514,15 +537,22 @@ async def _upload_media_by_spec(bot, spec: dict, max_client, max_chat_id, max_up
 
 async def _deliver_tg_media(bot, max_client, max_chat_id, max_upload_bytes,
                              caption: str, elements: list, specs: list[dict], *,
-                             notify, tg_chat_id, tg_message_id) -> bool:
+                             notify, tg_chat_id, tg_message_id,
+                             warn_transient: bool = True) -> bool:
     """Upload every attachment and send the MAX message. Shared by the live
     path (_send_topic_media_messages) and outbox retries — this is exactly
     the part that needs redoing on retry, since nothing before this point
     (the TG-side download source) is affected by MAX being unreachable."""
     attaches = []
+    unavailable = []
+    transient = 0
     for spec in specs:
         try:
             attach = await _upload_media_by_spec(bot, spec, max_client, max_chat_id, max_upload_bytes)
+        except TgFileUnavailable as exc:
+            unavailable.append(str(exc))
+            await notify(f"⚠️ Этот файл в MAX не передать: {exc}")
+            continue
         except Exception:
             log.exception("Failed to upload media (kind=%s) to MAX chat %s",
                           spec.get("kind"), max_chat_id)
@@ -530,9 +560,18 @@ async def _deliver_tg_media(bot, max_client, max_chat_id, max_upload_bytes,
         if attach:
             attaches.append(attach)
         else:
-            await notify("⚠️ Не удалось загрузить файл в MAX.")
+            transient += 1
+            # Said once, on the live attempt: the outbox retries on its own
+            # and the 🕊 delivery reaction shows when it gets through. The
+            # old "не удалось загрузить" with nothing after it read as final
+            # even when the file arrived two minutes later.
+            if warn_transient:
+                await notify("⚠️ Не удалось загрузить файл в MAX — повторю попытку позже.")
 
     if not attaches:
+        if unavailable and not transient:
+            # Nothing left that a retry could fix.
+            raise PermanentDeliveryFailure("; ".join(unavailable))
         return False
 
     try:
@@ -682,6 +721,7 @@ async def redeliver_tg_to_max_media(max_client, bot, payload: dict, max_upload_b
     return await _deliver_tg_media(
         bot, max_client, max_chat_id, max_upload_bytes, caption, elements, specs,
         notify=notify, tg_chat_id=tg_chat_id, tg_message_id=tg_message_id,
+        warn_transient=False,
     )
 
 
