@@ -267,7 +267,11 @@ class ContactResolver:
     # ── WebSocket contact fetch ────────────────────────────────────
 
     async def _ws_fetch_contacts(self, user_ids: list) -> None:
-        if not self._client:
+        # A channel post has no sender (sender_id None); asking MAX for
+        # contact None fails pymax's own validation before any request and
+        # logged an ERROR with a stack trace for an ordinary message.
+        user_ids = [uid for uid in user_ids if uid is not None]
+        if not self._client or not user_ids:
             return
         try:
             resp = await self._client.fetch_contacts(user_ids)

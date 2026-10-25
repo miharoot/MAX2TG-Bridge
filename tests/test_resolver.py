@@ -482,3 +482,29 @@ class TestParseChatResponse:
         resolver = ContactResolver()
         resolver._parse_chat_response(None)
         assert resolver.chats == {}
+
+
+class TestContactFetchSkipsMissingSenders:
+    """A channel post has no sender. Asking MAX for contact None failed
+    pymax's own validation and logged an ERROR with a stack trace."""
+
+    async def test_a_missing_sender_is_not_asked_for(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        client = MagicMock()
+        client.fetch_contacts = AsyncMock(return_value={})
+        resolver = ContactResolver(client=client)
+
+        assert await resolver.resolve_user(None) == "None"
+        client.fetch_contacts.assert_not_awaited()
+
+    async def test_the_rest_of_a_batch_is_still_fetched(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        client = MagicMock()
+        client.fetch_contacts = AsyncMock(return_value={})
+        resolver = ContactResolver(client=client)
+
+        await resolver.resolve_users_batch([None, 100000001])
+
+        client.fetch_contacts.assert_awaited_once_with([100000001])
