@@ -475,10 +475,25 @@ _PERMANENT_SEND_ERRORS = frozenset({
     "error.user.restricted.send",
 })
 
+# Codes MAX uses for more than one thing, final only with a given message.
+# chat.control + "Bot has restriction to input" is a service account
+# (security notices and the like) that takes no messages at all; the same
+# code may cover restrictions that do get lifted, so the code alone stays
+# retryable.
+_PERMANENT_SEND_ERROR_MESSAGES = frozenset({
+    ("chat.control", "bot has restriction to input"),
+})
+
 
 def _permanent_send_error(exc: Exception) -> bool:
     """True if MAX refused this message for good (see _PERMANENT_SEND_ERRORS)."""
-    return isinstance(exc, ApiError) and str(getattr(exc, "error", "") or "") in _PERMANENT_SEND_ERRORS
+    if not isinstance(exc, ApiError):
+        return False
+    code = str(getattr(exc, "error", "") or "")
+    if code in _PERMANENT_SEND_ERRORS:
+        return True
+    message = str(getattr(exc, "message", "") or "").strip().lower()
+    return (code, message) in _PERMANENT_SEND_ERROR_MESSAGES
 
 
 class VoiceRejectedByMax(UploadError):

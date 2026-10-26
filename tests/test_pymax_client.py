@@ -308,6 +308,39 @@ async def test_a_restricted_recipient_is_a_permanent_refusal(adapter):
     assert err["localizedMessage"] == "Начать диалог не получится. Возможности профиля ограничены"
 
 
+async def test_a_service_account_that_takes_no_input_is_a_permanent_refusal(adapter):
+    """MAX's own service accounts answer every message with chat.control
+    "Bot has restriction to input" — retrying can only get the same answer."""
+    client, raw = adapter
+    raw.send_message = AsyncMock(side_effect=ApiError(
+        opcode=64,
+        error="chat.control",
+        message="Bot has restriction to input",
+        localized_message="Невозможно отправить сообщение",
+        title="Невозможно отправить сообщение",
+    ))
+
+    resp = await client.send_message(20, "hello")
+
+    err = resp["_max_error"]
+    assert err["permanent"] is True
+    assert err["localizedMessage"] == "Невозможно отправить сообщение"
+
+
+async def test_chat_control_with_another_message_stays_retryable(adapter):
+    """chat.control alone is not final: other restrictions under the same
+    code may be lifted, so only the known message drops the item."""
+    client, raw = adapter
+    raw.send_message = AsyncMock(side_effect=ApiError(
+        opcode=64, error="chat.control", message="Something else",
+    ))
+
+    resp = await client.send_message(20, "hello")
+
+    assert not resp["_max_error"].get("permanent")
+    assert resp["_max_error"]["code"] == "chat.control"
+
+
 async def test_an_unknown_api_error_stays_retryable(adapter):
     """Only codes known to be final are dropped: misjudging the other way
     loses a message for good."""
