@@ -162,6 +162,35 @@ def _patch_voice_ready_resolution() -> None:
     log.debug("Patched pymax attach-ready event resolution for voice messages")
 
 
+_PATCHED_OWN_REACTIONS = False
+
+
+def _patch_ignore_own_reaction_notifications() -> None:
+    """Idempotent — safe to call multiple times.
+
+    pymax 2.5.0 started routing NOTIF_MSG_YOU_REACTED (opcode 156) into the
+    same reaction-update event as everyone else's reactions (opcode 155).
+    The event carries nothing that tells the two apart — ``your_reaction``
+    is set on the ordinary update too once you have reacted to a message —
+    so every reaction you put on in a MAX client started posting a
+    "Реакция на сообщение" line into the topic. 2.4.1 had no mapping for
+    that opcode at all; dropping it restores exactly that behaviour, and
+    other people's reactions keep arriving through opcode 155 as before.
+    A no-op on a pymax without the opcode.
+    """
+    global _PATCHED_OWN_REACTIONS
+    if _PATCHED_OWN_REACTIONS:
+        return
+    from pymax.dispatch import mapping
+    from pymax.protocol import Opcode
+
+    own = getattr(Opcode, "NOTIF_MSG_YOU_REACTED", None)
+    if own is not None:
+        mapping.EVENT_MAP.pop(own, None)
+    _PATCHED_OWN_REACTIONS = True
+    log.debug("Own-reaction notifications are not dispatched as reaction updates")
+
+
 _PATCHED_ATTACHMENT_WAIT_TIMEOUT = False
 _ATTACHMENT_READY_WAIT_SECONDS = 8
 _ATTACHMENT_READY_MAX_ATTEMPTS = 5
@@ -565,7 +594,14 @@ async def _upload_voice_without_mangled_user_agent(self, voice):
                 timeout=timeout, proxy=self.app.config.proxy
             ) as session:
                 async with session.post(
-                    url=upload_info.url, headers=headers, data=data
+                    url=upload_info.url, headers=headers, data=data,
+                    # pymax 2.5+ verifies MAX's upload hosts against its own
+                    # context: the system CAs plus the Russian Trusted Root
+                    # CA it ships, which those hosts' certificates may chain
+                    # to. It is a local object passed to this one request —
+                    # nothing global changes. None (older pymax) keeps
+                    # aiohttp's default verification.
+                    ssl=getattr(self, "ssl_ctx", None),
                 ) as resp:
                     # MAX reports upload errors with an HTTP 200, so the
                     # body is the only place such a failure surfaces.
@@ -737,7 +773,8 @@ async def _upload_photo_without_photo_ids_in_url(self, photo, profile: bool = Fa
     try:
         async with (
             aiohttp.ClientSession(proxy=self.app.config.proxy) as session,
-            session.post(url=url, data=form) as response,
+            session.post(url=url, data=form,
+                         ssl=getattr(self, "ssl_ctx", None)) as response,
         ):
             if response.status != HTTPStatus.OK:
                 logger.error("Photo upload failed with status %s", response.status)
@@ -770,10 +807,30 @@ async def _upload_photo_without_photo_ids_in_url(self, photo, profile: bool = Fa
     return AttachPhotoPayload(photo_token=token)
 
 
+def _pymax_version() -> tuple[int, ...]:
+    """Installed maxapi-python version as numbers; (0,) if unknown."""
+    try:
+        from importlib.metadata import version
+
+        return tuple(int(part) for part in version("maxapi-python").split(".")[:3])
+    except Exception:
+        return (0,)
+
+
 def _patch_photo_upload_id_lookup() -> None:
-    """Idempotent — safe to call multiple times."""
+    """Idempotent — safe to call multiple times.
+
+    Only for pymax < 2.5.0: 2.5.0 fixed the same bug upstream (and reads
+    the newer ``photos`` parameter too), so replacing its upload_photo
+    would put the older, worse copy back.
+    """
     global _PATCHED_PHOTO_UPLOAD_ID
     if _PATCHED_PHOTO_UPLOAD_ID:
+        return
+    if _pymax_version() >= (2, 5, 0):
+        _PATCHED_PHOTO_UPLOAD_ID = True
+        log.debug("pymax %s handles photo upload URLs without photoIds; not patching",
+                  ".".join(map(str, _pymax_version())))
         return
     from pymax.api.uploads.service import UploadService
 
@@ -1104,6 +1161,7 @@ class PyMaxClient:
         _patch_attachment_wait_timeout()
         _patch_voice_upload_user_agent()
         _patch_photo_upload_id_lookup()
+        _patch_ignore_own_reaction_notifications()
         self.settings = settings
         self.max_download_bytes = settings.max_download_mb * 1024 * 1024
         self.chat_ids: list[int] = []

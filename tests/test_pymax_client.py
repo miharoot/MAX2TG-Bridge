@@ -524,12 +524,20 @@ class TestReadMessagePayloadSerialization:
         from pymax.api.messages.enums import ReadAction
         from pymax.api.messages.payloads import ReadMessagesPayload
 
+        from app.pymax_client import _pymax_version
+
         payload = ReadMessagesPayload(
             type=ReadAction.READ_MESSAGE, chat_id=100000001,
             message_id="117250688214045881", mark=1234567890,
         )
-        assert payload.to_payload()["messageId"] == "117250688214045881"
-        assert isinstance(payload.to_payload()["messageId"], str)
+        if _pymax_version() >= (2, 5, 0):
+            # 2.5.0 types message_id as int and coerces the string itself;
+            # the int() in PyMaxClient.read_message stays as the guard for
+            # older pymax, where the string went out as-is.
+            assert payload.to_payload()["messageId"] == 117250688214045881
+        else:
+            assert payload.to_payload()["messageId"] == "117250688214045881"
+            assert isinstance(payload.to_payload()["messageId"], str)
 
     def test_int_message_id_serializes_as_json_number(self):
         from pymax.api.messages.enums import ReadAction
@@ -776,7 +784,7 @@ class TestPhotoUploadIdPatch:
         async def __aexit__(self, *exc):
             return False
 
-        def post(self, url, data=None, headers=None):
+        def post(self, url, data=None, headers=None, ssl=None):
             type(self).last_url = url
             return TestPhotoUploadIdPatch._FakeResponse(type(self).status)
 
@@ -790,16 +798,52 @@ class TestPhotoUploadIdPatch:
         return SimpleNamespace(app=app)
 
     async def _upload(self, monkeypatch, *, url, photos, status=200):
-        from app.pymax_client import _patch_photo_upload_id_lookup
+        # Our copy is called directly: on pymax >= 2.5 it is no longer
+        # installed (upstream fixed the bug), but it stays for older pymax.
+        from app.pymax_client import _upload_photo_without_photo_ids_in_url
 
-        _patch_photo_upload_id_lookup()
         self._FakeResponse.payload = {"photos": photos}
         self._FakeSession.status = status
         monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
 
+        return await _upload_photo_without_photo_ids_in_url(
+            self._service(url), self._FakePhoto())
+
+    async def test_pymax_2_5_keeps_its_own_fixed_upload_photo(self):
+        """2.5.0 handles a URL without photoIds itself and verifies MAX's
+        upload host with its own SSL context; putting our older copy over
+        it would lose both."""
+        from app.pymax_client import (
+            _patch_photo_upload_id_lookup,
+            _pymax_version,
+            _upload_photo_without_photo_ids_in_url,
+        )
         from pymax.api.uploads.service import UploadService
 
-        return await UploadService.upload_photo(self._service(url), self._FakePhoto())
+        if _pymax_version() < (2, 5, 0):
+            pytest.skip("only meaningful on pymax >= 2.5.0")
+        _patch_photo_upload_id_lookup()
+
+        assert UploadService.upload_photo is not _upload_photo_without_photo_ids_in_url
+
+    async def test_upstream_2_5_uploads_without_photo_ids(self, monkeypatch):
+        """The upstream fix we now rely on, checked rather than assumed."""
+        from types import SimpleNamespace
+
+        from app.pymax_client import _pymax_version
+        from pymax.api.uploads.service import UploadService
+
+        if _pymax_version() < (2, 5, 0):
+            pytest.skip("only meaningful on pymax >= 2.5.0")
+        self._FakeResponse.payload = {"photos": {"9911": {"token": "photo-token"}}}
+        self._FakeSession.status = 200
+        monkeypatch.setattr("aiohttp.ClientSession", self._FakeSession)
+        service = self._service("https://iu.oneme.ru/uploadImage?r=AFzp8WiMnXAD")
+        service.ssl_ctx = None
+
+        result = await UploadService.upload_photo(service, self._FakePhoto())
+
+        assert result.photo_token == "photo-token"
 
     async def test_a_url_without_photo_ids_still_uploads(self, monkeypatch):
         """The regression: nothing in the URL to key the answer by, one
@@ -911,9 +955,10 @@ class TestVoiceUploadUserAgentPatch:
 
         all_data: list = []
 
-        def post(self, url, headers=None, data=None):
+        def post(self, url, headers=None, data=None, ssl=None):
             type(self).last_headers = headers
             type(self).last_url = url
+            type(self).last_ssl = ssl
             type(self).all_headers = type(self).all_headers + [headers]
             type(self).all_data = type(self).all_data + [data]
             return TestVoiceUploadUserAgentPatch._FakeResponse(200)
@@ -1055,7 +1100,7 @@ class TestVoiceUploadUserAgentPatch:
         calls = {"n": 0}
 
         class _PickySession(self._FakeSession):
-            def post(self, url, headers=None, data=None):
+            def post(self, url, headers=None, data=None, ssl=None):
                 calls["n"] += 1
                 type(self).last_headers = headers
                 if calls["n"] < accepted_on_call:
@@ -1104,7 +1149,7 @@ class TestVoiceUploadUserAgentPatch:
         audio re-encoded to 48 kHz mono Opus — so that is the normal
         path, with the untouched file kept as the no-ffmpeg fallback."""
         class _RejectingSession(self._FakeSession):
-            def post(self, url, headers=None, data=None):
+            def post(self, url, headers=None, data=None, ssl=None):
                 type(self).all_data = type(self).all_data + [data]
                 rejecting = TestVoiceUploadUserAgentPatch._FakeResponse(200)
                 rejecting.text = _AsyncReturn(
@@ -1182,7 +1227,7 @@ class TestVoiceUploadUserAgentPatch:
         next shape against the same slot answers BAD_REQUEST no matter
         what — which would make the whole comparison meaningless."""
         class _RejectingSession(self._FakeSession):
-            def post(self, url, headers=None, data=None):
+            def post(self, url, headers=None, data=None, ssl=None):
                 rejecting = TestVoiceUploadUserAgentPatch._FakeResponse(200)
                 rejecting.text = _AsyncReturn(
                     '{"error_code":"4","error_data":"BAD_REQUEST"}'
@@ -1212,7 +1257,7 @@ class TestVoiceUploadUserAgentPatch:
         calls = {"n": 0}
 
         class _FlakySession(self._FakeSession):
-            def post(self, url, headers=None, data=None):
+            def post(self, url, headers=None, data=None, ssl=None):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise _aiohttp.ClientError("Server disconnected")
@@ -1243,7 +1288,7 @@ class TestVoiceUploadUserAgentPatch:
                 return '{"error_code":"1","error_data":"AUDIO_VALIDATION_FAILED"}'
 
         class _RejectingSession(self._FakeSession):
-            def post(self, url, headers=None, data=None):
+            def post(self, url, headers=None, data=None, ssl=None):
                 return _RejectingResponse(200)
 
         _patch_voice_upload_user_agent()
@@ -1258,7 +1303,7 @@ class TestVoiceUploadUserAgentPatch:
         _patch_voice_upload_user_agent()
 
         class _FailingSession(self._FakeSession):
-            def post(self, url, headers=None, data=None):
+            def post(self, url, headers=None, data=None, ssl=None):
                 return TestVoiceUploadUserAgentPatch._FakeResponse(500)
 
         monkeypatch.setattr("aiohttp.ClientSession", _FailingSession)
@@ -1358,3 +1403,65 @@ class TestDownloadAllowlist:
         from app.pymax_client import _is_allowed_download_url
 
         assert not _is_allowed_download_url(url)
+
+
+
+class TestOwnReactionNotifications:
+    """pymax 2.5.0 routes NOTIF_MSG_YOU_REACTED (your own reaction, opcode
+    156) into the same reaction-update event as everyone else's, with
+    nothing in the event to tell them apart — so your own reactions in a
+    MAX client started posting lines into the topic."""
+
+    def test_own_reactions_are_not_dispatched(self):
+        from app.pymax_client import _patch_ignore_own_reaction_notifications
+        from pymax.dispatch import mapping
+        from pymax.protocol import Opcode
+
+        _patch_ignore_own_reaction_notifications()
+
+        own = getattr(Opcode, "NOTIF_MSG_YOU_REACTED", None)
+        if own is not None:
+            assert own not in mapping.EVENT_MAP
+        assert Opcode.NOTIF_MSG_REACTIONS_CHANGED in mapping.EVENT_MAP
+
+    def test_patching_twice_is_harmless(self):
+        from app.pymax_client import _patch_ignore_own_reaction_notifications
+
+        _patch_ignore_own_reaction_notifications()
+        _patch_ignore_own_reaction_notifications()
+
+
+class TestVoiceUploadUsesPymaxsSslContext:
+    """pymax 2.5.0 verifies MAX's upload hosts against its own context
+    (system CAs plus the Russian Trusted Root CA it ships). Our voice upload
+    replaces pymax's, so it has to pass the same context along — a local
+    object for that one request, nothing global."""
+
+    async def test_the_context_reaches_the_upload_request(self, monkeypatch):
+        from app.pymax_client import _patch_voice_upload_user_agent
+        from pymax.api.uploads.service import UploadService
+
+        harness = TestVoiceUploadUserAgentPatch()
+        _patch_voice_upload_user_agent()
+        monkeypatch.setattr("aiohttp.ClientSession", harness._FakeSession)
+        service = harness._fake_upload_service(header_user_agent="Mozilla/5.0")
+        context = object()
+        service.ssl_ctx = context
+
+        await UploadService.upload_voice(service, harness._FakeVoice())
+
+        assert harness._FakeSession.last_ssl is context
+
+    async def test_without_a_context_default_verification_stays(self, monkeypatch):
+        """pymax < 2.5 has no ssl_ctx; aiohttp then verifies as it always did."""
+        from app.pymax_client import _patch_voice_upload_user_agent
+        from pymax.api.uploads.service import UploadService
+
+        harness = TestVoiceUploadUserAgentPatch()
+        _patch_voice_upload_user_agent()
+        monkeypatch.setattr("aiohttp.ClientSession", harness._FakeSession)
+        service = harness._fake_upload_service(header_user_agent="Mozilla/5.0")
+
+        await UploadService.upload_voice(service, harness._FakeVoice())
+
+        assert harness._FakeSession.last_ssl is None
