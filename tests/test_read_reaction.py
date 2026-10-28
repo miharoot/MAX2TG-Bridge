@@ -51,7 +51,8 @@ class _FakePyMaxClient:
     def is_bridge_echo(self, msg: MaxMessage) -> bool:
         return False
 
-    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id):
+    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id,
+                                 max_message_id=None):
         """Same contract as PyMaxClient: where a later MAX read marker
         puts its ✅, in memory and (for the real one) in the outbox."""
         if tg_message_id is None or tg_chat_id is None:

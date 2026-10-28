@@ -989,8 +989,10 @@ class TestReadAnchorOnReply:
             max_client=max_client, max_chat_id=-42,
         )
 
+        # The MAX id comes along so a later reply to this message can be
+        # sent as a reply to it in MAX.
         max_client.remember_tg_anchor.assert_awaited_once_with(
-            -42, DEFAULT_TG_CHAT_ID, 77)
+            -42, DEFAULT_TG_CHAT_ID, 77, max_message_id=1)
 
     async def test_a_rejected_message_leaves_the_anchor_alone(self):
         """MAX refused it, so nothing of yours is in that chat to be read."""

@@ -48,7 +48,8 @@ class FakeClient:
     last_message_ids: dict = {}
     last_tg_message: dict = {}
 
-    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id):
+    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id,
+                                 max_message_id=None):
         self.last_tg_message[max_chat_id] = (tg_chat_id, int(tg_message_id))
 
 

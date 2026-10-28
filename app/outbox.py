@@ -41,6 +41,9 @@ TG_TO_MAX_MEDIA = "tg_to_max_media"
 # How long a bridge-sent MAX message id is worth keeping: long enough to
 # outlive any catch-up window, short enough that the table stays small.
 SENT_BY_BRIDGE_TTL_SEC = 7 * 24 * 60 * 60
+# How long a MAX ↔ Telegram message pair stays answerable: a reply to
+# something older than this goes out as a plain message.
+MESSAGE_MAP_TTL_SEC = 90 * 24 * 60 * 60
 
 
 class PermanentDeliveryFailure(Exception):
@@ -228,6 +231,25 @@ class Outbox:
                     )
                     """
                 )
+                # Which Telegram message is which MAX message, both
+                # directions — what turns a reply on one side into a reply
+                # to the right message on the other.
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS message_map (
+                        tg_chat_id     TEXT NOT NULL,
+                        tg_message_id  INTEGER NOT NULL,
+                        max_chat_id    TEXT NOT NULL,
+                        max_message_id TEXT NOT NULL,
+                        created_at     REAL NOT NULL,
+                        PRIMARY KEY (tg_chat_id, tg_message_id)
+                    )
+                    """
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS message_map_by_max "
+                    "ON message_map (max_chat_id, max_message_id)"
+                )
                 await conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS max_contacts (
@@ -282,6 +304,51 @@ class Outbox:
         ) as cur:
             rows = await cur.fetchall()
         return {str(chat_id): str(last_id) for chat_id, last_id in rows}
+
+    async def map_message(self, tg_chat_id: Any, tg_message_id: Any,
+                          max_chat_id: Any, max_message_id: Any) -> None:
+        """Remember that this Telegram message and this MAX message are
+        the same message."""
+        if None in (tg_chat_id, tg_message_id, max_chat_id, max_message_id):
+            return
+        now = time.time()
+        conn = await self._get_conn()
+        await conn.execute(
+            "INSERT OR REPLACE INTO message_map (tg_chat_id, tg_message_id, "
+            "max_chat_id, max_message_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            (str(tg_chat_id), int(tg_message_id), str(max_chat_id),
+             str(max_message_id), now),
+        )
+        await conn.execute("DELETE FROM message_map WHERE created_at < ?",
+                           (now - MESSAGE_MAP_TTL_SEC,))
+        await conn.commit()
+
+    async def max_message_for(self, tg_chat_id: Any, tg_message_id: Any,
+                              max_chat_id: Any) -> str | None:
+        """The MAX message a Telegram message stands for — only within
+        that MAX chat, so a stray pair can't aim a reply elsewhere."""
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT max_message_id FROM message_map WHERE tg_chat_id = ? "
+            "AND tg_message_id = ? AND max_chat_id = ?",
+            (str(tg_chat_id), int(tg_message_id), str(max_chat_id)),
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else str(row[0])
+
+    async def tg_message_for(self, max_chat_id: Any, max_message_id: Any,
+                             tg_chat_id: Any) -> int | None:
+        """The Telegram message a MAX message was forwarded as (the latest,
+        if it went out in several)."""
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT tg_message_id FROM message_map WHERE max_chat_id = ? "
+            "AND max_message_id = ? AND tg_chat_id = ? "
+            "ORDER BY created_at DESC, tg_message_id DESC LIMIT 1",
+            (str(max_chat_id), str(max_message_id), str(tg_chat_id)),
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else int(row[0])
 
     async def save_max_chats(self, chats: list[dict], *, complete: bool) -> None:
         """Store the MAX chat list. ``complete`` says the list is the whole

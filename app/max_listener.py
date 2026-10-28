@@ -439,6 +439,14 @@ async def _handle_linked_message(
     return last_message
 
 
+def _meaningful_attaches(attaches) -> list[dict]:
+    """Attachments that carry content, as opposed to MAX's service ones."""
+    return [
+        a for a in attaches or []
+        if isinstance(a, dict) and a.get("_type") not in ("CONTROL", "WIDGET", "INLINE_KEYBOARD", None)
+    ]
+
+
 def _human_size(n: int) -> str:
     for unit in ("Б", "КБ", "МБ", "ГБ"):
         if n < 1024:
@@ -1076,6 +1084,24 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         link = msg.link
         link_type = link.get("type") if isinstance(link, dict) else None
 
+        if link_type == "REPLY" and msg.text and not _meaningful_attaches(msg.attaches):
+            # A reply to a message the bridge forwarded (or sent) goes out
+            # as a Telegram reply to it — Telegram quotes the original
+            # itself, so it isn't repeated as a separate message.
+            original = link.get("message") if isinstance(link.get("message"), dict) else {}
+            reply_to_tg = await client.tg_reply_target(
+                msg.chat_id, original.get("id"), target_chat_id)
+            if reply_to_tg is not None:
+                last_message = await sender.send(
+                    f"{header_text}\n{escape(msg.text)}", message_thread_id=thread_id,
+                    chat_id=target_chat_id, reply_to_message_id=reply_to_tg)
+                log.info("Forwarded reply → TG as a reply to message %s", reply_to_tg)
+                if last_message is not None:
+                    await client.remember_tg_anchor(msg.chat_id, target_chat_id,
+                                                    last_message.message_id,
+                                                    max_message_id=msg.message_id)
+                return
+
         if link_type in ("FORWARD", "REPLY"):
             last_message = await _handle_linked_message(
                 link, link_type, header_text, client, sender, resolver,
@@ -1085,13 +1111,11 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
                 last_message = await sender.send(f"{header_text}\n{escape(msg.text)}", message_thread_id=thread_id, chat_id=target_chat_id)
             log.info("Forwarded link type=%s → TG", link_type)
             if last_message is not None:
-                await client.remember_tg_anchor(msg.chat_id, target_chat_id, last_message.message_id)
+                await client.remember_tg_anchor(msg.chat_id, target_chat_id, last_message.message_id,
+                                                max_message_id=msg.message_id)
             return
 
-        meaningful_attaches = [
-            a for a in msg.attaches
-            if isinstance(a, dict) and a.get("_type") not in ("CONTROL", "WIDGET", "INLINE_KEYBOARD", None)
-        ]
+        meaningful_attaches = _meaningful_attaches(msg.attaches)
 
         if meaningful_attaches:
             group_caption = header_text
@@ -1112,7 +1136,8 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
                 grouped = None
             if grouped is not None and grouped is not False:
                 log.info("Forwarded %d attachments as media group", len(meaningful_attaches))
-                await client.remember_tg_anchor(msg.chat_id, target_chat_id, grouped.message_id)
+                await client.remember_tg_anchor(msg.chat_id, target_chat_id, grouped.message_id,
+                                                max_message_id=msg.message_id)
                 return
             if grouped is False:
                 fail_msg = await sender.send(
@@ -1120,7 +1145,8 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
                     message_thread_id=thread_id, chat_id=target_chat_id,
                 )
                 if fail_msg is not None:
-                    await client.remember_tg_anchor(msg.chat_id, target_chat_id, fail_msg.message_id)
+                    await client.remember_tg_anchor(msg.chat_id, target_chat_id, fail_msg.message_id,
+                                                    max_message_id=msg.message_id)
                 return
 
             text_sent = False
@@ -1165,7 +1191,8 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             log.info("Forwarded text → TG")
 
         if last_message is not None:
-            await client.remember_tg_anchor(msg.chat_id, target_chat_id, last_message.message_id)
+            await client.remember_tg_anchor(msg.chat_id, target_chat_id, last_message.message_id,
+                                            max_message_id=msg.message_id)
 
     # Exposed for the background retry loop (see app/outbox_retry.py) to
     # re-attempt a MAX→TG message that failed and is still sitting in the

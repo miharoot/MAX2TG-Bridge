@@ -1410,6 +1410,7 @@ class PyMaxClient:
         text: str = "",
         elements=None,
         attaches=None,
+        reply_to=None,
     ) -> dict:
         # A voice/video attachment can raise UploadError("Timed out
         # waiting for video processing ...") — MAX's own "attachment
@@ -1420,11 +1421,13 @@ class PyMaxClient:
         last_exc: Exception | None = None
         for attempt in range(1, _ATTACHMENT_READY_MAX_ATTEMPTS + 1):
             try:
+                extra = {"reply_to": int(reply_to)} if reply_to else {}
                 message = await self._client.send_message(
                     int(chat_id),
                     text=text or None,
                     attachments=attaches or None,
                     notify=True,
+                    **extra,
                 )
             except VoiceRejectedByMax as exc:
                 # Not a timing problem — re-uploading the same rejected
@@ -1479,13 +1482,15 @@ class PyMaxClient:
         await self._remember_sent_message(chat_id, getattr(message, "id", None))
         return _model_dict(message) or {"ok": True}
 
-    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id) -> None:
+    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id,
+                                 max_message_id=None) -> None:
         """Record the Telegram message a later MAX read marker reacts to.
 
         Both directions call this — a MAX message forwarded into the topic
         (app/max_listener.py) and a reply sent from it (app/tg_handler.py)
         — so the read receipt lands on whatever was said last, not on the
-        last thing the other side happened to send.
+        last thing the other side happened to send. With ``max_message_id``
+        the pair is also kept for replies (see max_reply_target).
         """
         if tg_message_id is None or tg_chat_id is None:
             return
@@ -1493,6 +1498,13 @@ class PyMaxClient:
         box = getattr(self, "outbox", None)
         if box is None:
             return
+        if max_message_id is not None:
+            try:
+                await box.map_message(tg_chat_id, tg_message_id, max_chat_id, max_message_id)
+            except Exception:
+                # Costs only a reply going out without its target.
+                log.exception("Could not record Telegram message %s as MAX message %s",
+                              tg_message_id, max_message_id)
         try:
             await box.set_last_tg_message(max_chat_id, tg_chat_id, tg_message_id)
         except Exception:
@@ -1502,6 +1514,33 @@ class PyMaxClient:
                 "Could not persist the read-receipt anchor for MAX chat %s (Telegram "
                 "message %s in %s)", max_chat_id, tg_message_id, tg_chat_id,
             )
+
+    async def max_reply_target(self, max_chat_id, tg_chat_id, tg_message_id) -> int | None:
+        """The MAX message id a reply to this Telegram message answers, or
+        None when the bridge never paired it with one (older than the
+        pairing, or not from this chat)."""
+        box = getattr(self, "outbox", None)
+        if box is None or tg_message_id is None:
+            return None
+        try:
+            found = await box.max_message_for(tg_chat_id, tg_message_id, max_chat_id)
+            return int(found) if found is not None else None
+        except Exception:
+            log.exception("Could not look up the MAX message for Telegram message %s",
+                          tg_message_id)
+            return None
+
+    async def tg_reply_target(self, max_chat_id, max_message_id, tg_chat_id) -> int | None:
+        """The Telegram message a MAX reply's original was forwarded as."""
+        box = getattr(self, "outbox", None)
+        if box is None or max_message_id is None:
+            return None
+        try:
+            return await box.tg_message_for(max_chat_id, max_message_id, tg_chat_id)
+        except Exception:
+            log.exception("Could not look up the Telegram message for MAX message %s",
+                          max_message_id)
+            return None
 
     async def _remember_sent_message(self, chat_id, message_id) -> None:
         box = getattr(self, "outbox", None)

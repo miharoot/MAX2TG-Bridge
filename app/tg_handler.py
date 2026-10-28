@@ -207,6 +207,41 @@ def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return message, max_chat_id, max_client
 
 
+def _replied_tg_message_id(message) -> int | None:
+    """The Telegram message this one answers, if it is a real reply.
+
+    In a forum topic every message carries the topic's opening service
+    message as its reply_to_message; that one is not an answer to anything.
+    """
+    reply = getattr(message, "reply_to_message", None)
+    reply_id = getattr(reply, "message_id", None)
+    if not isinstance(reply_id, int):
+        return None
+    if reply_id == getattr(message, "message_thread_id", None):
+        return None
+    if getattr(reply, "forum_topic_created", None):
+        return None
+    return reply_id
+
+
+async def _max_reply_to(max_client, max_chat_id, tg_chat_id, reply_tg_message_id) -> int | None:
+    """The MAX message to send as a reply to, from the Telegram message
+    replied to. Looked up at send time, so a retry finds a pair recorded
+    after the message was queued (a reply to your own message still in
+    flight)."""
+    if reply_tg_message_id is None:
+        return None
+    reply_to = await max_client.max_reply_target(max_chat_id, tg_chat_id, reply_tg_message_id)
+    if reply_to is None:
+        log.info("Reply to Telegram message %s has no MAX counterpart — sent as "
+                 "a plain message", reply_tg_message_id)
+    return reply_to
+
+
+def _reply_kwargs(reply_to) -> dict:
+    return {"reply_to": reply_to} if reply_to else {}
+
+
 async def _surface_send_result(resp, *, bot, tg_chat_id, tg_message_id, notify,
                                 max_client=None, max_chat_id=None) -> bool:
     """Translate a Max send_message response into a Telegram reaction or
@@ -269,7 +304,9 @@ async def _surface_send_result(resp, *, bot, tg_chat_id, tg_message_id, notify,
         # read receipt went on the last message the *other* side had sent,
         # or nowhere at all when they had not sent one since the last
         # restart.
-        await max_client.remember_tg_anchor(max_chat_id, tg_chat_id, tg_message_id)
+        sent_id = resp.get("id") if isinstance(resp, dict) else None
+        await max_client.remember_tg_anchor(max_chat_id, tg_chat_id, tg_message_id,
+                                            max_message_id=sent_id)
         last_id = max_client.last_message_ids.get(max_chat_id)
         if last_id:
             ok = await max_client.read_message(max_chat_id, last_id)
@@ -318,12 +355,14 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elements = _entities_to_max_elements(message.text, message.entities)
     tg_chat_id = message.chat_id
     thread_id = message.message_thread_id
+    reply_tg_message_id = _replied_tg_message_id(message)
 
     item_id = await max_client.outbox.add(outbox.TG_TO_MAX_TEXT, {
         "max_chat_id": max_chat_id,
         "tg_chat_id": tg_chat_id,
         "thread_id": thread_id,
         "tg_message_id": message.message_id,
+        "reply_to_tg_message_id": reply_tg_message_id,
         "text": message.text,
         "elements": elements,
     })
@@ -335,8 +374,11 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     max_client.outbox.try_start(item_id)
     try:
         try:
+            reply_to = await _max_reply_to(max_client, max_chat_id, tg_chat_id,
+                                           reply_tg_message_id)
             resp = await max_client.send_message(max_chat_id, message.text,
-                                                  elements=elements)
+                                                  elements=elements,
+                                                  **_reply_kwargs(reply_to))
         except Exception as exc:
             log.exception("Failed to send reply to Max chat %s", max_chat_id)
             await message.reply_text("⚠️ Ошибка при отправке в Max. Повторю попытку позже.")
@@ -545,7 +587,8 @@ async def _upload_media_by_spec(bot, spec: dict, max_client, max_chat_id, max_up
 async def _deliver_tg_media(bot, max_client, max_chat_id, max_upload_bytes,
                              caption: str, elements: list, specs: list[dict], *,
                              notify, tg_chat_id, tg_message_id,
-                             warn_transient: bool = True) -> bool:
+                             warn_transient: bool = True,
+                             reply_tg_message_id: int | None = None) -> bool:
     """Upload every attachment and send the MAX message. Shared by the live
     path (_send_topic_media_messages) and outbox retries — this is exactly
     the part that needs redoing on retry, since nothing before this point
@@ -582,8 +625,11 @@ async def _deliver_tg_media(bot, max_client, max_chat_id, max_upload_bytes,
         return False
 
     try:
+        reply_to = await _max_reply_to(max_client, max_chat_id, tg_chat_id,
+                                       reply_tg_message_id)
         resp = await max_client.send_message(
             max_chat_id, text=caption, elements=elements, attaches=attaches,
+            **_reply_kwargs(reply_to),
         )
     except Exception:
         log.exception("Failed to send media group to Max chat %s", max_chat_id)
@@ -614,12 +660,17 @@ async def _send_topic_media_messages(messages, max_chat_id, max_client, max_uplo
     elements = _entities_to_max_elements(caption, caption_message.caption_entities)
     tg_chat_id = caption_message.chat_id
     thread_id = caption_message.message_thread_id
+    # An album answers whatever any of its parts answers.
+    reply_tg_message_id = next(
+        (rid for rid in map(_replied_tg_message_id, [caption_message, *messages])
+         if rid is not None), None)
 
     item_id = await max_client.outbox.add(outbox.TG_TO_MAX_MEDIA, {
         "max_chat_id": max_chat_id,
         "tg_chat_id": tg_chat_id,
         "thread_id": thread_id,
         "tg_message_id": caption_message.message_id,
+        "reply_to_tg_message_id": reply_tg_message_id,
         "caption": caption,
         "elements": elements,
         "media_specs": specs,
@@ -639,6 +690,7 @@ async def _send_topic_media_messages(messages, max_chat_id, max_client, max_uplo
                 bot, max_client, max_chat_id, max_upload_bytes, caption, elements, specs,
                 notify=caption_message.reply_text,
                 tg_chat_id=tg_chat_id, tg_message_id=caption_message.message_id,
+                reply_tg_message_id=reply_tg_message_id,
             )
         except PermanentDeliveryFailure as exc:
             # Already reported into the topic; queueing it would only
@@ -695,7 +747,10 @@ async def redeliver_tg_to_max_text(max_client, bot, payload: dict) -> bool:
             log.exception("Outbox retry: failed to post status into chat %s", tg_chat_id)
 
     try:
-        resp = await max_client.send_message(max_chat_id, text, elements=elements)
+        reply_to = await _max_reply_to(max_client, max_chat_id, tg_chat_id,
+                                       payload.get("reply_to_tg_message_id"))
+        resp = await max_client.send_message(max_chat_id, text, elements=elements,
+                                             **_reply_kwargs(reply_to))
     except Exception:
         log.exception("Outbox retry: failed to send TG→MAX text to chat %s", max_chat_id)
         return False
@@ -729,6 +784,7 @@ async def redeliver_tg_to_max_media(max_client, bot, payload: dict, max_upload_b
         bot, max_client, max_chat_id, max_upload_bytes, caption, elements, specs,
         notify=notify, tg_chat_id=tg_chat_id, tg_message_id=tg_message_id,
         warn_transient=False,
+        reply_tg_message_id=payload.get("reply_to_tg_message_id"),
     )
 
 

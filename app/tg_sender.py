@@ -2,7 +2,14 @@ import asyncio
 import io
 import logging
 
-from telegram import Bot, InputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo
+from telegram import (
+    Bot,
+    InputFile,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
+    ReplyParameters,
+)
 from telegram.constants import ParseMode, ReactionEmoji
 from telegram.error import BadRequest, InvalidToken, NetworkError, RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
@@ -379,19 +386,27 @@ class TelegramSender:
     # falls back to the configured default group.
 
     async def send(self, text: str, message_thread_id: int | None = None,
-                    chat_id: str | int | None = None):
+                    chat_id: str | int | None = None,
+                    reply_to_message_id: int | None = None):
         if not text:
             return None
 
         if len(text) > TG_MAX_LENGTH:
             text = text[: TG_MAX_LENGTH - 20] + "\n\n[...усечено]"
 
+        extra = {}
+        if reply_to_message_id is not None:
+            # A reply whose original was deleted in Telegram still goes out,
+            # just without the quote.
+            extra["reply_parameters"] = ReplyParameters(
+                message_id=int(reply_to_message_id), allow_sending_without_reply=True)
         return await self._retry(
             lambda: self._bot.send_message(
                 chat_id=chat_id if chat_id is not None else self._default_chat_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 message_thread_id=message_thread_id,
+                **extra,
             )
         )
 

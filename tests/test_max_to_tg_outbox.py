@@ -51,15 +51,25 @@ class _FakePyMaxClient:
     def is_bridge_echo(self, msg: MaxMessage) -> bool:
         return False
 
-    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id):
+    async def remember_tg_anchor(self, max_chat_id, tg_chat_id, tg_message_id,
+                                 max_message_id=None):
         """Same contract as PyMaxClient: where a later MAX read marker
-        puts its ✅, in memory and (for the real one) in the outbox."""
+        puts its ✅, in memory and (for the real one) in the outbox — and
+        the MAX ↔ Telegram pair replies are matched by."""
         if tg_message_id is None or tg_chat_id is None:
             return
         self.last_tg_message[max_chat_id] = (tg_chat_id, int(tg_message_id))
         box = getattr(self, "outbox", None)
         if box is not None:
             await box.set_last_tg_message(max_chat_id, tg_chat_id, tg_message_id)
+            if max_message_id is not None:
+                await box.map_message(tg_chat_id, tg_message_id, max_chat_id, max_message_id)
+
+    async def tg_reply_target(self, max_chat_id, max_message_id, tg_chat_id):
+        box = getattr(self, "outbox", None)
+        if box is None or max_message_id is None:
+            return None
+        return await box.tg_message_for(max_chat_id, max_message_id, tg_chat_id)
 
 
 def _make_client(sender=None):
