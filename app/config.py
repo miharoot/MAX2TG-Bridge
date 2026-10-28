@@ -36,8 +36,8 @@ class Settings:
     # everything newer than the last message it forwarded, per chat.
     catchup_enabled: bool = False
     catchup_limit: int = 50
-    # Someone new writing in a one-to-one chat is added to the MAX
-    # contacts of the bridged account (see max_listener).
+    # Someone not in the MAX contacts writing in a one-to-one chat is
+    # added to them (see max_listener).
     auto_add_contacts: bool = True
 
 

@@ -213,6 +213,32 @@ class Outbox:
                     )
                     """
                 )
+                # The account's MAX chats and contacts as MAX listed them
+                # at the last login (a full sync, see app/pymax_auth.py).
+                # The contacts are what says whether someone writing in
+                # is already one — MAX tells nothing of it per message.
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS max_chats (
+                        chat_id    TEXT PRIMARY KEY,
+                        type       TEXT,
+                        title      TEXT,
+                        data       TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS max_contacts (
+                        user_id    TEXT PRIMARY KEY,
+                        name       TEXT,
+                        status     TEXT,
+                        data       TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
                 await conn.commit()
                 self._conn = conn
         return self._conn
@@ -256,6 +282,75 @@ class Outbox:
         ) as cur:
             rows = await cur.fetchall()
         return {str(chat_id): str(last_id) for chat_id, last_id in rows}
+
+    async def save_max_chats(self, chats: list[dict], *, complete: bool) -> None:
+        """Store the MAX chat list. ``complete`` says the list is the whole
+        account: only then do chats missing from it go — a walk cut short
+        must not read as having left them."""
+        now = time.time()
+        rows = [
+            (str(chat["id"]), chat.get("type"), chat.get("title"),
+             json.dumps(chat, default=str, ensure_ascii=False), now)
+            for chat in chats if isinstance(chat, dict) and chat.get("id") is not None
+        ]
+        conn = await self._get_conn()
+        if complete:
+            await conn.execute("DELETE FROM max_chats")
+        await conn.executemany(
+            "INSERT INTO max_chats (chat_id, type, title, data, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET type = excluded.type, "
+            "    title = excluded.title, data = excluded.data, "
+            "    updated_at = excluded.updated_at",
+            rows,
+        )
+        await conn.commit()
+
+    async def replace_max_contacts(self, contacts: list[tuple[Any, str | None, dict]]) -> None:
+        """Replace the stored contact list with a full one from MAX:
+        ``(user_id, name, contact dict)`` per contact."""
+        now = time.time()
+        rows = [
+            (str(user_id), name, data.get("status"),
+             json.dumps(data, default=str, ensure_ascii=False), now)
+            for user_id, name, data in contacts
+        ]
+        conn = await self._get_conn()
+        await conn.execute("DELETE FROM max_contacts")
+        await conn.executemany(
+            "INSERT OR REPLACE INTO max_contacts (user_id, name, status, data, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        await conn.commit()
+
+    async def add_max_contact(self, user_id: Any, name: str | None, data: dict) -> None:
+        """One contact added since the last full list (see add_contact)."""
+        conn = await self._get_conn()
+        await conn.execute(
+            "INSERT OR REPLACE INTO max_contacts (user_id, name, status, data, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (str(user_id), name, (data or {}).get("status"),
+             json.dumps(data or {}, default=str, ensure_ascii=False), time.time()),
+        )
+        await conn.commit()
+
+    async def max_contact_ids(self) -> set[int]:
+        """Who is in the account's MAX contacts. A contact MAX lists as
+        REMOVED was one once and no longer is."""
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT user_id FROM max_contacts "
+            "WHERE status IS NULL OR UPPER(status) != 'REMOVED'"
+        ) as cur:
+            rows = await cur.fetchall()
+        ids = set()
+        for (user_id,) in rows:
+            try:
+                ids.add(int(user_id))
+            except (TypeError, ValueError):
+                continue
+        return ids
 
     async def mark_sent_by_bridge(self, chat_id: Any, message_id: Any) -> None:
         """Remember that this MAX message came from the bridge.

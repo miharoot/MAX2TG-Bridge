@@ -1206,6 +1206,10 @@ class PyMaxClient:
         # max_listener), so a read marker arriving after a restart still
         # has something to mark.
         self.last_tg_message: dict[Any, tuple[Any, int]] = {}
+        # User ids in the account's MAX contacts, from the full list MAX
+        # sends at login (stored in the outbox database); None until it is
+        # known. Kept current by add_contact.
+        self.contact_ids: set[int] | None = None
 
         self._wire_events()
 
@@ -1287,8 +1291,9 @@ class PyMaxClient:
         async def _handle_start(pymax_client):
             self._my_id = self._extract_my_id(pymax_client)
             self._is_connected = True
-            await self._fetch_all_chats(pymax_client)
+            chats_complete, _ = await self._fetch_all_chats(pymax_client)
             snapshot = self._build_snapshot(pymax_client)
+            snapshot["chats_complete"] = chats_complete
             await self._add_configured_chats(snapshot)
             if self._on_ready_cb:
                 await self._on_ready_cb(snapshot)
@@ -1867,11 +1872,20 @@ class PyMaxClient:
             }}
 
         contact = _user_to_dict(user) if user is not None else {}
+        name = None
         if contact and self.resolver is not None:
             name = self.resolver._extract_name_from_contact(contact)
             if name:
                 self.resolver.users[int(user_id)] = name
         log.info("Added MAX user %s to contacts", user_id)
+        if getattr(self, "contact_ids", None) is not None:
+            self.contact_ids.add(int(user_id))
+        outbox = getattr(self, "outbox", None)
+        if outbox is not None:
+            try:
+                await outbox.add_max_contact(int(user_id), name or None, contact)
+            except Exception:
+                log.exception("Could not store MAX contact %s", user_id)
         return {"contact": contact}
 
     def _known_chat_by_link(self, link: str) -> dict | None:

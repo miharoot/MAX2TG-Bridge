@@ -12,6 +12,11 @@ class FakeExtraConfig:
         self.kwargs = kwargs
 
 
+class FakeSyncOverrides:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
 class FakeClient:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -26,6 +31,7 @@ def _install_fake_pymax(monkeypatch):
     fake = types.SimpleNamespace(
         Client=FakeClient,
         ExtraConfig=FakeExtraConfig,
+        SyncOverrides=FakeSyncOverrides,
         WebClient=FakeWebClient,
     )
     monkeypatch.setitem(sys.modules, "pymax", fake)
@@ -74,6 +80,18 @@ def test_builds_qr_web_client(monkeypatch):
     assert client.kwargs["session_name"] == "web.db"
     assert isinstance(client.kwargs["qr_provider"], LogQrHandler)
     assert client.kwargs["extra_config"].kwargs["log_level"] == "INFO"
+
+
+def test_every_login_asks_for_the_full_chat_and_contact_lists(monkeypatch):
+    """A login with the saved sync markers gets only what changed since
+    the last one — a partial list the bridge can't tell from the whole."""
+    _install_fake_pymax(monkeypatch)
+    settings = Settings(tg_bot_token="tg", tg_chat_id="-100", max_pymax_auth="qr")
+
+    client = build_pymax_client(settings)
+
+    sync = client.kwargs["extra_config"].kwargs["sync"]
+    assert sync.kwargs == {"chats_sync": -1, "contacts_sync": -1}
 
 
 def test_sms_client_requires_phone(monkeypatch):

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from collections import Counter
 from dataclasses import fields as _dataclass_fields
 from datetime import datetime
 from html import escape
@@ -559,6 +560,9 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
     # Someone new writing in a dialog goes into the account's MAX contacts
     # (MAX_AUTO_ADD_CONTACTS, on by default). Off without settings.
     auto_add_contacts = bool(getattr(_settings, "auto_add_contacts", False))
+    # Senders already tried this run: a refusal (a service account, say)
+    # is not asked again for every message they send.
+    _contact_attempted: set[int] = set()
 
     _first_connect = True
     # Reconnect ("восстановлено") should only ever follow a disconnect
@@ -594,6 +598,8 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             log.info("Known chats: %s", resolver.chats)
             log.info("Known users: %s", resolver.users)
 
+        await _store_chats_and_contacts(snapshot)
+
         # Status notifications go out to every Telegram group the bridge is
         # currently routing to (not just the default one) — otherwise
         # someone only watching a non-default group would never see them.
@@ -610,6 +616,65 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
 
         if getattr(_settings, "catchup_enabled", False):
             asyncio.create_task(_catch_up_missed())
+
+    async def _store_chats_and_contacts(snapshot: dict) -> None:
+        """Keep the account's MAX chats and contacts in the database.
+
+        Every login asks MAX for both in full (app/pymax_auth.py), so this
+        is the whole list rather than what changed since the last login.
+        An empty contact list is read as "MAX sent none" — the stored one
+        stays — since telling it from "the account has none" isn't
+        possible.
+        """
+        box = getattr(client, "outbox", None)
+        if box is None:
+            return
+        chats = snapshot.get("chats") or []
+        contacts = [c for c in snapshot.get("contacts") or []
+                    if isinstance(c, dict) and c.get("id") is not None]
+        try:
+            await box.save_max_chats(chats, complete=bool(snapshot.get("chats_complete")))
+            if contacts:
+                await box.replace_max_contacts([
+                    (c["id"], resolver._extract_name_from_contact(c) or None, c)
+                    for c in contacts
+                ])
+            client.contact_ids = await box.max_contact_ids() or None
+        except Exception:
+            log.exception("Could not store the MAX chat and contact lists")
+            return
+        statuses = Counter(str(c.get("status") or "-") for c in contacts)
+        log.info("MAX lists stored: %d chats, %d contacts from MAX (statuses: %s), "
+                 "%d known as contacts", len(chats), len(contacts), dict(statuses),
+                 len(client.contact_ids or ()))
+
+    def _maybe_add_contact(msg: MaxMessage, is_dm: bool, new_topic: bool) -> None:
+        """Someone not in the MAX contacts writing in a dialog: add them.
+
+        Only the sender is certain to be that person — a dialog's id is
+        not their user id — so a message of our own adds no one. With the
+        contact list known (client.contact_ids) anyone missing from it is
+        added; without it, only someone whose dialog is new to the bridge,
+        the one sign of "new" left.
+        """
+        if not (auto_add_contacts and is_dm and not msg.is_self
+                and msg.sender_id is not None
+                and not resolver.is_saved_messages(msg.chat_id)):
+            return
+        try:
+            sender_id = int(msg.sender_id)
+        except (TypeError, ValueError):
+            return
+        known = getattr(client, "contact_ids", None)
+        if known is None:
+            if not new_topic:
+                return
+        elif sender_id in known:
+            return
+        if sender_id in _contact_attempted:
+            return
+        _contact_attempted.add(sender_id)
+        asyncio.create_task(client.add_contact(sender_id))
 
     async def _restore_read_state() -> None:
         """Bring back what the read markers need across a restart.
@@ -992,20 +1057,13 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
 
         # First time we touch this chat → publish a pinned profile card so the
         # topic starts with context (avatar, name, etc.).
-        if existing_thread is None and thread_id is not None:
+        new_topic = existing_thread is None and thread_id is not None
+        if new_topic:
             from app.tg_handler import post_topic_intro
             asyncio.create_task(post_topic_intro(
                 sender.bot, target_chat_id, client, msg.chat_id, thread_id,
             ))
-            # A dialog whose first message comes from the other side is
-            # someone new writing in: add them to the MAX contacts. Only
-            # the sender is certain to be that person — a dialog's id is
-            # not their user id — so a first message of our own adds no
-            # one (/contact does it by hand).
-            if (auto_add_contacts and is_dm and not msg.is_self
-                    and msg.sender_id is not None
-                    and not resolver.is_saved_messages(msg.chat_id)):
-                asyncio.create_task(client.add_contact(msg.sender_id))
+        _maybe_add_contact(msg, is_dm, new_topic)
 
         sender_label = escape(raw_sender)
         chat_label = escape(raw_chat)

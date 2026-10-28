@@ -263,3 +263,166 @@ class TestSomeoneNewWritingIn:
         await self._deliver(client, _dm_msg())
 
         client.add_contact.assert_not_awaited()
+
+
+class TestStoredLists:
+    """The full chat and contact lists MAX sends at login, kept in the
+    outbox database."""
+
+    async def _box(self):
+        from app.outbox import Outbox
+        return Outbox(":memory:")
+
+    async def test_contacts_are_replaced_by_the_new_full_list(self):
+        box = await self._box()
+        await box.replace_max_contacts([(1, "Иван Петров", {"id": 1})])
+
+        await box.replace_max_contacts([(2, None, {"id": 2})])
+
+        assert await box.max_contact_ids() == {2}
+        await box.close()
+
+    async def test_a_removed_contact_is_not_a_contact(self):
+        box = await self._box()
+        await box.replace_max_contacts([
+            (1, None, {"id": 1, "status": "REMOVED"}),
+            (2, None, {"id": 2, "status": "ACTIVE"}),
+            (3, None, {"id": 3}),
+        ])
+
+        assert await box.max_contact_ids() == {2, 3}
+        await box.close()
+
+    async def test_one_added_contact_joins_the_list(self):
+        box = await self._box()
+        await box.replace_max_contacts([(1, None, {"id": 1})])
+
+        await box.add_max_contact(PEER_ID, "Иван Петров", {"id": PEER_ID})
+
+        assert await box.max_contact_ids() == {1, PEER_ID}
+        await box.close()
+
+    async def _chat_ids(self, box):
+        conn = await box._get_conn()
+        async with conn.execute("SELECT chat_id FROM max_chats") as cur:
+            return {row[0] for row in await cur.fetchall()}
+
+    async def test_a_complete_chat_list_drops_chats_no_longer_in_it(self):
+        box = await self._box()
+        await box.save_max_chats([{"id": -1}, {"id": -2}], complete=True)
+
+        await box.save_max_chats([{"id": -2}], complete=True)
+
+        assert await self._chat_ids(box) == {"-2"}
+        await box.close()
+
+    async def test_an_incomplete_one_drops_nothing(self):
+        """A walk cut short must not read as having left the chats it
+        didn't reach."""
+        box = await self._box()
+        await box.save_max_chats([{"id": -1}, {"id": -2}], complete=True)
+
+        await box.save_max_chats([{"id": -2, "title": "Рабочий чат"}], complete=False)
+
+        assert await self._chat_ids(box) == {"-1", "-2"}
+        await box.close()
+
+
+class TestListsStoredAtLogin:
+    async def _ready(self, snapshot, stored_contacts=()):
+        from app.max_listener import configure_pymax_client
+        from app.outbox import Outbox
+        from tests.test_max_to_tg_outbox import _FakePyMaxClient
+
+        sender = AsyncMock()
+        sender.topic_store = MagicMock()
+        sender.topic_store.get_topic = MagicMock(return_value=None)
+        client = _FakePyMaxClient()
+        configure_pymax_client(client, sender)
+        client.outbox = Outbox(":memory:")
+        if stored_contacts:
+            await client.outbox.replace_max_contacts(
+                [(uid, None, {"id": uid}) for uid in stored_contacts])
+
+        await client._on_ready_cb(snapshot)
+        return client
+
+    async def test_the_contacts_from_max_become_the_known_contacts(self):
+        client = await self._ready({
+            "chats": [{"id": -10000000000001, "type": "CHAT", "title": "Рабочий чат"}],
+            "contacts": [{"id": PEER_ID, "names": [{"name": "Иван Петров"}]}],
+            "chats_complete": True,
+        })
+
+        assert client.contact_ids == {PEER_ID}
+        assert await client.outbox.max_contact_ids() == {PEER_ID}
+        await client.outbox.close()
+
+    async def test_no_contacts_from_max_keeps_the_stored_ones(self):
+        client = await self._ready({"chats": [], "contacts": []}, stored_contacts=[PEER_ID])
+
+        assert client.contact_ids == {PEER_ID}
+        await client.outbox.close()
+
+    async def test_with_nothing_known_the_list_stays_unknown(self):
+        client = await self._ready({"chats": [], "contacts": []})
+
+        assert getattr(client, "contact_ids", None) is None
+        await client.outbox.close()
+
+
+class TestAddingWithTheContactListKnown:
+    """With the full list in hand, "new" means "not in the contacts", not
+    "no topic yet" — someone already talking to you gets added too."""
+
+    def _setup(self, contacts):
+        client = TestSomeoneNewWritingIn()._setup(topic=5)
+        client.contact_ids = set(contacts)
+        return client
+
+    async def test_a_sender_missing_from_the_contacts_is_added(self):
+        client = self._setup({1})
+
+        await TestSomeoneNewWritingIn()._deliver(client, _dm_msg())
+
+        client.add_contact.assert_awaited_once_with(PEER_ID)
+
+    async def test_a_contact_is_left_alone(self):
+        client = self._setup({PEER_ID})
+
+        await TestSomeoneNewWritingIn()._deliver(client, _dm_msg())
+
+        client.add_contact.assert_not_awaited()
+
+    async def test_each_sender_is_tried_once_a_run(self):
+        """A refusal (a service account) isn't asked again for every
+        message they send."""
+        client = self._setup({1})
+        client.add_contact = AsyncMock(return_value={"_max_error": {"message": "нет"}})
+
+        with patch("app.tg_handler.post_topic_intro", AsyncMock()):
+            await client._on_message_cb(_dm_msg())
+            await client._on_message_cb(MaxMessage(
+                chat_id=DIALOG_ID, sender_id=PEER_ID, text="ещё", timestamp=200,
+                message_id="2", is_self=False, cid=None, attaches=[], link=None, raw={}))
+            await asyncio.sleep(0)
+        await client.outbox.close()
+
+        client.add_contact.assert_awaited_once_with(PEER_ID)
+
+
+class TestAnAddedContactIsRemembered:
+    async def test_it_joins_the_known_contacts_and_the_database(self):
+        from app.outbox import Outbox
+
+        client = _pymax_client()
+        client.contact_ids = {1}
+        client.outbox = Outbox(":memory:")
+        client._client.add_contact = AsyncMock(return_value=MagicMock())
+
+        with patch("app.pymax_client._user_to_dict", return_value={"id": PEER_ID}):
+            await client.add_contact(PEER_ID)
+
+        assert client.contact_ids == {1, PEER_ID}
+        assert await client.outbox.max_contact_ids() == {PEER_ID}
+        await client.outbox.close()

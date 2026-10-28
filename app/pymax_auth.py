@@ -88,7 +88,7 @@ def build_pymax_client(settings: Settings, bridge_client: "PyMaxClient | None" =
     via ``bridge_client.notify_qr`` instead of only logging it.
     """
     try:
-        from pymax import Client, ExtraConfig, WebClient
+        from pymax import Client, ExtraConfig, SyncOverrides, WebClient
     except ImportError as exc:
         raise RuntimeError(
             "PyMax requires maxapi-python to be installed."
@@ -97,6 +97,12 @@ def build_pymax_client(settings: Settings, bridge_client: "PyMaxClient | None" =
     extra_config = ExtraConfig(
         proxy=settings.tg_proxy,
         log_level="DEBUG" if settings.debug else "INFO",
+        # A login normally asks MAX only for what changed since the
+        # previous one (pymax keeps the markers in the session file), so
+        # the chats and contacts it returns are a partial list. -1, the
+        # marker of a session that has never synced, asks for both in
+        # full on every login; the bridge stores them (app/outbox.py).
+        sync=SyncOverrides(chats_sync=-1, contacts_sync=-1),
     )
 
     if settings.max_pymax_auth == "qr":
