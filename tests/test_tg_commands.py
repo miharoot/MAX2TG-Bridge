@@ -51,6 +51,9 @@ def _make_context(args=None, existing_topic=None, allowed_user_ids=None):
     # Off, as it is by default: a bare MagicMock would read as "backfill
     # 〈Mock〉 messages" and make every /bind and /add pull history.
     max_client.backfill_limit = 0
+    # /add puts a person into the MAX contacts; awaited, so it can't be a
+    # bare MagicMock.
+    max_client.add_contact = AsyncMock(return_value={"contact": {}})
 
     ctx.bot_data = {
         ALLOWED_USER_KEY: allowed_user_ids,
@@ -138,6 +141,7 @@ class TestEveryCommandAnswersSomething:
 
     @pytest.mark.parametrize("name", [
         "bind", "add", "list", "help", "del", "intro", "profile", "catchup",
+        "contact",
     ])
     async def test_command_replies_without_raising(self, name, monkeypatch):
         import app.tg_handler as th

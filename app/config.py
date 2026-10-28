@@ -36,6 +36,9 @@ class Settings:
     # everything newer than the last message it forwarded, per chat.
     catchup_enabled: bool = False
     catchup_limit: int = 50
+    # Someone new writing in a one-to-one chat is added to the MAX
+    # contacts of the bridged account (see max_listener).
+    auto_add_contacts: bool = True
 
 
 def _parse_chat_routes(raw: str | None) -> dict[str, int]:
@@ -163,4 +166,6 @@ def load_settings() -> Settings:
         backfill_limit=min(_int_env("MAX_BACKFILL_LIMIT", 20), 200),
         catchup_enabled=os.environ.get("MAX_CATCHUP", "").lower() in ("1", "true", "yes"),
         catchup_limit=min(_int_env("MAX_CATCHUP_LIMIT", 50), 200),
+        auto_add_contacts=os.environ.get("MAX_AUTO_ADD_CONTACTS", "").lower()
+        not in ("0", "false", "no", "off"),
     )

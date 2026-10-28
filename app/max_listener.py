@@ -556,6 +556,10 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         if getattr(_settings, "backfill_enabled", False) else 0
     )
 
+    # Someone new writing in a dialog goes into the account's MAX contacts
+    # (MAX_AUTO_ADD_CONTACTS, on by default). Off without settings.
+    auto_add_contacts = bool(getattr(_settings, "auto_add_contacts", False))
+
     _first_connect = True
     # Reconnect ("восстановлено") should only ever follow a disconnect
     # notice the user actually saw — otherwise pymax's internal
@@ -993,6 +997,15 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             asyncio.create_task(post_topic_intro(
                 sender.bot, target_chat_id, client, msg.chat_id, thread_id,
             ))
+            # A dialog whose first message comes from the other side is
+            # someone new writing in: add them to the MAX contacts. Only
+            # the sender is certain to be that person — a dialog's id is
+            # not their user id — so a first message of our own adds no
+            # one (/contact does it by hand).
+            if (auto_add_contacts and is_dm and not msg.is_self
+                    and msg.sender_id is not None
+                    and not resolver.is_saved_messages(msg.chat_id)):
+                asyncio.create_task(client.add_contact(msg.sender_id))
 
         sender_label = escape(raw_sender)
         chat_label = escape(raw_chat)

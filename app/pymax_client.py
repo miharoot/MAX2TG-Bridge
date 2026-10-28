@@ -1841,6 +1841,39 @@ class PyMaxClient:
             chat["title"] = title
         return {"chatId": chat_id, "chat": chat}
 
+    async def add_contact(self, user_id: int) -> dict:
+        """Add a MAX user to this account's contacts.
+
+        The same request MAX's own "add to contacts" button makes
+        (CONTACT_UPDATE, action ADD, exposed by pymax as add_contact). It
+        carries no name — MAX files the person under their own profile
+        name. Bounded like every other lookup here, and a refusal comes
+        back as ``_max_error`` rather than an exception, so callers can
+        word it for the topic.
+        """
+        try:
+            user = await asyncio.wait_for(
+                self._client.add_contact(int(user_id)), timeout=USER_LOOKUP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning("MAX did not answer adding user %s to contacts in %ss",
+                        user_id, USER_LOOKUP_TIMEOUT)
+            return {"_max_error": {"message": "MAX не ответил на добавление в контакты"}}
+        except Exception as exc:
+            log.warning("PyMax add_contact failed for %s: %s", user_id, exc)
+            return {"_max_error": {
+                "message": str(exc),
+                "localizedMessage": getattr(exc, "localized_message", None),
+            }}
+
+        contact = _user_to_dict(user) if user is not None else {}
+        if contact and self.resolver is not None:
+            name = self.resolver._extract_name_from_contact(contact)
+            if name:
+                self.resolver.users[int(user_id)] = name
+        log.info("Added MAX user %s to contacts", user_id)
+        return {"contact": contact}
+
     def _known_chat_by_link(self, link: str) -> dict | None:
         """A chat from our own list whose invite link is this one.
 

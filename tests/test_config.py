@@ -298,3 +298,18 @@ class TestBackfillSettings:
     def test_a_negative_limit_is_refused_outright(self):
         with pytest.raises(SystemExit):
             load({**BASE, "MAX_CATCHUP_LIMIT": "-5"})
+
+
+class TestAutoAddContacts:
+    """Someone new writing in a dialog is added to the MAX contacts unless
+    switched off."""
+
+    def test_on_by_default(self):
+        assert load(BASE).auto_add_contacts is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "FALSE"])
+    def test_can_be_switched_off(self, value):
+        assert load({**BASE, "MAX_AUTO_ADD_CONTACTS": value}).auto_add_contacts is False
+
+    def test_true_keeps_it_on(self):
+        assert load({**BASE, "MAX_AUTO_ADD_CONTACTS": "true"}).auto_add_contacts is True

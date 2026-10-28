@@ -157,8 +157,13 @@ def _log_command(update: Update, name: str) -> None:
     )
 
 
-def _peer_id_in_dm(resolver, chat_id) -> int | None:
-    """Return the other participant of a DIALOG chat (i.e., not us)."""
+def _peer_id_in_dm(resolver, chat_id, *, guess: bool = True) -> int | None:
+    """Return the other participant of a DIALOG chat (i.e., not us).
+
+    ``guess=False`` answers only from the participant list: the fallback
+    below is good enough for a name or an avatar, not for acting on a
+    person (adding them to contacts).
+    """
     chat = resolver.chats_raw.get(chat_id) or {}
     my_id = resolver.my_id
     for uid_str in chat.get("participants") or {}:
@@ -170,6 +175,8 @@ def _peer_id_in_dm(resolver, chat_id) -> int | None:
             return uid
     # MAX convention: positive chat_id == DM chat_id == peer's user id.
     # Falls back here for chats whose participants list wasn't fetched yet.
+    if not guess:
+        return None
     try:
         return int(chat_id) if int(chat_id) > 0 else None
     except (TypeError, ValueError):
@@ -1090,6 +1097,34 @@ def _max_chat_label(context: ContextTypes.DEFAULT_TYPE, chat_id: Any) -> str:
     return f"<b>{escape(str(name))}</b> (<code>{chat_id}</code>)"
 
 
+async def _add_peer_to_contacts(max_client, chat_id, peer_id=None) -> str:
+    """Add the person on the other side of a MAX dialog to MAX contacts.
+
+    Returns a line (HTML) for the command's reply, or "" when the chat is
+    not a dialog with someone else — a group, a channel, «Избранное».
+    ``peer_id`` is passed when the caller already knows who the person
+    is (/add by id); otherwise only the dialog's participant list counts.
+    """
+    resolver = getattr(max_client, "resolver", None)
+    if peer_id is None:
+        if (resolver is None or not resolver.is_dm(chat_id)
+                or resolver.is_saved_messages(chat_id)):
+            return ""
+        peer_id = _peer_id_in_dm(resolver, chat_id, guess=False)
+        if peer_id is None:
+            return ("⚠️ В контакты MAX не добавил: MAX не сообщил, кто "
+                    "собеседник в этом чате.")
+    resp = await max_client.add_contact(peer_id) or {}
+    name = resolver.user_name(peer_id) if resolver is not None else str(peer_id)
+    label = (f"<b>{escape(str(name))}</b>" if name and str(name) != str(peer_id)
+             else f"<code>{peer_id}</code>")
+    err = resp.get("_max_error")
+    if err:
+        desc = err.get("localizedMessage") or err.get("message") or "MAX отказал"
+        return f"⚠️ {label} не добавлен в контакты MAX: {escape(str(desc))}"
+    return f"👤 {label} — в контактах MAX."
+
+
 async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Join a MAX chat by link if we aren't in it, then bind it to a topic.
 
@@ -1221,11 +1256,18 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if resolver is not None and isinstance(resp.get("chat"), dict):
         resolver.remember_chat(resp["chat"])
 
+    # A person added by /add goes into the MAX contacts too — also when
+    # their dialog is bound already, which makes /add the way to add
+    # someone you are talking to anyway.
+    contact_note = await _add_peer_to_contacts(max_client, chat_id, peer_id=user_id)
+    contact_line = f"\n{contact_note}" if contact_note else ""
+
     topic_store: TopicStore = context.bot_data[TOPIC_STORE_KEY]
     existing = topic_store.get_topic(chat_id)
     if existing is not None:
         await message.reply_text(
-            f"Этот чат MAX уже привязан к топику (thread_id=<code>{existing}</code>).",
+            f"Этот чат MAX уже привязан к топику (thread_id=<code>{existing}</code>)."
+            + contact_line,
             parse_mode="HTML",
         )
         return
@@ -1266,7 +1308,7 @@ async def _cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
              thread_id, title, chat_id, target_chat_id)
     await message.reply_text(
         f"Готово: <b>{escape(title)}</b> ↔ MAX <code>{chat_id}</code> "
-        f"(thread_id=<code>{thread_id}</code>) в этой группе.",
+        f"(thread_id=<code>{thread_id}</code>) в этой группе." + contact_line,
         parse_mode="HTML",
     )
     asyncio.create_task(
@@ -1315,6 +1357,11 @@ HELP_TEXT = (
     "сообщения этого чата (сколько — <code>MAX_BACKFILL_LIMIT</code>). "
     "Работает, только если включена <code>MAX_BACKFILL</code>; уже "
     "пересланное придёт повторно.\n"
+    "• <code>/contact</code> — внутри топика личного диалога: добавить "
+    "собеседника в контакты MAX. <code>/add</code> человека (по номеру, id "
+    "или ссылке) добавляет его в контакты сам, и тот, кто впервые пишет "
+    "тебе в личку, добавляется автоматически "
+    "(<code>MAX_AUTO_ADD_CONTACTS</code>).\n"
     "• <code>/read</code> — внутри топика: отметить чат прочитанным в MAX, "
     "не отвечая в нём. Telegram не сообщает боту, что ты прочитал "
     "переписку, поэтому обычно отметка уходит только вместе с ответом — "
@@ -1978,6 +2025,34 @@ async def _cmd_read(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def _cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add the person this topic's dialog is with to the MAX contacts."""
+    target = _resolve_topic_target(update, context)
+    message = update.message
+    if message is None:
+        return
+    _log_command(update, "contact")
+    if not target:
+        await message.reply_text(
+            "Команда работает только внутри топика, связанного с чатом MAX."
+        )
+        return
+    _, max_chat_id, max_client = target
+    if not max_client:
+        await message.reply_text("⚠️ Max клиент не подключён.")
+        return
+
+    note = await _add_peer_to_contacts(max_client, max_chat_id)
+    if not note:
+        await message.reply_text(
+            f"{_max_chat_label(context, max_chat_id)} — не личный диалог: "
+            "в контакты добавляют человека, а не группу или канал.",
+            parse_mode="HTML",
+        )
+        return
+    await message.reply_text(note, parse_mode="HTML")
+
+
 async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show profile of the Max peer linked to the current topic."""
     target = _resolve_topic_target(update, context)
@@ -2165,6 +2240,7 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("intro", _cmd_intro, filters=chat_filter))
     app.add_handler(CommandHandler("catchup", _cmd_catchup, filters=chat_filter))
     app.add_handler(CommandHandler("read", _cmd_read, filters=chat_filter))
+    app.add_handler(CommandHandler("contact", _cmd_contact, filters=chat_filter))
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))
     app.add_handler(CommandHandler("del_max", _cmd_del_max, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
