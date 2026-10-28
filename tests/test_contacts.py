@@ -426,3 +426,23 @@ class TestAnAddedContactIsRemembered:
         assert client.contact_ids == {1, PEER_ID}
         assert await client.outbox.max_contact_ids() == {PEER_ID}
         await client.outbox.close()
+
+
+class TestTheLoginLogLine:
+    async def test_it_gives_both_what_max_sent_and_what_the_db_holds(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="app.max_listener"):
+            client = await TestListsStoredAtLogin()._ready({
+                "chats": [{"id": -10000000000001, "type": "CHAT"}],
+                "contacts": [{"id": 1, "status": "ACTIVE"},
+                             {"id": 2, "status": "REMOVED"}],
+                "chats_complete": True,
+            })
+        await client.outbox.close()
+
+        line = next(r.getMessage() for r in caplog.records
+                    if r.getMessage().startswith("MAX lists at login"))
+        assert line == ("MAX lists at login: chats 1 from MAX, 1 in DB; contacts 2 "
+                        "from MAX (statuses: {'ACTIVE': 1, 'REMOVED': 1}), 2 in DB, "
+                        "1 of them current")

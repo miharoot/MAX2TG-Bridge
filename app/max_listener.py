@@ -640,13 +640,15 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
                     for c in contacts
                 ])
             client.contact_ids = await box.max_contact_ids() or None
+            db_chats, db_contacts = await box.max_list_counts()
         except Exception:
             log.exception("Could not store the MAX chat and contact lists")
             return
         statuses = Counter(str(c.get("status") or "-") for c in contacts)
-        log.info("MAX lists stored: %d chats, %d contacts from MAX (statuses: %s), "
-                 "%d known as contacts", len(chats), len(contacts), dict(statuses),
-                 len(client.contact_ids or ()))
+        log.info("MAX lists at login: chats %d from MAX, %d in DB; contacts %d from "
+                 "MAX (statuses: %s), %d in DB, %d of them current",
+                 len(chats), db_chats, len(contacts), dict(statuses),
+                 db_contacts, len(client.contact_ids or ()))
 
     def _maybe_add_contact(msg: MaxMessage, is_dm: bool, new_topic: bool) -> None:
         """Someone not in the MAX contacts writing in a dialog: add them.

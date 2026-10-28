@@ -335,6 +335,15 @@ class Outbox:
         )
         await conn.commit()
 
+    async def max_list_counts(self) -> tuple[int, int]:
+        """How many chats and contacts the database holds, as rows."""
+        conn = await self._get_conn()
+        async with conn.execute("SELECT COUNT(*) FROM max_chats") as cur:
+            chats = (await cur.fetchone())[0]
+        async with conn.execute("SELECT COUNT(*) FROM max_contacts") as cur:
+            contacts = (await cur.fetchone())[0]
+        return int(chats), int(contacts)
+
     async def max_contact_ids(self) -> set[int]:
         """Who is in the account's MAX contacts. A contact MAX lists as
         REMOVED was one once and no longer is."""
