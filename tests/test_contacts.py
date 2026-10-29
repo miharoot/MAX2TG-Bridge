@@ -453,8 +453,8 @@ class TestARestrictedProfileStopsAutomaticAdding:
     restricted account; asking for each new person only fills the log."""
 
     def _refusal(self, **kwargs):
-        defaults = dict(opcode=34, error="error.contact.add",
-                        message="Profile is restricted",
+        defaults = dict(opcode=34, error="error.user.blocked.add.contact",
+                        message="User is restricted",
                         localized_message="Добавить контакт не получится. "
                                           "Возможности профиля ограничены")
         defaults.update(kwargs)
@@ -478,10 +478,20 @@ class TestARestrictedProfileStopsAutomaticAdding:
 
         assert client.contacts_restricted is True
 
+    async def test_max_s_own_code_alone_is_enough(self):
+        """The code MAX sent live, should the wording ever change."""
+        client = _pymax_client()
+        client._client.add_contact = AsyncMock(side_effect=self._refusal(
+            localized_message="", message="", title=""))
+
+        await client.add_contact(PEER_ID)
+
+        assert client.contacts_restricted is True
+
     async def test_another_refusal_does_not(self):
         client = _pymax_client()
         client._client.add_contact = AsyncMock(side_effect=self._refusal(
-            localized_message="Не получилось", message="nope"))
+            error="error.contact.add", localized_message="Не получилось", message="nope"))
 
         await client.add_contact(PEER_ID)
 

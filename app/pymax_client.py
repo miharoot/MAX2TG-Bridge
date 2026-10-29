@@ -501,7 +501,10 @@ def _profile_restricted(exc: Exception) -> bool:
     ограничены") — a refusal of the account, not of one request."""
     if not isinstance(exc, ApiError):
         return False
-    if str(getattr(exc, "error", "") or "").startswith("error.user.restricted"):
+    code = str(getattr(exc, "error", "") or "")
+    # error.user.blocked.add.contact is what MAX answered adding a contact
+    # on a restricted account; error.user.restricted.send, starting a dialog.
+    if code == "error.user.blocked.add.contact" or code.startswith("error.user.restricted"):
         return True
     text = " ".join(str(getattr(exc, attr, "") or "")
                     for attr in ("localized_message", "title", "message"))
