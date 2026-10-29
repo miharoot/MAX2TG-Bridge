@@ -695,6 +695,8 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         added; without it, only someone whose dialog is new to the bridge,
         the one sign of "new" left.
         """
+        if getattr(client, "contacts_restricted", False):
+            return   # MAX refused this profile adding contacts (see add_contact)
         if not (auto_add_contacts and is_dm and not msg.is_self
                 and msg.sender_id is not None
                 and not resolver.is_saved_messages(msg.chat_id)):

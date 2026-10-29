@@ -446,3 +446,51 @@ class TestTheLoginLogLine:
         assert line == ("MAX lists at login: chats 1 from MAX, 1 in DB; contacts 2 "
                         "from MAX (statuses: {'ACTIVE': 1, 'REMOVED': 1}), 2 in DB, "
                         "1 of them current")
+
+
+class TestARestrictedProfileStopsAutomaticAdding:
+    """MAX answers every add with «Возможности профиля ограничены» on a
+    restricted account; asking for each new person only fills the log."""
+
+    def _refusal(self, **kwargs):
+        defaults = dict(opcode=34, error="error.contact.add",
+                        message="Profile is restricted",
+                        localized_message="Добавить контакт не получится. "
+                                          "Возможности профиля ограничены")
+        defaults.update(kwargs)
+        return ApiError(**defaults)
+
+    async def test_the_refusal_marks_the_profile_restricted(self):
+        client = _pymax_client()
+        client._client.add_contact = AsyncMock(side_effect=self._refusal())
+
+        resp = await client.add_contact(PEER_ID)
+
+        assert "ограничены" in resp["_max_error"]["localizedMessage"]
+        assert client.contacts_restricted is True
+
+    async def test_a_restricted_code_alone_is_enough(self):
+        client = _pymax_client()
+        client._client.add_contact = AsyncMock(side_effect=self._refusal(
+            error="error.user.restricted.contact", localized_message="", message=""))
+
+        await client.add_contact(PEER_ID)
+
+        assert client.contacts_restricted is True
+
+    async def test_another_refusal_does_not(self):
+        client = _pymax_client()
+        client._client.add_contact = AsyncMock(side_effect=self._refusal(
+            localized_message="Не получилось", message="nope"))
+
+        await client.add_contact(PEER_ID)
+
+        assert not getattr(client, "contacts_restricted", False)
+
+    async def test_no_more_automatic_attempts_after_it(self):
+        client = TestSomeoneNewWritingIn()._setup()
+        client.contacts_restricted = True
+
+        await TestSomeoneNewWritingIn()._deliver(client, _dm_msg())
+
+        client.add_contact.assert_not_awaited()

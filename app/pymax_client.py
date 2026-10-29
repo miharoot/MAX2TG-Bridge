@@ -496,6 +496,18 @@ def _permanent_send_error(exc: Exception) -> bool:
     return (code, message) in _PERMANENT_SEND_ERROR_MESSAGES
 
 
+def _profile_restricted(exc: Exception) -> bool:
+    """MAX has limited what this account may do ("Возможности профиля
+    ограничены") — a refusal of the account, not of one request."""
+    if not isinstance(exc, ApiError):
+        return False
+    if str(getattr(exc, "error", "") or "").startswith("error.user.restricted"):
+        return True
+    text = " ".join(str(getattr(exc, attr, "") or "")
+                    for attr in ("localized_message", "title", "message"))
+    return "возможности профиля ограничены" in text.lower()
+
+
 class VoiceRejectedByMax(UploadError):
     """MAX's server rejected the uploaded audio *itself* — as opposed to
     it merely not having finished processing yet.
@@ -1940,6 +1952,12 @@ class PyMaxClient:
             return {"_max_error": {"message": "MAX не ответил на добавление в контакты"}}
         except Exception as exc:
             log.warning("PyMax add_contact failed for %s: %s", user_id, exc)
+            if _profile_restricted(exc) and not getattr(self, "contacts_restricted", False):
+                # Asking again for the next person can only get the same
+                # answer, so automatic adding stops until a restart.
+                self.contacts_restricted = True
+                log.warning("MAX restricts this profile from adding contacts — "
+                            "automatic adding is off until the bridge restarts")
             return {"_max_error": {
                 "message": str(exc),
                 "localizedMessage": getattr(exc, "localized_message", None),
