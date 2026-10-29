@@ -61,6 +61,14 @@ class _FakePyMaxClient:
         box = getattr(self, "outbox", None)
         if box is not None:
             await box.set_last_tg_message(max_chat_id, tg_chat_id, tg_message_id)
+            if max_message_id is not None:
+                await box.map_message(tg_chat_id, tg_message_id, max_chat_id, max_message_id)
+
+    async def tg_reply_target(self, max_chat_id, max_message_id, tg_chat_id):
+        box = getattr(self, "outbox", None)
+        if box is None or max_message_id is None:
+            return None
+        return await box.tg_message_for(max_chat_id, max_message_id, tg_chat_id)
 
 
 def _make_client(sender=None, my_id=None):
@@ -323,9 +331,9 @@ class TestReadEventForwarding:
 
 
 class TestReactionEventForwarding:
-    """A MAX message-reaction change becomes a short status line in the
-    corresponding topic (no per-message Telegram reaction — we don't track
-    individual MAX message_id → Telegram message_id pairs)."""
+    """A reaction on a MAX message with no Telegram copy on file becomes a
+    short status line in the corresponding topic (with a copy it becomes a
+    reaction on it — see tests/test_reactions.py)."""
 
     async def test_no_op_when_topic_does_not_exist_yet(self):
         client, sender = _make_client()

@@ -12,7 +12,12 @@ from app.config import Settings
 from app.outbox import Outbox
 from app.pymax_client import MaxMessage, MaxReactionEvent, MaxReadEvent, PyMaxClient
 from app.resolver import SAVED_MESSAGES_TITLE, ContactResolver
-from app.tg_sender import READ_RECEIPT_REACTION, TelegramSender, TopicGone
+from app.tg_sender import (
+    READ_RECEIPT_REACTION,
+    TelegramSender,
+    TopicGone,
+    telegram_reaction,
+)
 
 log = logging.getLogger(__name__)
 
@@ -439,6 +444,21 @@ async def _handle_linked_message(
     return last_message
 
 
+def _reactions_of_others(counters, your_reaction) -> list[tuple[str, int]]:
+    """``(emoji, count)`` from MAX's counters without our own reaction,
+    most given first."""
+    result = []
+    for counter in counters or []:
+        reaction = counter.get("reaction")
+        count = int(counter.get("count") or 0)
+        if reaction and reaction == your_reaction:
+            count -= 1
+        if reaction and count > 0:
+            result.append((reaction, count))
+    result.sort(key=lambda item: -item[1])
+    return result
+
+
 def _meaningful_attaches(attaches) -> list[dict]:
     """Attachments that carry content, as opposed to MAX's service ones."""
     return [
@@ -847,25 +867,40 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
 
     @client.on_reaction
     async def handle_reaction(event: MaxReactionEvent):
-        """Surface a MAX message-reaction change (someone reacted 👍/❤️/etc.
-        to a message) as a short status line in that chat's topic. We don't
-        currently track individual MAX message_id → Telegram message_id
-        pairs, so this can't be attached as a Telegram reaction on the
-        exact corresponding message (unlike read events, which only need
-        the *latest* message) — a status line is the simplest faithful
-        mirror without adding that extra bookkeeping."""
-        if not event.counters:
-            return
+        """Mirror reactions on a MAX message onto its Telegram copy.
+
+        The bot's reaction on the paired Telegram message (message_map)
+        shows the most given one; when none are left it is taken off. Ours
+        is counted in MAX like anyone's, so it is left out — it is already
+        in Telegram, where it was set. Telegram lets a bot hold a single
+        reaction from its own fixed set: one it can't show, or a message
+        with no Telegram copy, still gets the old status line.
+        """
         thread_id = sender.topic_store.get_topic(event.chat_id)
         if thread_id is None:
             return  # no topic yet — nothing sent to this chat so far
         tg_chat_id = sender.resolve_chat_id(event.chat_id)
-        parts = " ".join(
-            f"{c.get('reaction', '?')}×{c.get('count', 1)}" for c in event.counters
-        )
+        others = _reactions_of_others(event.counters, event.your_reaction)
+
+        tg_message_id = await client.tg_reply_target(
+            event.chat_id, event.message_id, tg_chat_id)
+        if tg_message_id is not None:
+            if not others:
+                await sender.clear_reaction(tg_chat_id, tg_message_id)
+                return
+            emoji = telegram_reaction(others[0][0])
+            if emoji is not None and await sender.set_reaction(
+                    tg_chat_id, tg_message_id, emoji):
+                return
+        if not others:
+            return
+
+        parts = " ".join(f"{reaction}×{count}" for reaction, count in others)
         try:
             await sender.send(f"👍 <i>Реакция на сообщение: {parts}</i>",
-                              message_thread_id=thread_id, chat_id=tg_chat_id)
+                              message_thread_id=thread_id, chat_id=tg_chat_id,
+                              **({"reply_to_message_id": tg_message_id}
+                                 if tg_message_id is not None else {}))
         except TopicGone:
             # Not worth a new topic on its own — the next message from this
             # chat recreates it (see _deliver_max_message).

@@ -336,6 +336,18 @@ class Outbox:
             row = await cur.fetchone()
         return None if row is None else str(row[0])
 
+    async def max_pair_for(self, tg_chat_id: Any,
+                           tg_message_id: Any) -> tuple[str, str] | None:
+        """``(max_chat_id, max_message_id)`` a Telegram message stands for."""
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT max_chat_id, max_message_id FROM message_map "
+            "WHERE tg_chat_id = ? AND tg_message_id = ?",
+            (str(tg_chat_id), int(tg_message_id)),
+        ) as cur:
+            row = await cur.fetchone()
+        return None if row is None else (str(row[0]), str(row[1]))
+
     async def tg_message_for(self, max_chat_id: Any, max_message_id: Any,
                              tg_chat_id: Any) -> int | None:
         """The Telegram message a MAX message was forwarded as (the latest,

@@ -998,6 +998,8 @@ class MaxReactionEvent:
     message_id: str = ""
     counters: list = field(default_factory=list)   # [{"reaction": "👍", "count": 2}, ...]
     total_count: int = 0
+    # Ours among the counters, if any — it is counted there like anyone's.
+    your_reaction: str | None = None
 
 
 def _plain(value: Any) -> Any:
@@ -1352,6 +1354,7 @@ class PyMaxClient:
                         for c in counters
                     ],
                     total_count=getattr(event, "total_count", 0),
+                    your_reaction=getattr(event, "your_reaction", None),
                 ))
 
     async def run(self):
@@ -1529,6 +1532,38 @@ class PyMaxClient:
             log.exception("Could not look up the MAX message for Telegram message %s",
                           tg_message_id)
             return None
+
+    async def max_message_pair(self, tg_chat_id, tg_message_id) -> tuple[int, int] | None:
+        """``(max_chat_id, max_message_id)`` a Telegram message stands for."""
+        box = getattr(self, "outbox", None)
+        if box is None or tg_message_id is None:
+            return None
+        try:
+            pair = await box.max_pair_for(tg_chat_id, tg_message_id)
+        except Exception:
+            log.exception("Could not look up the MAX message for Telegram message %s",
+                          tg_message_id)
+            return None
+        return None if pair is None else (int(pair[0]), int(pair[1]))
+
+    async def set_reaction(self, chat_id, message_id, emoji: str | None) -> bool:
+        """Put our reaction on a MAX message, or take it off with None.
+
+        MAX keeps one reaction per person, so a new one replaces the old.
+        """
+        try:
+            if emoji:
+                call = self._client.add_reaction(int(chat_id), int(message_id), emoji)
+            else:
+                call = self._client.remove_reaction(int(chat_id), int(message_id))
+            await asyncio.wait_for(call, timeout=USER_LOOKUP_TIMEOUT)
+        except Exception as exc:
+            log.warning("MAX refused reaction %r on message %s in chat %s: %s",
+                        emoji, message_id, chat_id, exc)
+            return False
+        log.info("Reaction %r set on MAX message %s in chat %s",
+                 emoji, message_id, chat_id)
+        return True
 
     async def tg_reply_target(self, max_chat_id, max_message_id, tg_chat_id) -> int | None:
         """The Telegram message a MAX reply's original was forwarded as."""

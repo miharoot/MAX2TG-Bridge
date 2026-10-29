@@ -16,6 +16,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    MessageReactionHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
@@ -2081,6 +2082,42 @@ async def _cmd_read(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def _on_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A reaction set in a topic goes onto the MAX message it stands for.
+
+    Telegram reports a user's reactions as a whole (new_reaction); MAX keeps
+    one per person, so the newest plain emoji is the one sent and an empty
+    list takes ours off. Custom emoji have no MAX counterpart. The bot's own
+    reactions (👀, 🕊, mirrored ones) are never reported to it by Telegram.
+    """
+    change = update.message_reaction
+    if change is None:
+        return
+    user = change.user
+    if user is None or user.is_bot:
+        return   # anonymous (on behalf of the group) or a bot
+    allowed_user_ids = context.bot_data.get(ALLOWED_USER_KEY)
+    if allowed_user_ids and user.id not in allowed_user_ids:
+        return
+    max_client = context.bot_data.get(MAX_CLIENT_KEY)
+    if not max_client:
+        return
+
+    emojis = [r.emoji for r in change.new_reaction or [] if getattr(r, "emoji", None)]
+    if change.new_reaction and not emojis:
+        log.info("Reaction on Telegram message %s is a custom emoji — MAX has none",
+                 change.message_id)
+        return
+    pair = await max_client.max_message_pair(change.chat.id, change.message_id)
+    if pair is None:
+        log.info("Reaction on Telegram message %s: no MAX message paired with it",
+                 change.message_id)
+        return
+    max_chat_id, max_message_id = pair
+    await max_client.set_reaction(max_chat_id, max_message_id,
+                                  emojis[-1] if emojis else None)
+
+
 async def _cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Add the person this topic's dialog is with to the MAX contacts."""
     target = _resolve_topic_target(update, context)
@@ -2301,6 +2338,7 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("del_max", _cmd_del_max, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(_on_del_callback, pattern=r"^del:"))
+    app.add_handler(MessageReactionHandler(_on_message_reaction))
     app.add_handler(CallbackQueryHandler(_on_del_max_callback, pattern=r"^delmax:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, _on_topic_message)

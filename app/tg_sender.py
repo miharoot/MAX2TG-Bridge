@@ -31,6 +31,21 @@ DELIVERED_REACTION = "🕊"
 READ_RECEIPT_REACTION = "👀"
 _ALLOWED_REACTIONS = frozenset(e.value for e in ReactionEmoji)
 
+
+def telegram_reaction(emoji: str | None) -> str | None:
+    """The emoji as Telegram lets a bot react with it, or None.
+
+    MAX and Telegram spell some emoji differently — with or without the
+    U+FE0F variation selector (❤️ against ❤) — so both spellings are tried.
+    """
+    if not emoji:
+        return None
+    for candidate in (emoji, emoji.replace("\ufe0f", ""), emoji + "\ufe0f"):
+        if candidate in _ALLOWED_REACTIONS:
+            return candidate
+    return None
+
+
 # How Telegram words "that forum topic no longer exists" — someone deleted
 # it by hand in Telegram, while the bridge still has it on file.
 _TOPIC_GONE_MARKERS = ("thread not found", "topic_deleted", "topic_id_invalid")
@@ -240,6 +255,21 @@ class TelegramSender:
         if result is None:
             log.warning("Could not set reaction %r on message %s in %s",
                         emoji, message_id, chat_id)
+            return False
+        return bool(result)
+
+    async def clear_reaction(self, chat_id: str | int, message_id: int) -> bool:
+        """Take the bot's reaction off a Telegram message (best-effort)."""
+        try:
+            result = await self._retry(
+                lambda: self._bot.set_message_reaction(
+                    chat_id=chat_id, message_id=message_id, reaction=[],
+                ),
+                permanent=(BadRequest,),
+            )
+        except BadRequest as exc:
+            log.warning("Telegram refused clearing the reaction on message %s in %s: %s",
+                        message_id, chat_id, exc)
             return False
         return bool(result)
 
