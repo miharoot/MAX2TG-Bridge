@@ -99,10 +99,13 @@ def build_pymax_client(settings: Settings, bridge_client: "PyMaxClient | None" =
         log_level="DEBUG" if settings.debug else "INFO",
         # A login normally asks MAX only for what changed since the
         # previous one (pymax keeps the markers in the session file), so
-        # the chats and contacts it returns are a partial list. -1, the
-        # marker of a session that has never synced, asks for both in
-        # full on every login; the bridge stores them (app/outbox.py).
-        sync=SyncOverrides(chats_sync=-1, contacts_sync=-1),
+        # the chats and contacts it returns are a partial list. A marker
+        # is a point in time, and 0 — everything since the start — asks
+        # for both in full on every login; the bridge stores them
+        # (app/outbox.py). Not -1: that is "send none", the marker pymax
+        # itself sends with contacts switched off, and MAX answered it
+        # with an empty contact list.
+        sync=SyncOverrides(chats_sync=0, contacts_sync=0),
     )
 
     if settings.max_pymax_auth == "qr":
