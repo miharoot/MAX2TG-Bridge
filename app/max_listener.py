@@ -3,6 +3,7 @@ import logging
 import os
 from collections import Counter
 from dataclasses import fields as _dataclass_fields
+from dataclasses import replace as _dataclass_replace
 from datetime import datetime
 from html import escape
 from typing import Any
@@ -393,6 +394,12 @@ async def _handle_linked_message(
         a for a in fwd_attaches
         if isinstance(a, dict) and a.get("_type") not in ("CONTROL", "WIDGET", "INLINE_KEYBOARD", None)
     ]
+    # A quoted message's video or file belongs to that message, and MAX
+    # looks it up by that message's id — asked with the reply's own id it
+    # answers not.found. Forwards keep the message that carries them.
+    if link_type == "REPLY" and msg is not None and inner.get("id"):
+        msg = _dataclass_replace(
+            msg, chat_id=link.get("chatId") or msg.chat_id, message_id=str(inner["id"]))
 
     last_message = None
     if fwd_meaningful:

@@ -231,3 +231,33 @@ class TestMaxReplyArrivesAsATelegramReply:
         assert any("Встречаемся?" in text for text in sent)
         assert all("reply_to_message_id" not in c.kwargs for c in sender.send.await_args_list)
         await client.outbox.close()
+
+
+class TestAQuotedMessagesAttachmentIsLookedUpByThatMessage:
+    """A reply quoting a message with a video: the video belongs to the
+    quoted message, and MAX answers not.found when asked with the reply's
+    own id — the video was lost from the topic."""
+
+    async def test_the_quoted_message_id_is_used(self):
+        from app.max_listener import _handle_linked_message
+
+        client = MagicMock()
+        client.download_video_url = AsyncMock(return_value=None)
+        sender = AsyncMock()
+        resolver = MagicMock()
+        resolver.resolve_user = AsyncMock(return_value="Иван Петров")
+        reply = MaxMessage(chat_id=MAX_CHAT, sender_id=100000001, text="и тебе",
+                           message_id="117000000000000009", link={}, attaches=[], raw={})
+        link = {"type": "REPLY", "chatId": MAX_CHAT, "message": {
+            "id": "117000000000000001", "sender": 100000001, "text": "",
+            "attaches": [{"_type": "VIDEO", "videoId": 16000000000001}]}}
+
+        await _handle_linked_message(link, "REPLY", "<b>Иван Петров</b>", client, sender,
+                                     resolver, thread_id=5, msg=reply, chat_id=DEFAULT_TG_CHAT_ID)
+
+        calls = client.download_video_url.await_args_list
+        assert calls, "the quoted video was never looked up"
+        for call in calls:
+            looked_up = list(call.args) + list(call.kwargs.values())
+            assert "117000000000000001" in looked_up
+            assert "117000000000000009" not in looked_up
