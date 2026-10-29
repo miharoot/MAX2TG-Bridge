@@ -93,13 +93,25 @@ class TestMaxReactionOnTheTelegramCopy:
         sender.send.assert_not_called()
         await client.outbox.close()
 
-    async def test_one_telegram_can_t_show_becomes_a_line_under_the_message(self):
+    async def test_one_telegram_can_t_show_becomes_a_neutral_reaction(self):
+        """Not a 👍 — that would claim approval nobody gave."""
         client, sender = await self._setup()
 
         await client._on_reaction_cb(self._event([{"reaction": "🫠", "count": 1}]))
 
-        sender.set_reaction.assert_not_called()
-        assert "🫠×1" in sender.send.await_args.args[0]
+        sender.set_reaction.assert_awaited_once_with(str(TG_CHAT), 55, "💊")
+        sender.send.assert_not_called()
+        await client.outbox.close()
+
+    async def test_a_reaction_telegram_refuses_becomes_a_line_under_the_message(self):
+        """The group may allow only some reactions."""
+        client, sender = await self._setup()
+        sender.set_reaction = AsyncMock(return_value=False)
+
+        await client._on_reaction_cb(self._event([{"reaction": "🫠", "count": 1}]))
+
+        line = sender.send.await_args.args[0]
+        assert "🫠×1" in line and not line.startswith("👍")
         assert sender.send.await_args.kwargs["reply_to_message_id"] == 55
         await client.outbox.close()
 

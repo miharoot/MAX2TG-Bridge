@@ -29,6 +29,10 @@ log = logging.getLogger(__name__)
 # level.
 DELIVERED_REACTION = "🕊"
 READ_RECEIPT_REACTION = "👀"
+# Shown for a MAX reaction Telegram has no way to show (its emoji is not in
+# the set a bot may react with): something was reacted, without a guess at
+# what. Neutral on purpose — a 👍 would claim approval nobody gave.
+NEUTRAL_REACTION = "💊"
 _ALLOWED_REACTIONS = frozenset(e.value for e in ReactionEmoji)
 
 

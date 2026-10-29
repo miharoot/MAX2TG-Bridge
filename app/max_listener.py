@@ -13,6 +13,7 @@ from app.outbox import Outbox
 from app.pymax_client import MaxMessage, MaxReactionEvent, MaxReadEvent, PyMaxClient
 from app.resolver import SAVED_MESSAGES_TITLE, ContactResolver
 from app.tg_sender import (
+    NEUTRAL_REACTION,
     READ_RECEIPT_REACTION,
     TelegramSender,
     TopicGone,
@@ -873,8 +874,9 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
         shows the most given one; when none are left it is taken off. Ours
         is counted in MAX like anyone's, so it is left out — it is already
         in Telegram, where it was set. Telegram lets a bot hold a single
-        reaction from its own fixed set: one it can't show, or a message
-        with no Telegram copy, still gets the old status line.
+        reaction from its own fixed set, so one outside it shows as the
+        neutral 💊. A message with no Telegram copy, or a reaction Telegram
+        refuses, still gets the status line.
         """
         thread_id = sender.topic_store.get_topic(event.chat_id)
         if thread_id is None:
@@ -888,16 +890,15 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             if not others:
                 await sender.clear_reaction(tg_chat_id, tg_message_id)
                 return
-            emoji = telegram_reaction(others[0][0])
-            if emoji is not None and await sender.set_reaction(
-                    tg_chat_id, tg_message_id, emoji):
+            emoji = telegram_reaction(others[0][0]) or NEUTRAL_REACTION
+            if await sender.set_reaction(tg_chat_id, tg_message_id, emoji):
                 return
         if not others:
             return
 
         parts = " ".join(f"{reaction}×{count}" for reaction, count in others)
         try:
-            await sender.send(f"👍 <i>Реакция на сообщение: {parts}</i>",
+            await sender.send(f"<i>Реакция на сообщение: {parts}</i>",
                               message_thread_id=thread_id, chat_id=tg_chat_id,
                               **({"reply_to_message_id": tg_message_id}
                                  if tg_message_id is not None else {}))
