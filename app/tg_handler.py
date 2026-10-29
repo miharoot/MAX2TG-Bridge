@@ -208,6 +208,39 @@ def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return message, max_chat_id, max_client
 
 
+async def _set_delivered_reaction(bot, tg_chat_id, tg_message_id) -> None:
+    """Put 🕊 on a message MAX confirmed, riding out a network blip.
+
+    One attempt used to be all: a dropped connection to the proxy — the
+    usual way this bridge's network misbehaves — lost the 🕊 for good and
+    logged it as a missing permission. A refusal (BadRequest) is not
+    retried: the chat forbids the reaction, repeating changes nothing.
+    """
+    for attempt in range(1, TG_FILE_RETRIES + 1):
+        try:
+            await bot.set_message_reaction(chat_id=tg_chat_id, message_id=tg_message_id,
+                                           reaction=DELIVERED_REACTION)
+            return
+        except BadRequest:
+            log.warning(
+                "Telegram refused the %s delivery reaction on message %s in %s: "
+                "missing permission or a reaction this chat does not allow",
+                DELIVERED_REACTION, tg_message_id, tg_chat_id, exc_info=True,
+            )
+            return
+        except NetworkError as exc:
+            if attempt == TG_FILE_RETRIES:
+                log.warning("Could not set the %s delivery reaction on message %s in %s "
+                            "after %d attempts: %s", DELIVERED_REACTION, tg_message_id,
+                            tg_chat_id, attempt, exc)
+                return
+            await asyncio.sleep(2 * attempt)
+        except Exception:
+            log.warning("Could not set the %s delivery reaction on message %s in %s",
+                        DELIVERED_REACTION, tg_message_id, tg_chat_id, exc_info=True)
+            return
+
+
 def _replied_tg_message_id(message) -> int | None:
     """The Telegram message this one answers, if it is a real reply.
 
@@ -288,16 +321,7 @@ async def _surface_send_result(resp, *, bot, tg_chat_id, tg_message_id, notify,
         await notify("⚠️ Таймаут от MAX — сообщение не подтверждено.")
         return False
     if tg_message_id is not None:
-        try:
-            await bot.set_message_reaction(chat_id=tg_chat_id, message_id=tg_message_id,
-                                            reaction=DELIVERED_REACTION)
-        except Exception:
-            log.warning(
-                "Could not set the %s delivery reaction on confirmed message "
-                "(chat=%s, message_id=%s): likely missing permission or an "
-                "unsupported reaction for this chat",
-                DELIVERED_REACTION, tg_chat_id, tg_message_id, exc_info=True,
-            )
+        await _set_delivered_reaction(bot, tg_chat_id, tg_message_id)
 
     if max_client is not None and max_chat_id is not None:
         # Your own reply is now the last thing in the topic, so a read

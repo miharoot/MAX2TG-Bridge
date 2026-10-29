@@ -1093,3 +1093,47 @@ class _capture_tg_handler:
         self._logger.removeHandler(self._handler)
         self._logger.setLevel(self._old_level)
         return False
+
+
+class TestDeliveredReactionSurvivesANetworkBlip:
+    """🕊 used to get one attempt: a dropped proxy connection lost it for
+    good and was logged as a missing permission."""
+
+    async def test_a_network_error_is_retried(self, monkeypatch):
+        from telegram.error import NetworkError
+
+        from app.tg_handler import _set_delivered_reaction
+
+        monkeypatch.setattr("app.tg_handler.asyncio.sleep", AsyncMock())
+        bot = MagicMock()
+        bot.set_message_reaction = AsyncMock(side_effect=[NetworkError("ConnectError"), True])
+
+        await _set_delivered_reaction(bot, DEFAULT_TG_CHAT_ID, 77)
+
+        assert bot.set_message_reaction.await_count == 2
+
+    async def test_a_refusal_is_not_retried(self, monkeypatch):
+        from telegram.error import BadRequest
+
+        from app.tg_handler import _set_delivered_reaction
+
+        monkeypatch.setattr("app.tg_handler.asyncio.sleep", AsyncMock())
+        bot = MagicMock()
+        bot.set_message_reaction = AsyncMock(side_effect=BadRequest("REACTION_INVALID"))
+
+        await _set_delivered_reaction(bot, DEFAULT_TG_CHAT_ID, 77)
+
+        bot.set_message_reaction.assert_awaited_once()
+
+    async def test_it_gives_up_after_a_few_attempts(self, monkeypatch):
+        from telegram.error import NetworkError
+
+        from app.tg_handler import TG_FILE_RETRIES, _set_delivered_reaction
+
+        monkeypatch.setattr("app.tg_handler.asyncio.sleep", AsyncMock())
+        bot = MagicMock()
+        bot.set_message_reaction = AsyncMock(side_effect=NetworkError("ConnectError"))
+
+        await _set_delivered_reaction(bot, DEFAULT_TG_CHAT_ID, 77)
+
+        assert bot.set_message_reaction.await_count == TG_FILE_RETRIES
