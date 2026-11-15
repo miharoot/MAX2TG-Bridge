@@ -1548,6 +1548,27 @@ class PyMaxClient:
                           tg_message_id)
             return None
 
+    async def edit_message(self, chat_id, message_id, text: str) -> tuple[bool, str]:
+        """Replace the text of one of our MAX messages.
+
+        Returns (True, "") or (False, why) — the why worded for the topic.
+        """
+        try:
+            await asyncio.wait_for(
+                self._client.edit_message(int(chat_id), int(message_id), text=text),
+                timeout=USER_LOOKUP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning("MAX did not answer editing message %s in chat %s in %ss",
+                        message_id, chat_id, USER_LOOKUP_TIMEOUT)
+            return False, "MAX не ответил"
+        except Exception as exc:
+            log.warning("MAX refused editing message %s in chat %s: %s",
+                        message_id, chat_id, exc)
+            return False, getattr(exc, "localized_message", None) or str(exc)
+        log.info("Edited MAX message %s in chat %s", message_id, chat_id)
+        return True, ""
+
     async def max_message_pair(self, tg_chat_id, tg_message_id) -> tuple[int, int] | None:
         """``(max_chat_id, max_message_id)`` a Telegram message stands for."""
         box = getattr(self, "outbox", None)

@@ -184,10 +184,12 @@ def _peer_id_in_dm(resolver, chat_id, *, guess: bool = True) -> int | None:
         return None
 
 
-def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          message=None):
     """Common prelude for topic handlers. Returns (message, max_chat_id, max_client)
-    if the message should be routed, or None to drop silently."""
-    message = update.message
+    if the message should be routed, or None to drop silently. ``message``
+    overrides update.message — an edit arrives as update.edited_message."""
+    message = message or update.message
     if message is None:
         return None
     thread_id = message.message_thread_id
@@ -1462,6 +1464,8 @@ HELP_TEXT = (
     "соответствующий чат MAX. Поддерживается жирный/курсив/зачёркнутый/"
     "подчёркнутый текст, моноширинный код, цитаты и ссылки. Фото, "
     "документы, видео и голосовые сообщения тоже передаются напрямую.\n\n"
+    "Исправил сообщение в топике — правка уйдёт и в MAX (для текстовых "
+    "сообщений; правку подписи к вложению мост не передаёт).\n\n"
     "Как только твой ответ из топика доставлен в MAX, чат там "
     "отмечается прочитанным (статус «прочитано» для собеседника). "
     "Учти: Telegram не сообщает боту, когда ты именно <i>прочитал</i> "
@@ -2106,6 +2110,42 @@ async def _cmd_read(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def _on_topic_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """An edited message in a topic edits its MAX copy.
+
+    Found through the MAX ↔ Telegram pairs (message_map), so only messages
+    MAX confirmed are editable. Text only: MAX's edit request always
+    carries the message's attachments, and sending it without them could
+    strip a photo whose caption was edited — so that is said, not tried.
+    Every edit used to vanish without a trace: the text handler got the
+    update, found no update.message in it and returned.
+    """
+    message = update.edited_message
+    if message is None:
+        return
+    target = _resolve_topic_target(update, context, message=message)
+    if not target:
+        return
+    _, max_chat_id, max_client = target
+    if not max_client:
+        return
+    if message.effective_attachment is not None or not message.text:
+        await message.reply_text(
+            "⚠️ Правку подписи к вложению в MAX не передаю — исправленное "
+            "сообщение там осталось прежним.")
+        return
+    pair = await max_client.max_message_pair(message.chat_id, message.message_id)
+    if pair is None or pair[0] != int(max_chat_id):
+        log.info("Edited Telegram message %s has no MAX copy on file", message.message_id)
+        await message.reply_text(
+            "⚠️ Не нашёл это сообщение в MAX — правка туда не ушла. Мост "
+            "помнит только сообщения, доставленные начиная с версии 0.11.0.")
+        return
+    ok, desc = await max_client.edit_message(pair[0], pair[1], message.text)
+    if not ok:
+        await message.reply_text(f"⚠️ MAX не принял правку: {desc}")
+
+
 async def _on_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """A reaction set in a topic goes onto the MAX message it stands for.
 
@@ -2364,6 +2404,11 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
     app.add_handler(CallbackQueryHandler(_on_del_callback, pattern=r"^del:"))
     app.add_handler(MessageReactionHandler(_on_message_reaction))
     app.add_handler(CallbackQueryHandler(_on_del_max_callback, pattern=r"^delmax:"))
+    # Before the handlers below: they match an edit too (their filters look
+    # at the edited message), and the first match in the group wins.
+    app.add_handler(
+        MessageHandler(filters.UpdateType.EDITED_MESSAGE & chat_filter, _on_topic_edit)
+    )
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, _on_topic_message)
     )
