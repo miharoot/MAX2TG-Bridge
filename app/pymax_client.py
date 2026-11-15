@@ -1214,6 +1214,11 @@ class PyMaxClient:
         self._on_disconnect_cb = None
         self._on_read_cb = None
         self._on_reaction_cb = None
+        self._on_edit_cb = None
+        self._on_delete_cb = None
+        # MAX messages this bridge is deleting itself (/rm): MAX reports the
+        # deletion back, and that echo must not be announced in the topic.
+        self._deleting: set[tuple[str, str]] = set()
         self._outbound_cids: OrderedDict[tuple[Any, str], float] = OrderedDict()
         self.resolver = None
         self.last_message_ids: dict[Any, str] = {}
@@ -1257,6 +1262,23 @@ class PyMaxClient:
     def on_read(self, func):
         self._on_read_cb = func
         return func
+
+    def on_edit(self, func):
+        self._on_edit_cb = func
+        return func
+
+    def on_delete(self, func):
+        self._on_delete_cb = func
+        return func
+
+    def is_own_deletion(self, chat_id, message_id) -> bool:
+        """Whether this deletion is the echo of one the bridge made (/rm)."""
+        return (str(chat_id), str(message_id)) in self._deleting
+
+    def _bridged_chat(self, chat_id) -> bool:
+        if self.chat_ids and chat_id not in self.chat_ids:
+            return False
+        return not (self.ignore_chat_ids and chat_id in self.ignore_chat_ids)
 
     def on_reaction(self, func):
         self._on_reaction_cb = func
@@ -1328,6 +1350,28 @@ class PyMaxClient:
                 return
             if self._on_message_cb:
                 await self._on_message_cb(bridge_message)
+
+        @self._client.on_message_edit()
+        async def _handle_message_edit(message, pymax_client):
+            bridge_message = _message_from_pymax(message, self._my_id)
+            if bridge_message is None or not self._bridged_chat(bridge_message.chat_id):
+                return
+            if self._on_edit_cb:
+                await self._on_edit_cb(bridge_message)
+
+        @self._client.on_message_delete()
+        async def _handle_message_delete(event, pymax_client):
+            # Two shapes reach this: MAX's delete notice (message_ids) and a
+            # message whose status turned REMOVED (its own id).
+            chat_id = getattr(event, "chat_id", None)
+            ids = getattr(event, "message_ids", None)
+            if ids is None:
+                ids = [getattr(event, "id", None)]
+            ids = [str(i) for i in ids if i is not None]
+            if chat_id is None or not ids or not self._bridged_chat(chat_id):
+                return
+            if self._on_delete_cb:
+                await self._on_delete_cb(chat_id, ids)
 
         @self._client.on_disconnect()
         async def _handle_disconnect(exc, reconnect, delay):
@@ -1578,6 +1622,9 @@ class PyMaxClient:
         bridge does not unsend other people's words.
         """
         box = getattr(self, "outbox", None)
+        deleting = getattr(self, "_deleting", None)
+        if deleting is not None:
+            deleting.add((str(chat_id), str(message_id)))
         for_everyone = False
         if box is not None:
             try:

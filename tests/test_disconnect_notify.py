@@ -37,6 +37,17 @@ class FakeClient:
         self._on_reaction_cb = func
         return func
 
+    def on_edit(self, func):
+        self._on_edit_cb = func
+        return func
+
+    def on_delete(self, func):
+        self._on_delete_cb = func
+        return func
+
+    def is_own_deletion(self, chat_id, message_id):
+        return False
+
     def on_qr(self, func):
         self._on_qr_cb = func
         return func

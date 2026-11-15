@@ -917,6 +917,64 @@ def configure_pymax_client(client: PyMaxClient, sender: TelegramSender):
             log.warning("Reaction for MAX chat %s not posted: its topic %s is gone",
                         event.chat_id, thread_id)
 
+    @client.on_edit
+    async def handle_edit(msg: MaxMessage):
+        """A message edited in MAX is edited in its topic too.
+
+        The bot rewrites its own copy, marked «✏️ изменено в MAX». A message
+        the bridge itself sent from Telegram is skipped: its Telegram side
+        is the user's own message, which a bot may not edit — and the edit
+        came from there in the first place. If Telegram won't take the
+        edit, the new text goes in as a reply under the old one.
+        """
+        if await _sent_by_bridge(msg):
+            return
+        tg_chat_id = sender.resolve_chat_id(msg.chat_id)
+        tg_id = await client.tg_reply_target(msg.chat_id, msg.message_id, tg_chat_id)
+        if tg_id is None:
+            log.info("MAX edit of message %s in chat %s: no Telegram copy on file",
+                     msg.message_id, msg.chat_id)
+            return
+        raw_sender = await resolver.resolve_user(msg.sender_id)
+        header = _header(escape(raw_sender), escape(resolver.chat_name(msg.chat_id)),
+                         resolver.is_dm(msg.chat_id), msg.is_self)
+        body = f"\n{escape(msg.text)}" if msg.text else ""
+        log.info("MAX edit of message %s in chat %s → Telegram message %s",
+                 msg.message_id, msg.chat_id, tg_id)
+        if await sender.edit_text_or_caption(
+                tg_chat_id, tg_id, f"{header}{body}\n<i>✏️ изменено в MAX</i>"):
+            return
+        thread_id = sender.topic_store.get_topic(msg.chat_id)
+        try:
+            await sender.send(f"<i>✏️ изменено в MAX:</i>{body or ' (без текста)'}",
+                              message_thread_id=thread_id, chat_id=tg_chat_id,
+                              reply_to_message_id=tg_id)
+        except TopicGone:
+            log.warning("Edit for MAX chat %s not posted: its topic is gone", msg.chat_id)
+
+    @client.on_delete
+    async def handle_delete(chat_id: Any, message_ids: list[str]):
+        """A message deleted in MAX is marked in its topic, not removed:
+        «🗑 удалено в MAX» goes in as a reply to its copy. One the bridge
+        deleted itself (/rm) is already gone from the topic."""
+        thread_id = sender.topic_store.get_topic(chat_id)
+        if thread_id is None:
+            return
+        tg_chat_id = sender.resolve_chat_id(chat_id)
+        for message_id in message_ids:
+            if client.is_own_deletion(chat_id, message_id):
+                continue
+            tg_id = await client.tg_reply_target(chat_id, message_id, tg_chat_id)
+            if tg_id is None:
+                continue
+            log.info("MAX deletion of message %s in chat %s → marked on Telegram message %s",
+                     message_id, chat_id, tg_id)
+            try:
+                await sender.send("<i>🗑 удалено в MAX</i>", message_thread_id=thread_id,
+                                  chat_id=tg_chat_id, reply_to_message_id=tg_id)
+            except TopicGone:
+                log.warning("Deletion for MAX chat %s not posted: its topic is gone", chat_id)
+
     def _as_chat_key(chat_id: Any) -> Any:
         """MAX chat ids come back from the database as text; everywhere
         else they are ints. Keep one shape, so a restored entry matches the

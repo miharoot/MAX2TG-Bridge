@@ -262,6 +262,44 @@ class TelegramSender:
             return False
         return bool(result)
 
+    async def edit_text_or_caption(self, chat_id: str | int, message_id: int,
+                                   text: str) -> bool:
+        """Replace the text of one of the bot's own messages (HTML).
+
+        A forwarded MAX message is either a text message or media with a
+        caption, and which one isn't on record — so the text is tried
+        first and the caption when Telegram says there is no text.
+        """
+        try:
+            await self._retry(
+                lambda: self._bot.edit_message_text(
+                    chat_id=chat_id, message_id=message_id,
+                    text=text[:TG_MAX_LENGTH], parse_mode=ParseMode.HTML),
+                permanent=(BadRequest,),
+            )
+            return True
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            if "no text in the message" not in str(exc).lower():
+                log.warning("Telegram refused editing message %s in %s: %s",
+                            message_id, chat_id, exc)
+                return False
+        try:
+            await self._retry(
+                lambda: self._bot.edit_message_caption(
+                    chat_id=chat_id, message_id=message_id,
+                    caption=self._truncate_caption(text), parse_mode=ParseMode.HTML),
+                permanent=(BadRequest,),
+            )
+            return True
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            log.warning("Telegram refused editing the caption of message %s in %s: %s",
+                        message_id, chat_id, exc)
+            return False
+
     async def clear_reaction(self, chat_id: str | int, message_id: int) -> bool:
         """Take the bot's reaction off a Telegram message (best-effort)."""
         try:

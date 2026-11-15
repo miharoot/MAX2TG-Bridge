@@ -35,6 +35,8 @@ class FakeRawClient:
         self.disconnect_handlers = []
         self.message_read_handlers = []
         self.reaction_update_handlers = []
+        self.message_edit_handlers = []
+        self.message_delete_handlers = []
         self.me = SimpleNamespace(
             contact=FakeModel(
                 id=7,
@@ -88,6 +90,18 @@ class FakeRawClient:
     def on_reaction_update(self):
         def decorator(func):
             self.reaction_update_handlers.append(func)
+            return func
+        return decorator
+
+    def on_message_edit(self):
+        def decorator(func):
+            self.message_edit_handlers.append(func)
+            return func
+        return decorator
+
+    def on_message_delete(self):
+        def decorator(func):
+            self.message_delete_handlers.append(func)
             return func
         return decorator
 
