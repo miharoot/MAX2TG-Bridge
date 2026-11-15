@@ -362,6 +362,27 @@ class Outbox:
             row = await cur.fetchone()
         return None if row is None else int(row[0])
 
+    async def tg_messages_for(self, max_chat_id: Any, max_message_id: Any,
+                              tg_chat_id: Any) -> list[int]:
+        """Every Telegram message a MAX message went out as — a message with
+        attachments can take several."""
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT tg_message_id FROM message_map WHERE max_chat_id = ? "
+            "AND max_message_id = ? AND tg_chat_id = ? ORDER BY tg_message_id",
+            (str(max_chat_id), str(max_message_id), str(tg_chat_id)),
+        ) as cur:
+            return [int(row[0]) for row in await cur.fetchall()]
+
+    async def forget_message(self, max_chat_id: Any, max_message_id: Any) -> None:
+        """Drop the pairs of a MAX message that no longer exists."""
+        conn = await self._get_conn()
+        await conn.execute(
+            "DELETE FROM message_map WHERE max_chat_id = ? AND max_message_id = ?",
+            (str(max_chat_id), str(max_message_id)),
+        )
+        await conn.commit()
+
     async def save_max_chats(self, chats: list[dict], *, complete: bool) -> None:
         """Store the MAX chat list. ``complete`` says the list is the whole
         account: only then do chats missing from it go — a walk cut short

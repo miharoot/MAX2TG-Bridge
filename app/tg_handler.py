@@ -1445,6 +1445,10 @@ HELP_TEXT = (
     "или ссылке) добавляет его в контакты сам, и тот, кто пишет тебе в "
     "личку и не состоит в контактах, добавляется автоматически "
     "(<code>MAX_AUTO_ADD_CONTACTS</code>).\n"
+    "• <code>/rm</code> — ответом на сообщение в топике: удалить его в MAX "
+    "и здесь. Отправленное через мост удаляется в MAX у всех, остальное — "
+    "только у тебя. Telegram не сообщает боту об удалении сообщений, "
+    "поэтому просто удалить сообщение в топике недостаточно.\n"
     "• <code>/read</code> — внутри топика: отметить чат прочитанным в MAX, "
     "не отвечая в нём. Telegram не сообщает боту, что ты прочитал "
     "переписку, поэтому обычно отметка уходит только вместе с ответом — "
@@ -2146,6 +2150,61 @@ async def _on_topic_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text(f"⚠️ MAX не принял правку: {desc}")
 
 
+async def _cmd_rm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply /rm to a message in a topic: delete it in MAX, then here.
+
+    A command because nothing else is possible: Telegram tells a bot
+    nothing when a message is deleted. What the bridge sent goes for
+    everyone in MAX; anything else only for this account (see
+    PyMaxClient.delete_message). The Telegram copies and the command
+    itself are removed once MAX has agreed.
+    """
+    message = update.message
+    if message is None:
+        return
+    _log_command(update, "rm")
+    target = _resolve_topic_target(update, context)
+    if not target:
+        await message.reply_text(
+            "Команда работает только внутри топика, связанного с чатом MAX.")
+        return
+    _, max_chat_id, max_client = target
+    if not max_client:
+        await message.reply_text("⚠️ Max клиент не подключён.")
+        return
+    reply_id = _replied_tg_message_id(message)
+    if reply_id is None:
+        await message.reply_text(
+            "Ответь командой <code>/rm</code> на сообщение, которое нужно "
+            "удалить в MAX.", parse_mode="HTML")
+        return
+    pair = await max_client.max_message_pair(message.chat_id, reply_id)
+    if pair is None or pair[0] != int(max_chat_id):
+        await message.reply_text(
+            "⚠️ Не нашёл это сообщение в MAX. Мост помнит только сообщения, "
+            "пересланные или доставленные начиная с версии 0.11.0.")
+        return
+
+    ok, for_everyone, desc = await max_client.delete_message(pair[0], pair[1])
+    if not ok:
+        await message.reply_text(f"⚠️ MAX не удалил сообщение: {desc}")
+        return
+    copies = await max_client.tg_messages_for(pair[0], pair[1], message.chat_id)
+    for tg_id in sorted({reply_id, *copies, message.message_id}):
+        try:
+            await context.bot.delete_message(chat_id=message.chat_id, message_id=tg_id)
+        except Exception:
+            log.warning("Could not delete Telegram message %s in %s", tg_id,
+                        message.chat_id, exc_info=True)
+    if not for_everyone:
+        # Said in the topic, since the message is gone from here either
+        # way: in MAX the other side still sees it.
+        await context.bot.send_message(
+            chat_id=message.chat_id, message_thread_id=message.message_thread_id,
+            text="🗑 Удалено в MAX только у тебя — сообщение не отправлено мостом, "
+                 "у собеседника оно осталось.")
+
+
 async def _on_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """A reaction set in a topic goes onto the MAX message it stands for.
 
@@ -2398,6 +2457,7 @@ def build_tg_app(token: str, max_client: PyMaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("catchup", _cmd_catchup, filters=chat_filter))
     app.add_handler(CommandHandler("read", _cmd_read, filters=chat_filter))
     app.add_handler(CommandHandler("contact", _cmd_contact, filters=chat_filter))
+    app.add_handler(CommandHandler("rm", _cmd_rm, filters=chat_filter))
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))
     app.add_handler(CommandHandler("del_max", _cmd_del_max, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))

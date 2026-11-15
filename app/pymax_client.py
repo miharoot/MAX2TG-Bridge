@@ -1569,6 +1569,57 @@ class PyMaxClient:
         log.info("Edited MAX message %s in chat %s", message_id, chat_id)
         return True, ""
 
+    async def delete_message(self, chat_id, message_id) -> tuple[bool, bool, str]:
+        """Delete one MAX message; returns (ok, for_everyone, why-not).
+
+        Only a message the bridge itself sent goes for everyone — the
+        outbox keeps those ids (sent_by_bridge). Anything else, someone
+        else's message above all, is deleted for this account alone: the
+        bridge does not unsend other people's words.
+        """
+        box = getattr(self, "outbox", None)
+        for_everyone = False
+        if box is not None:
+            try:
+                for_everyone = await box.was_sent_by_bridge(chat_id, message_id)
+            except Exception:
+                log.exception("Could not check whether MAX message %s is the bridge's",
+                              message_id)
+        try:
+            await asyncio.wait_for(
+                self._client.delete_message(int(chat_id), [int(message_id)],
+                                            for_me=not for_everyone),
+                timeout=USER_LOOKUP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning("MAX did not answer deleting message %s in chat %s in %ss",
+                        message_id, chat_id, USER_LOOKUP_TIMEOUT)
+            return False, for_everyone, "MAX не ответил"
+        except Exception as exc:
+            log.warning("MAX refused deleting message %s in chat %s: %s",
+                        message_id, chat_id, exc)
+            return False, for_everyone, getattr(exc, "localized_message", None) or str(exc)
+        log.info("Deleted MAX message %s in chat %s (%s)", message_id, chat_id,
+                 "for everyone" if for_everyone else "for us only")
+        if box is not None:
+            try:
+                await box.forget_message(chat_id, message_id)
+            except Exception:
+                log.exception("Could not forget the pairs of MAX message %s", message_id)
+        return True, for_everyone, ""
+
+    async def tg_messages_for(self, max_chat_id, max_message_id, tg_chat_id) -> list[int]:
+        """Every Telegram message a MAX message went out as."""
+        box = getattr(self, "outbox", None)
+        if box is None:
+            return []
+        try:
+            return await box.tg_messages_for(max_chat_id, max_message_id, tg_chat_id)
+        except Exception:
+            log.exception("Could not look up the Telegram copies of MAX message %s",
+                          max_message_id)
+            return []
+
     async def max_message_pair(self, tg_chat_id, tg_message_id) -> tuple[int, int] | None:
         """``(max_chat_id, max_message_id)`` a Telegram message stands for."""
         box = getattr(self, "outbox", None)

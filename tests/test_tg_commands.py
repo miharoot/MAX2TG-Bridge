@@ -141,7 +141,7 @@ class TestEveryCommandAnswersSomething:
 
     @pytest.mark.parametrize("name", [
         "bind", "add", "list", "help", "del", "intro", "profile", "catchup",
-        "contact",
+        "contact", "rm",
     ])
     async def test_command_replies_without_raising(self, name, monkeypatch):
         import app.tg_handler as th
